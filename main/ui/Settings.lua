@@ -14,7 +14,10 @@
 -- picks the right one per model.
 
 local Theme = require(script.Parent:WaitForChild("Theme"))
-local Claude = require(script.Parent:WaitForChild("Claude"))
+-- Reaches into agent/ for the model list only. Settings is the one module that
+-- is genuinely half UI and half configuration; if it ever splits, the prefs half
+-- is what belongs next to the agent.
+local Claude = require(script.Parent.Parent:WaitForChild("agent"):WaitForChild("Claude"))
 
 local make = Theme.make
 

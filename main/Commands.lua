@@ -4,13 +4,19 @@
 -- dropdown, /help, and the dispatch table below, so adding a command in one
 -- place can't leave the other two stale.
 
-local OAuth = require(script.Parent:WaitForChild("OAuth"))
-local Console = require(script.Parent:WaitForChild("Console"))
-local Settings = require(script.Parent:WaitForChild("Settings"))
-local Claude = require(script.Parent:WaitForChild("Claude"))
-local Agent = require(script.Parent:WaitForChild("Agent"))
-local Terminal = require(script.Parent:WaitForChild("Terminal"))
-local Tools = require(script.Parent:WaitForChild("Tools"))
+-- Commands sits at the root rather than in a folder because it is the glue: it
+-- reaches into every layer by definition, so filing it under one of them would
+-- be picking a side arbitrarily.
+local agent = script.Parent:WaitForChild("agent")
+local ui = script.Parent:WaitForChild("ui")
+
+local OAuth = require(script.Parent:WaitForChild("auth"):WaitForChild("OAuth"))
+local Console = require(ui:WaitForChild("Console"))
+local Settings = require(ui:WaitForChild("Settings"))
+local Claude = require(agent:WaitForChild("Claude"))
+local Agent = require(agent:WaitForChild("Agent"))
+local Terminal = require(script.Parent:WaitForChild("fs"):WaitForChild("Terminal"))
+local Tools = require(agent:WaitForChild("Tools"))
 
 local Commands = {}
 

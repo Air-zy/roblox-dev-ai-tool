@@ -8,16 +8,24 @@
 
 assert(plugin ~= nil, "This script must run as a Roblox Studio plugin (the `plugin` global is missing).")
 
-local Sha256   = require(script:WaitForChild("Sha256"))   :: any
-local OAuth    = require(script:WaitForChild("OAuth"))    :: any
-local Claude   = require(script:WaitForChild("Claude"))   :: any
-local Props    = require(script:WaitForChild("Props"))    :: any
-local Terminal = require(script:WaitForChild("Terminal")) :: any
-local Theme    = require(script:WaitForChild("Theme"))
-local Markdown = require(script:WaitForChild("Markdown"))
-local Console  = require(script:WaitForChild("Console"))
-local Settings = require(script:WaitForChild("Settings"))
-local Agent    = require(script:WaitForChild("Agent"))
+-- Modules are grouped by what they are, not listed flat. A module only ever
+-- reaches for a folder it does not live in when it genuinely crosses layers,
+-- which is why this is the only file that names all four.
+local agent = script:WaitForChild("agent")
+local auth  = script:WaitForChild("auth")
+local fs    = script:WaitForChild("fs")
+local ui    = script:WaitForChild("ui")
+
+local Sha256   = require(auth:WaitForChild("Sha256"))   :: any
+local OAuth    = require(auth:WaitForChild("OAuth"))    :: any
+local Claude   = require(agent:WaitForChild("Claude"))  :: any
+local Props    = require(fs:WaitForChild("Props"))      :: any
+local Terminal = require(fs:WaitForChild("Terminal"))   :: any
+local Theme    = require(ui:WaitForChild("Theme"))
+local Markdown = require(ui:WaitForChild("Markdown"))
+local Console  = require(ui:WaitForChild("Console"))
+local Settings = require(ui:WaitForChild("Settings"))
+local Agent    = require(agent:WaitForChild("Agent"))
 local Commands = require(script:WaitForChild("Commands"))
 
 local make = Theme.make
@@ -124,15 +132,24 @@ make("Frame", {
 	Position = UDim2.new(0, 0, 1, -1),
 })
 
-Console.mount(root, 2)
+local outputFrame = Console.mount(root, 2)
 
+-- Grows with the text now that Shift+Enter can add lines, capped so a pasted
+-- wall of code cannot eat the console. The output frame is resized from this
+-- row's real height below rather than from the old hardcoded 64.
 local inputRow = make("Frame", {
 	Name = "InputRow",
 	Parent = root,
 	BackgroundColor3 = Theme.BG_INPUT,
 	BorderSizePixel = 0,
 	Size = UDim2.new(1, 0, 0, 32),
+	AutomaticSize = Enum.AutomaticSize.Y,
 	LayoutOrder = 3,
+})
+make("UISizeConstraint", {
+	Parent = inputRow,
+	MinSize = Vector2.new(0, 32),
+	MaxSize = Vector2.new(math.huge, 132),
 })
 make("Frame", {
 	Parent = inputRow,
@@ -140,14 +157,17 @@ make("Frame", {
 	BorderSizePixel = 0,
 	Size = UDim2.new(1, 0, 0, 1),
 })
+-- Pinned to the top rather than centred: the row grows downward now, and a
+-- prompt caret that drifts to the middle of a six-line message reads as a bug.
 make("TextLabel", {
 	Parent = inputRow,
 	BackgroundTransparency = 1,
-	Size = UDim2.new(0, 24, 1, 0),
+	Size = UDim2.new(0, 24, 0, 32),
 	FontFace = Theme.MONO,
 	TextSize = 14,
 	TextColor3 = Theme.ACCENT,
 	TextXAlignment = Enum.TextXAlignment.Center,
+	TextYAlignment = Enum.TextYAlignment.Center,
 	Text = "❯",
 })
 local stopButton = make("TextButton", {
@@ -175,18 +195,43 @@ local inputBox = make("TextBox", {
 	Parent = inputRow,
 	BackgroundTransparency = 1,
 	-- Leaves room for the Stop button, which only appears while streaming.
-	Size = UDim2.new(1, -104, 1, 0),
+	Size = UDim2.new(1, -104, 0, 32),
+	AutomaticSize = Enum.AutomaticSize.Y,
 	Position = UDim2.new(0, 24, 0, 0),
 	FontFace = Theme.SANS,
 	TextSize = Theme.TEXT_SIZE,
 	TextColor3 = Theme.TEXT_HI,
+	-- MultiLine is what lets Shift+Enter add a line. It also means Enter no
+	-- longer fires FocusLost(enterPressed): the TextBox keeps the keypress and
+	-- inserts a newline instead. Sending is therefore detected from the text
+	-- changing, not from the key — see the Text handler further down.
+	MultiLine = true,
 	ClearTextOnFocus = false,
 	Text = "",
-	PlaceholderText = "Message Claude…  ( / for commands )",
+	PlaceholderText = "Message Claude…  ( / for commands · shift+enter for a new line )",
 	PlaceholderColor3 = Theme.TEXT_LO,
 	TextXAlignment = Enum.TextXAlignment.Left,
-	TextYAlignment = Enum.TextYAlignment.Center,
+	TextYAlignment = Enum.TextYAlignment.Top,
 })
+make("UIPadding", { Parent = inputBox, PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8) })
+
+-- The output frame used to assume a 32px header plus a 32px input row. The row
+-- is elastic now, so read its real height instead of hardcoding the sum.
+--
+-- Guarded on the height actually changing. AbsoluteSize fires on width too, and
+-- on recomputes that land on the same value, so an unguarded version reassigned
+-- the output frame's size on every keystroke — and because that frame is a
+-- ScrollingFrame with AutomaticCanvasSize, each assignment relaid out the entire
+-- console behind it. That was the stutter while typing, not a Roblox artefact.
+local lastInputHeight = -1
+local function fitOutput()
+	local height = inputRow.AbsoluteSize.Y
+	if height == lastInputHeight then return end
+	lastInputHeight = height
+	outputFrame.Size = UDim2.new(1, 0, 1, -(32 + height))
+end
+inputRow:GetPropertyChangedSignal("AbsoluteSize"):Connect(fitOutput)
+fitOutput()
 
 -- =============================================================================
 -- Settings popup
@@ -283,7 +328,9 @@ local function updateDropdown(filter: string)
 
 	local height = #matches * 24 + 4
 	dropdown.Size = UDim2.new(0, 320, 0, height)
-	dropdown.Position = UDim2.new(0, 12, 1, -32 - height - 4)
+	-- Sits above the input row, whatever height the row currently is — it grows
+	-- with the message, so the old hardcoded 32 would put the list on top of it.
+	dropdown.Position = UDim2.new(0, 12, 1, -inputRow.AbsoluteSize.Y - height - 4)
 	dropdown.Visible = true
 end
 
@@ -301,34 +348,73 @@ end)
 -- =============================================================================
 Agent.Initialize(term, function(busy: boolean)
 	inputBox.TextEditable = not busy
-	inputBox.PlaceholderText = busy and "Working…  (Stop to cancel)" or "Message Claude…  ( / for commands )"
+	inputBox.PlaceholderText = busy and "Working…  (Stop to cancel)"
+		or "Message Claude…  ( / for commands · shift+enter for a new line )"
 	inputBox.TextColor3 = busy and Theme.TEXT_LO or Theme.TEXT_HI
 	stopButton.Visible = busy
 	if not busy then refreshStatus() end
 end)
 Commands.Initialize(term, toggleSettings)
 
--- Esc cancels too: the input keeps focus while streaming, so the keyboard is
--- the closest control to hand.
-game:GetService("UserInputService").InputBegan:Connect(function(input: InputObject, processed: boolean)
-	if input.KeyCode == Enum.KeyCode.Escape and Agent.isBusy() then
-		Agent.stop()
-	end
-end)
+local UserInputService = game:GetService("UserInputService")
 
-inputBox.FocusLost:Connect(function(enterPressed: boolean)
-	task.delay(0.1, function() dropdown.Visible = false end)
-	if not enterPressed then return end
-
-	local text = inputBox.Text
+local function submit(text: string)
 	inputBox.Text = ""
 	if text:gsub("%s+", "") == "" then return end
-
 	if not Commands.handle(text) then
 		Agent.send(text, OAuth.isLoggedIn)
 	end
 	refreshStatus()
 	inputBox:CaptureFocus()
+end
+
+-- Enter sends, Shift+Enter adds a line.
+--
+-- This watches the text rather than the keyboard, because a focused TextBox
+-- swallows its keystrokes: UserInputService.InputBegan does NOT fire for keys
+-- that go into a TextBox, so a Return handler there never runs and Enter only
+-- ever inserted a newline. A MultiLine box also never reports Enter through
+-- FocusLost, so the newline appearing in the text is the only signal there is.
+--
+-- Growth of exactly one character is what separates a keystroke from a paste —
+-- without that check, pasting a snippet containing newlines would fire a send.
+local previousText = ""
+inputBox:GetPropertyChangedSignal("Text"):Connect(function()
+	local text = inputBox.Text
+	local grew = #text == #previousText + 1
+	previousText = text
+	if not grew then return end
+
+	-- The caret sits just after the character that was inserted. Falling back to
+	-- a trailing newline covers the case where CursorPosition has not caught up.
+	local caret = inputBox.CursorPosition
+	local atCaret = caret >= 2 and text:sub(caret - 1, caret - 1) == "\n"
+	local atEnd = text:sub(-1) == "\n"
+	if not (atCaret or atEnd) then return end
+
+	if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+		or UserInputService:IsKeyDown(Enum.KeyCode.RightShift) then
+		return   -- Shift+Enter: the newline stays
+	end
+
+	-- Enter: cut out the newline it just inserted, send what is left.
+	local without = atCaret
+		and (text:sub(1, caret - 2) .. text:sub(caret))
+		or text:sub(1, -2)
+	previousText = ""
+	submit(without)
+end)
+
+-- Esc cancels: the input keeps focus while streaming, so the keyboard is the
+-- closest control to hand. Escape is not text, so it does reach InputBegan.
+UserInputService.InputBegan:Connect(function(input: InputObject, processed: boolean)
+	if input.KeyCode == Enum.KeyCode.Escape and Agent.isBusy() then
+		Agent.stop()
+	end
+end)
+
+inputBox.FocusLost:Connect(function()
+	task.delay(0.1, function() dropdown.Visible = false end)
 end)
 
 -- =============================================================================

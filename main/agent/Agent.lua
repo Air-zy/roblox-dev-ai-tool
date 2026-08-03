@@ -6,10 +6,12 @@
 -- follow-up turn sent `input: []` and Anthropic rejected it. One function means
 -- one code path to keep correct.
 
+local ui = script.Parent.Parent:WaitForChild("ui")
+
 local Claude = require(script.Parent:WaitForChild("Claude"))
-local Console = require(script.Parent:WaitForChild("Console"))
-local Settings = require(script.Parent:WaitForChild("Settings"))
 local Tools = require(script.Parent:WaitForChild("Tools"))
+local Console = require(ui:WaitForChild("Console"))
+local Settings = require(ui:WaitForChild("Settings"))
 
 local Agent = {}
 

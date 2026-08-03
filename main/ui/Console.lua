@@ -74,30 +74,90 @@ function Console.clear()
 	end
 end
 
+-- TextEditable stays TRUE. Setting it false is the obvious way to make a
+-- read-only box and it does not work: the box stops taking focus at all, and
+-- with no focus there is no caret, no selection and nothing for Ctrl+C to copy.
+-- So the box is a completely ordinary editable TextBox — which is what makes it
+-- reliably selectable — and read-only is enforced by reverting any edit.
+--
+-- Returns the box and a setter. Content has to go through the setter so the
+-- guard knows what the text is supposed to be; assigning .Text directly would
+-- be immediately reverted.
+local function readOnlyBox(parent: Instance, font: Font, size: number, color: Color3)
+	local box = make("TextBox", {
+		Parent = parent,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		FontFace = font,
+		TextSize = size,
+		TextColor3 = color,
+		TextWrapped = true,
+		RichText = false,
+		MultiLine = true,
+		TextEditable = true,
+		ClearTextOnFocus = false,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		Text = "",
+	})
+
+	local content = ""
+	local setting = false
+	box:GetPropertyChangedSignal("Text"):Connect(function()
+		if setting or box.Text == content then return end
+		-- Someone typed. Put it back. Selecting and copying never changes .Text,
+		-- so this costs the reader nothing.
+		setting = true
+		box.Text = content
+		setting = false
+	end)
+
+	return box, function(text: string)
+		content = text
+		setting = true
+		box.Text = text
+		setting = false
+	end
+end
+
+-- Focus the box and select all of it, so the next Ctrl+C takes the lot.
+-- CursorPosition first, then SelectionStart: setting the cursor clears any
+-- existing selection, so anchoring afterwards is what actually makes a range.
+local function selectAll(box: TextBox)
+	box:CaptureFocus()
+	box.CursorPosition = #box.Text + 1
+	box.SelectionStart = 1
+end
+
 -- =============================================================================
 -- Plain lines
 -- =============================================================================
 -- Commands, status and errors are never Markdown, so RichText stays off and the
 -- text goes in raw. Nothing to escape means nothing to escape wrongly.
-function Console.appendLine(text: string, kind: string?): TextLabel
-	local label = make("TextLabel", {
-		Name = "Line",
-		Parent = output,
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 0),
-		AutomaticSize = Enum.AutomaticSize.Y,
-		FontFace = (kind == "user") and Theme.SANS or Theme.MONO,
-		TextSize = Theme.TEXT_SIZE,
-		TextColor3 = KIND_COLOR[kind or ""] or Theme.TEXT_HI,
-		TextWrapped = true,
-		RichText = false,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextYAlignment = Enum.TextYAlignment.Top,
-		Text = (KIND_PREFIX[kind or ""] or "") .. text,
-		LayoutOrder = #output:GetChildren() + 1,
-	})
+--
+-- Selectable, for the same reason code blocks are: this is where tool output
+-- lands — grep hits, file listings, error text — and it is exactly the sort of
+-- thing you want to pull out of the widget. RichText being off here is what
+-- makes that safe; a selection copies the characters you can see, with no markup
+-- to leak into it.
+function Console.appendLine(text: string, kind: string?): TextBox
+	-- Counted BEFORE the box is made, because readOnlyBox parents it on
+	-- creation and a count taken afterwards includes the new child. Bubbles
+	-- number themselves the same way, so an off-by-one here would let a line and
+	-- a bubble share a LayoutOrder and swap places.
+	local order = #output:GetChildren() + 1
+	local line, setLine = readOnlyBox(
+		output,
+		(kind == "user") and Theme.SANS or Theme.MONO,
+		Theme.TEXT_SIZE,
+		KIND_COLOR[kind or ""] or Theme.TEXT_HI
+	)
+	line.Name = "Line"
+	line.LayoutOrder = order
+	setLine((KIND_PREFIX[kind or ""] or "") .. text)
 	Console.scrollToBottom()
-	return label
+	return line
 end
 
 -- =============================================================================
@@ -126,6 +186,11 @@ local function richLabel(parent: Instance, font: Font, size: number, color: Colo
 	})
 end
 
+-- richLabel is the RichText one, and it is deliberately NOT selectable. With
+-- RichText on, selection indices map to the RAW string — tags included — so
+-- copying a bold word would hand you `<b>word</b>`. Blocks that are already
+-- verbatim (code, plain lines, the raw-source view) use readOnlyBox instead and
+-- are selectable; formatted prose stays a label.
 local renderers: { [string]: (Instance) -> Rendered } = {}
 
 renderers.paragraph = function(parent: Instance): Rendered
@@ -211,18 +276,37 @@ renderers.code = function(parent: Instance): Rendered
 		PaddingBottom = UDim.new(0, 8),
 	})
 
-	local langLabel = make("TextLabel", {
+	-- The header row exists whether or not the fence named a language, because
+	-- it carries the copy button and that is wanted on every block.
+	local header = make("Frame", {
 		Parent = frame,
 		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 13),
+		Size = UDim2.new(1, 0, 0, 14),
+		LayoutOrder = 1,
+	})
+	local langLabel = make("TextLabel", {
+		Parent = header,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, -72, 1, 0),
 		FontFace = Theme.SANS,
 		TextSize = 10,
 		TextColor3 = Theme.TEXT_LO,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		RichText = false,
 		Text = "",
-		Visible = false,
-		LayoutOrder = 1,
+	})
+	local copyButton = make("TextButton", {
+		Parent = header,
+		BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, 0, 0, 0),
+		Size = UDim2.new(0, 68, 1, 0),
+		FontFace = Theme.SANS,
+		TextSize = 10,
+		TextColor3 = Theme.TEXT_LO,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Text = "select all",
+		AutoButtonColor = false,
 	})
 
 	-- RichText OFF: code is shown byte for byte. No escaping step means no way
@@ -230,28 +314,27 @@ renderers.code = function(parent: Instance): Rendered
 	-- ponytail: long lines wrap instead of scrolling horizontally. A real
 	-- horizontal scroll needs a nested ScrollingFrame plus measured text width;
 	-- wrapping keeps the code visible, which is the part that matters.
-	local body = make("TextLabel", {
-		Parent = frame,
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 0),
-		AutomaticSize = Enum.AutomaticSize.Y,
-		FontFace = Theme.MONO,
-		TextSize = Theme.SMALL_SIZE,
-		TextColor3 = Theme.CODE_CLR,
-		TextWrapped = true,
-		RichText = false,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextYAlignment = Enum.TextYAlignment.Top,
-		Text = "",
-		LayoutOrder = 2,
-	})
+	local body, setBody = readOnlyBox(frame, Theme.MONO, Theme.SMALL_SIZE, Theme.CODE_CLR)
+	body.LayoutOrder = 2
+
+	copyButton.MouseButton1Click:Connect(function()
+		selectAll(body)
+		-- The button cannot copy — nothing in a plugin can. It selects, and then
+		-- says what to press. Naming the key beats a "Copy" label that silently
+		-- does half of what it claims.
+		copyButton.Text = "press Ctrl+C"
+		copyButton.TextColor3 = Theme.ACCENT
+		task.delay(2.5, function()
+			copyButton.Text = "select all"
+			copyButton.TextColor3 = Theme.TEXT_LO
+		end)
+	end)
 
 	return {
 		node = frame,
 		set = function(block)
-			langLabel.Visible = block.lang ~= nil
 			langLabel.Text = block.lang or ""
-			body.Text = block.text
+			setBody(block.text)
 		end,
 	}
 end
@@ -413,6 +496,9 @@ function Console.createBubble(): Bubble
 	})
 
 	local rendered: { Rendered & { kind: string } } = {}
+	-- Set while the raw-markdown view is up, so a block drawn mid-stream does
+	-- not pop back into view behind it.
+	local showingSource = false
 
 	-- Thinking lives INSIDE the bubble at LayoutOrder 0, above the answer blocks
 	-- (which start at 1). Creating it as a separate top-level child put it after
@@ -445,6 +531,7 @@ function Console.createBubble(): Bubble
 				rendered[i] = slot
 			end
 			slot.node.LayoutOrder = i
+			slot.node.Visible = not showingSource
 			slot.set(block)
 		end
 		for j = #rendered, #blocks + 1, -1 do
@@ -454,12 +541,50 @@ function Console.createBubble(): Bubble
 		Console.scrollToBottom()
 	end
 
+	-- Selection cannot cross widgets in Roblox — each TextBox is its own scope,
+	-- so there is no dragging from one paragraph into the next the way a text
+	-- editor lets you. This is the way around that: one toggle that swaps the
+	-- whole rendered reply for the raw markdown it was built from, in a single
+	-- selectable box. Raw markdown is also the more useful thing to paste back
+	-- than the rendered text would be.
+	local sourceToggle = make("TextButton", {
+		Parent = container,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(0, 60, 0, 14),
+		FontFace = Theme.SANS,
+		TextSize = 10,
+		TextColor3 = Theme.TEXT_LO,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "⧉ raw",
+		AutoButtonColor = false,
+		Visible = false,
+		LayoutOrder = 1000,   -- below the answer; blocks number up from 1
+	})
+	local sourceBox, setSource = readOnlyBox(container, Theme.MONO, Theme.SMALL_SIZE, Theme.TEXT_MED)
+	sourceBox.Visible = false
+	sourceBox.LayoutOrder = 1001
+
+	sourceToggle.MouseButton1Click:Connect(function()
+		showingSource = not showingSource
+		for _, slot in ipairs(rendered) do
+			slot.node.Visible = not showingSource
+		end
+		sourceBox.Visible = showingSource
+		sourceToggle.Text = showingSource and "⧉ rendered" or "⧉ raw"
+		if showingSource then
+			selectAll(sourceBox)
+		end
+		Console.scrollToBottom()
+	end)
+
 	local lastRender = 0
 	local pending: string? = nil
 	local scheduled = false
 
 	local function render(md: string)
 		draw(Markdown.parse(md))
+		setSource(md)
+		sourceToggle.Visible = md ~= ""
 		lastRender = os.clock()
 	end
 

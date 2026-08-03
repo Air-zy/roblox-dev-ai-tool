@@ -16,7 +16,9 @@
 -- composition should use the `run` tool instead of growing a language here.
 
 local Fs = require(script.Parent:WaitForChild("Fs"))
-local Tools = require(script.Parent:WaitForChild("Tools"))
+-- The only reach out of fs/: the shell has to know which words are tools rather
+-- than commands, so it can say so instead of reporting "unknown command".
+local Tools = require(script.Parent.Parent:WaitForChild("agent"):WaitForChild("Tools"))
 
 local isScript     = Fs.isScript
 local getSource    = Fs.getSource
