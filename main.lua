@@ -510,10 +510,20 @@ end)
 -- =============================================================================
 -- Input handling
 -- =============================================================================
+local stopBusySpin: (() -> ())? = nil
 Agent.Initialize(term, function(busy: boolean)
 	inputBox.TextEditable = not busy
-	inputBox.PlaceholderText = busy and "Working…  (Stop to cancel)"
-		or "Message Claude…  ( / for commands · shift+enter for a new line )"
+	if stopBusySpin then
+		stopBusySpin()
+		stopBusySpin = nil
+	end
+	if busy then
+		stopBusySpin = Console.spin(function(frame: string)
+			inputBox.PlaceholderText = frame .. " Working…  (Stop to cancel)"
+		end)
+	else
+		inputBox.PlaceholderText = "Message Claude…  ( / for commands · shift+enter for a new line )"
+	end
 	inputBox.TextColor3 = busy and Theme.TEXT_LO or Theme.TEXT_HI
 	stopButton.Visible = busy
 	if not busy then refreshStatus() end

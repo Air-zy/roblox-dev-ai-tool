@@ -643,11 +643,35 @@ function Console.createBubble(): Bubble
 end
 
 -- =============================================================================
--- Collapsible thinking block
+-- Spinner
 -- =============================================================================
 local SPINNER = { "/", "-", "\\", "|" }
 local SPINNER_INTERVAL = 0.12
 
+-- One animation for everything that is still running: the thinking header, a
+-- tool call waiting on its result, and the input placeholder. `render` gets the
+-- current frame and does whatever that caller's text needs. `alive` stops the
+-- loop when its Instance is destroyed, for callers that never get a stop() call
+-- (Console.clear destroys blocks out from under them).
+function Console.spin(render: (string) -> (), alive: Instance?): () -> ()
+	local i, running = 1, true
+	render(SPINNER[i])
+	task.spawn(function()
+		while running and (alive == nil or alive.Parent) do
+			task.wait(SPINNER_INTERVAL)
+			if not running then break end   -- stop() may have landed during the wait
+			i = i % #SPINNER + 1
+			render(SPINNER[i])
+		end
+	end)
+	return function()
+		running = false
+	end
+end
+
+-- =============================================================================
+-- Collapsible thinking block
+-- =============================================================================
 function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinking
 	local host = parent or output
 	local container = make("Frame", {
@@ -693,20 +717,15 @@ function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinki
 
 	local expanded = false
 	local finished = false
-	local spinner = 1
+	local frame = SPINNER[1]
 	local function render()
 		header.Text = (expanded and "▼ " or "▶ ") .. "thinking"
-			.. (finished and "" or (" " .. SPINNER[spinner]))
+			.. (finished and "" or (" " .. frame))
 	end
-	render()
-	task.spawn(function()
-		while not finished and container.Parent do
-			task.wait(SPINNER_INTERVAL)
-			if finished then break end   -- finish() may have landed during the wait
-			spinner = spinner % #SPINNER + 1
-			render()
-		end
-	end)
+	local stopSpin = Console.spin(function(f)
+		frame = f
+		render()
+	end, container)
 
 	header.MouseButton1Click:Connect(function()
 		expanded = not expanded
@@ -725,9 +744,11 @@ function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinki
 		end,
 		finish = function()
 			finished = true
+			stopSpin()
 			render()
 		end,
 		destroy = function()
+			stopSpin()
 			container:Destroy()
 		end,
 	}
@@ -834,19 +855,44 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 	end
 	renderDetail(result)
 
+	-- No result yet means the call is still running, so the header spins the same
+	-- way the thinking header does until setResult lands.
 	local expanded = false
+	local pending = result == nil
+	local frame = SPINNER[1]
+	local function renderHeader()
+		header.Text = (expanded and "▼ " or "▶ ") .. label .. (pending and (" " .. frame) or "")
+	end
+	local stopSpin: (() -> ())? = nil
+	if pending then
+		stopSpin = Console.spin(function(f)
+			frame = f
+			renderHeader()
+		end, container)
+	end
+
 	header.MouseButton1Click:Connect(function()
 		expanded = not expanded
 		detailBox.Visible = expanded
-		header.Text = (expanded and "▼ " or "▶ ") .. label
+		renderHeader()
 		Console.scrollToBottom()
 	end)
 
 	Console.scrollToBottom()
 	return {
 		setResult = function(res: string)
+			pending = false
+			if stopSpin then stopSpin() end
+			renderHeader()
 			renderDetail(res)
 			if expanded then Console.scrollToBottom() end
+		end,
+		-- Stops the spinner without a result, for a call whose result is never
+		-- coming: the request errored or was cancelled while it was in flight.
+		finish = function()
+			pending = false
+			if stopSpin then stopSpin() end
+			renderHeader()
 		end,
 	}
 end

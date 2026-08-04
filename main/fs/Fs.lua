@@ -95,7 +95,7 @@ function Fs.resolve(base: Instance, path: string?): (Instance?, string?)
 	end
 
 	local current: Instance = start
-	for _, seg in ipairs(segments) do
+	for i, seg in ipairs(segments) do
 		if seg == "" or seg == "." then
 			-- no-op
 		elseif seg == ".." then
@@ -137,6 +137,16 @@ function Fs.resolve(base: Instance, path: string?): (Instance?, string?)
 						break
 					end
 				end
+			end
+			-- Away from the root that fold no longer applies, but `workspace` is
+			-- a Luau global: it means game.Workspace from any scope, so `ls
+			-- workspace` from anywhere is the model writing Luau, not naming a
+			-- child. Only the leading segment, and only when no real child has
+			-- that name — a genuine sibling always wins. Workspace alone,
+			-- because it is the one service that is also a global; the others
+			-- need GetService in Luau too.
+			if not child and i == 1 and seg:lower() == "workspace" then
+				child = game:GetService("Workspace")
 			end
 			if not child then
 				return nil, string.format("no child named %q in %s", seg, instancePath(current))

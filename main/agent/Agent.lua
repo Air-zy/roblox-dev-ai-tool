@@ -101,6 +101,16 @@ local stopCurrent: (() -> ())? = nil
 -- Code's /usage. Plan limits are a separate thing and come from the usage
 -- endpoint (OAuth.fetchUsage); this is just what this session has spent.
 local totals = { input = 0, output = 0 }
+-- server_tool_use id -> the console block waiting for its result. Keyed by id
+-- rather than "the last one", because a turn can run several searches.
+--
+-- Deliberately NOT per-turn. On stop_reason "pause_turn" Anthropic interrupts a
+-- long-running search, so the server_tool_use lands in one stream and its
+-- web_search_tool_result in the NEXT one, after runTurn has recursed. A per-turn
+-- table lost the pairing across that boundary: the first block spun forever and
+-- the result arrived as a second, argument-less [web_search] below it. Parallel
+-- searches hit it most, being the slowest turns and the likeliest to be paused.
+local serverCalls: { [string]: any } = {}
 
 function Agent.Initialize(terminal: any, busyCallback: ((boolean) -> ())?)
 	term = terminal
@@ -125,7 +135,16 @@ end
 
 local function setBusy(value: boolean)
 	busy = value
-	if not value then stopCurrent = nil end
+	if not value then
+		stopCurrent = nil
+		-- The request is over, so anything still waiting on a result is never
+		-- getting one — a cancel or an error mid-search. Stop the spinners rather
+		-- than leave them turning until the widget closes.
+		for id, call in pairs(serverCalls) do
+			call.finish()
+			serverCalls[id] = nil
+		end
+	end
 	if onBusyChanged then onBusyChanged(value) end
 end
 
@@ -151,9 +170,6 @@ local function runTurn(turn: number)
 	local text = ""        -- every text delta of the turn; what the history gets
 	local bubbleText = ""  -- only the part belonging to the CURRENT bubble
 	local finished = false
-	-- server_tool_use id -> the console block waiting for its result. Keyed by id
-	-- rather than "the last one", because a turn can run several searches.
-	local serverCalls: { [string]: any } = {}
 
 	-- A server tool runs mid-stream, so its console block lands below a bubble
 	-- that is still being written to — and the text that comes AFTER the search
@@ -236,7 +252,9 @@ local function runTurn(turn: number)
 			-- blocks, so waiting for both would leave the console silent for the
 			-- whole search.
 			local call = Console.appendToolCall(name, type(input) == "table" and input or {})
-			if id then serverCalls[id] = call end
+			-- No id means nothing can ever pair a result to this block, so it must
+			-- not be left spinning for one.
+			if id then serverCalls[id] = call else call.finish() end
 		end,
 
 		onServerToolResult = function(name: string, toolUseId: string?, content: any)
@@ -345,6 +363,11 @@ local function runTurn(turn: number)
 			for _, block in ipairs(toolUses) do
 				local toolResult: string
 				if block.inputParsed then
+					-- Header goes up before the tool runs, not after: dispatch blocks
+					-- this thread for as long as the tool takes, and catalog/run/web
+					-- calls take seconds. The spinner is the only thing saying which
+					-- call the wait belongs to.
+					local call = Console.appendToolCall(block.name, block.inputParsed)
 					toolResult = Tools.dispatch(term, block.name, block.inputParsed)
 					-- A tool_result whose content is "" is rejected outright, and on
 					-- turn > 1 it cannot be rolled back: the tool_use is already in
@@ -356,7 +379,7 @@ local function runTurn(turn: number)
 					-- here rather than in each handler because "" is a correct result
 					-- for /sh; it is only invalid on the wire.
 					if toolResult == "" then toolResult = "(no output)" end
-					Console.appendToolCall(block.name, block.inputParsed, toolResult)
+					call.setResult(toolResult)
 				else
 					-- Naming the stop reason is what makes this recoverable: on
 					-- "max_tokens" the input was cut off mid-JSON, and the answer

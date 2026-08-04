@@ -1373,10 +1373,35 @@ function Shell.selfTest(probe: any): (boolean, string?)
 	-- `workspace` is a Luau global, not the service's Name, so FindFirstChild
 	-- misses it and every path a model writes lowercase used to fail — including
 	-- `catalog parent workspace`, where the failure looked like a catalog bug.
-	local ws = Fs.resolve(game, "workspace")
-	if ws ~= game:GetService("Workspace") then
-		return false, "resolve(\"workspace\") did not reach the Workspace service"
+	-- It has to hold from a cwd other than the root too, since `workspace` is a
+	-- global everywhere in Luau and a model that cd'd somewhere still writes it.
+	-- The non-root base is a detached fixture, not a real service: an assertion
+	-- about what is *not* in the open place is an assertion about the user's
+	-- game, and it would fail the moment someone named a Folder "workspace".
+	local fixture = Instance.new("Folder")
+	local nested = Instance.new("Folder")
+	nested.Name = "nested"
+	nested.Parent = fixture
+	for _, base in ipairs({ game, fixture }) do
+		for _, path in ipairs({ "workspace", "/workspace", "Workspace" }) do
+			if Fs.resolve(base, path) ~= game:GetService("Workspace") then
+				return false, string.format("resolve(%q) from %s did not reach Workspace",
+					path, base.Name)
+			end
+		end
 	end
+	-- ...but only as the leading segment. Deeper in a path it is a child name.
+	if Fs.resolve(fixture, "nested/workspace") ~= nil then
+		return false, "workspace fallback fired on a non-leading segment"
+	end
+	-- And a real child by that name beats the fallback, wherever it sits.
+	local impostor = Instance.new("Folder")
+	impostor.Name = "workspace"
+	impostor.Parent = fixture
+	if Fs.resolve(fixture, "workspace") ~= impostor then
+		return false, "workspace fallback shadowed a real child"
+	end
+	fixture:Destroy()
 
 	-- Globs: a bare word stays a substring match, a wildcard anchors.
 	for _, case in ipairs({
