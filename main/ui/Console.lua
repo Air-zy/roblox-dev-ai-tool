@@ -77,11 +77,18 @@ function Console.mount(parent: Instance, layoutOrder: number): ScrollingFrame
 		PaddingBottom = UDim.new(0, 6),
 	})
 
-	output:GetPropertyChangedSignal("AbsoluteCanvasSize"):Connect(function()
+	local function pin()
 		if stickToBottom then
 			output.CanvasPosition = Vector2.new(0, math.huge)
 		end
-	end)
+	end
+	output:GetPropertyChangedSignal("AbsoluteCanvasSize"):Connect(pin)
+	-- The window moves the bottom too, not just the canvas. The input row grows
+	-- with a multi-line message and main.lua shrinks this frame to match, which
+	-- lifts the visible bottom edge without touching the canvas — so nothing fired
+	-- and the view sat stranded above the bottom until the next block arrived.
+	-- Resizing the widget did the same thing.
+	output:GetPropertyChangedSignal("AbsoluteWindowSize"):Connect(pin)
 	output:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
 		stickToBottom = output.CanvasPosition.Y
 			>= output.AbsoluteCanvasSize.Y - output.AbsoluteWindowSize.Y - STICK_SLOP
