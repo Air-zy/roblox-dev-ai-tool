@@ -73,6 +73,8 @@ system-prompt settings; they persist via `plugin:SetSetting`.
 | `catalog` | search / load Free Models | filtered to public-domain Models, ranked by takes; loads unsandboxed |
 
 Path mapping: `/` = `game`, `/Workspace/Parts/Brick` = absolute, `.` `..` as usual.
+Service names at the root are case-insensitive, so `workspace` — a real Luau
+global — resolves like `/Workspace`; below the root, case matters.
 Scripts are listed with a `.luau` suffix. `-type f` is a script, `-type d` is
 anything else. Every mutation is wrapped in a `ChangeHistoryService` recording,
 so **Ctrl+Z works**.

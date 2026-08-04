@@ -122,6 +122,22 @@ function Fs.resolve(base: Instance, path: string?): (Instance?, string?)
 					child = stripped
 				end
 			end
+			-- `workspace` is a real Luau global for game.Workspace, so a model
+			-- writes it lowercase and is not wrong to — the engine accepts it
+			-- everywhere else. Services generally: their names are fixed and
+			-- unique, so a case-insensitive match at the root cannot be
+			-- ambiguous. It stops at the root deliberately; two ordinary
+			-- siblings really can differ only by case, and folding those
+			-- together would resolve to whichever came first.
+			if not child and current == game then
+				local wanted = seg:lower()
+				for _, service in ipairs(game:GetChildren()) do
+					if service.Name:lower() == wanted then
+						child = service
+						break
+					end
+				end
+			end
 			if not child then
 				return nil, string.format("no child named %q in %s", seg, instancePath(current))
 			end

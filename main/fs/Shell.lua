@@ -1370,6 +1370,14 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		end
 	end
 
+	-- `workspace` is a Luau global, not the service's Name, so FindFirstChild
+	-- misses it and every path a model writes lowercase used to fail — including
+	-- `catalog parent workspace`, where the failure looked like a catalog bug.
+	local ws = Fs.resolve(game, "workspace")
+	if ws ~= game:GetService("Workspace") then
+		return false, "resolve(\"workspace\") did not reach the Workspace service"
+	end
+
 	-- Globs: a bare word stays a substring match, a wildcard anchors.
 	for _, case in ipairs({
 		{ pattern = "*Handler*", name = "DamageHandler", want = true },

@@ -24,6 +24,28 @@ local SERVER_RESULT_BLOCKS: { [string]: boolean } = {
 	code_execution_tool_result = true,
 }
 
+-- tool_use.input must be a JSON *object* on the wire, and Roblox's encoder turns
+-- an empty Lua table into `[]`. That rejection is not a one-turn failure: the
+-- block is already in the history, so every later request fails on the same
+-- index — "messages.27.content.1.tool_use.input: Input should be an object" —
+-- until the conversation is cleared. It fires whenever the accumulated input
+-- JSON does not parse, which fine-grained tool streaming makes possible: an
+-- input cut short by max_tokens arrives as invalid JSON rather than being
+-- buffered and validated. `edits` payloads are the longest thing the model
+-- sends, so multiedit is where it shows up.
+--
+-- Roblox has no object sentinel, so the fallback carries the raw fragment
+-- instead of nothing: an object either way, and it shows what was cut off.
+-- Capped because a truncated multiedit can be thousands of characters and this
+-- stays in the history for the rest of the session.
+local function toolInput(block: any): any
+	local parsed = block.inputParsed
+	if type(parsed) == "table" and next(parsed) ~= nil then
+		return parsed
+	end
+	return { _unparsed = string.sub(tostring(block.input or ""), 1, 200) }
+end
+
 -- Our registered tools, plus Anthropic's server-side web search when the user
 -- has turned it on. Server tools need no dispatcher: the API runs them.
 --
@@ -204,7 +226,7 @@ local function runTurn(turn: number)
 						type = "tool_use",
 						id = block.id,
 						name = block.name,
-						input = block.inputParsed or {},
+						input = toolInput(block),
 					})
 					table.insert(toolUses, block)
 				elseif block.type == "server_tool_use" then
@@ -214,7 +236,7 @@ local function runTurn(turn: number)
 						type = "server_tool_use",
 						id = block.id,
 						name = block.name,
-						input = block.inputParsed or {},
+						input = toolInput(block),
 					})
 				elseif SERVER_RESULT_BLOCKS[block.type] and block.raw then
 					-- Server tool results arrive complete and are replayed verbatim.
@@ -252,7 +274,12 @@ local function runTurn(turn: number)
 					if toolResult == "" then toolResult = "(no output)" end
 					Console.appendToolCall(block.name, block.inputParsed, toolResult)
 				else
-					toolResult = "error: failed to parse tool input"
+					-- Naming the stop reason is what makes this recoverable: on
+					-- "max_tokens" the input was cut off mid-JSON, and the answer
+					-- is to send less rather than to send the same thing again.
+					toolResult = string.format(
+						"error: tool input was not valid JSON (stop_reason: %s) — if it was truncated, retry with a smaller input",
+						tostring(result.stopReason))
 					Console.appendLine("[" .. tostring(block.name) .. ": parse error]", "error")
 				end
 				table.insert(toolResults, {

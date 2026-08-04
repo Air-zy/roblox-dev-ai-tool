@@ -409,12 +409,11 @@ local function streamMessage(args: {
 							-- input_json_delta, so `input` stays "".
 							inputParsed = HttpService:JSONDecode(block.input ~= "" and block.input or "{}")
 						end)
-						-- ponytail: Roblox's JSONEncode serialises an empty table as `[]`,
-						-- and there is no object sentinel. Safe today because every tool in
-						-- TOOLS has a required field, so input is never legitimately empty.
-						-- Upgrade path if a zero-arg tool is ever added: keep block.input as
-						-- the raw JSON string and splice it into the request body instead of
-						-- round-tripping through a Lua table.
+						-- nil on failure, and it stays nil: the caller uses it to decide
+						-- whether the tool may be dispatched at all. What must NOT reach
+						-- the wire is an empty table, which Roblox encodes as `[]` — see
+						-- Agent.toolInput, which owns that fallback. block.input keeps the
+						-- raw accumulated JSON for it, so do not stop retaining it.
 						block.inputParsed = inputParsed
 						if block.type == "server_tool_use" then
 							if callbacks.onServerToolUse then
