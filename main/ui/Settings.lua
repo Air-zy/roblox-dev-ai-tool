@@ -277,11 +277,16 @@ end
 -- =============================================================================
 -- Panel
 -- =============================================================================
-export type StatusRow = { label: string, value: string }
+-- `bar` is a 0..1 fraction; rows that carry one get a progress track drawn under
+-- the label/value line.
+export type StatusRow = { label: string, value: string, bar: number? }
 
 -- `statusProvider` is supplied by the entry point so Settings doesn't have to
 -- know about OAuth, the Terminal or the Agent.
-function Settings.mountPanel(parent: Instance, statusProvider: () -> { StatusRow }): (boolean?) -> ()
+function Settings.mountPanel(
+	parent: Instance,
+	statusProvider: () -> { StatusRow }
+): ((boolean?) -> (), () -> ())
 	-- Full-bleed scrim: dims the console and catches clicks outside the card.
 	local scrim = make("TextButton", {
 		Name = "SettingsScrim",
@@ -400,13 +405,15 @@ function Settings.mountPanel(parent: Instance, statusProvider: () -> { StatusRow
 			local line = make("Frame", {
 				Parent = statusBox,
 				BackgroundTransparency = 1,
-				Size = UDim2.new(1, 0, 0, 18),
+				-- A bar row keeps the same label/value line and hangs a 4px track
+				-- underneath it.
+				Size = UDim2.new(1, 0, 0, row.bar and 25 or 18),
 				LayoutOrder = i,
 			})
 			make("TextLabel", {
 				Parent = line,
 				BackgroundTransparency = 1,
-				Size = UDim2.new(0.4, 0, 1, 0),
+				Size = UDim2.new(0.4, 0, 0, 18),
 				FontFace = Theme.SANS,
 				TextSize = 11,
 				TextColor3 = Theme.TEXT_LO,
@@ -416,7 +423,7 @@ function Settings.mountPanel(parent: Instance, statusProvider: () -> { StatusRow
 			make("TextLabel", {
 				Parent = line,
 				BackgroundTransparency = 1,
-				Size = UDim2.new(0.6, 0, 1, 0),
+				Size = UDim2.new(0.6, 0, 0, 18),
 				Position = UDim2.new(0.4, 0, 0, 0),
 				FontFace = Theme.MONO,
 				TextSize = 11,
@@ -425,6 +432,26 @@ function Settings.mountPanel(parent: Instance, statusProvider: () -> { StatusRow
 				TextXAlignment = Enum.TextXAlignment.Right,
 				Text = row.value,
 			})
+			if row.bar then
+				local fraction = math.clamp(row.bar, 0, 1)
+				local track = make("Frame", {
+					Parent = line,
+					BackgroundColor3 = Theme.BG_SURFACE,
+					BorderSizePixel = 0,
+					Size = UDim2.new(1, 0, 0, 4),
+					Position = UDim2.new(0, 0, 0, 19),
+				})
+				make("UICorner", { Parent = track, CornerRadius = UDim.new(0, 2) })
+				local fill = make("Frame", {
+					Parent = track,
+					-- Red once the window is nearly spent, so a full bar reads as a
+					-- warning without needing a legend.
+					BackgroundColor3 = fraction >= 0.9 and Theme.ERR_CLR or Theme.ACCENT,
+					BorderSizePixel = 0,
+					Size = UDim2.fromScale(fraction, 1),
+				})
+				make("UICorner", { Parent = fill, CornerRadius = UDim.new(0, 2) })
+			end
 		end
 	end
 
@@ -459,9 +486,7 @@ function Settings.mountPanel(parent: Instance, statusProvider: () -> { StatusRow
 		TextColor3 = Theme.TEXT_LO,
 		TextWrapped = true,
 		TextXAlignment = Enum.TextXAlignment.Left,
-		Text = "output_config.effort — controls total token spend across thinking, "
-			.. "prose and tool calls. At lower effort Claude may skip thinking "
-			.. "entirely on easy inputs; that is expected, not a bug.",
+		Text = "Caps total token spend. Low effort may skip thinking entirely.",
 		LayoutOrder = 7,
 	})
 
@@ -485,9 +510,7 @@ function Settings.mountPanel(parent: Instance, statusProvider: () -> { StatusRow
 		TextColor3 = Theme.TEXT_LO,
 		TextWrapped = true,
 		TextXAlignment = Enum.TextXAlignment.Left,
-		Text = "Anthropic runs the searches server-side and cites its sources. "
-			.. "Useful for current Roblox API changes and engine docs. Billed per "
-			.. "search in addition to tokens.",
+		Text = "Server-side, with citations. Billed per search on top of tokens.",
 		LayoutOrder = 10,
 	})
 
@@ -509,9 +532,8 @@ function Settings.mountPanel(parent: Instance, statusProvider: () -> { StatusRow
 		TextColor3 = Theme.TEXT_LO,
 		TextWrapped = true,
 		TextXAlignment = Enum.TextXAlignment.Left,
-		Text = "Lets Claude execute Luau to test and benchmark code. Runs at plugin "
-			.. "permission level with no timeout — an unbounded loop will freeze Studio. "
-			.. "Effects are undoable; enable only in a place you can afford to lose.",
+		-- The freeze warning stays: it is the one thing that can cost the user work.
+		Text = "Runs Luau at plugin level, no timeout — an infinite loop freezes Studio.",
 		LayoutOrder = 13,
 	})
 
@@ -580,7 +602,9 @@ function Settings.mountPanel(parent: Instance, statusProvider: () -> { StatusRow
 	-- card is a child that consumes them.
 	scrim.MouseButton1Click:Connect(function() toggle(false) end)
 
-	return toggle
+	-- refreshStatus rides along so the caller can redraw the STATUS rows when an
+	-- async source (the usage endpoint) lands after the panel is already open.
+	return toggle, refreshStatus
 end
 
 return Settings

@@ -78,6 +78,10 @@ local onBusyChanged: ((boolean) -> ())? = nil
 -- Set while a turn is in flight; cleared the moment it settles. Agent.stop()
 -- calls this, which is what the Stop button drives.
 local stopCurrent: (() -> ())? = nil
+-- Running total for this session, the equivalent of the Session block in Claude
+-- Code's /usage. Plan limits are a separate thing and come from the usage
+-- endpoint (OAuth.fetchUsage); this is just what this session has spent.
+local totals = { input = 0, output = 0 }
 
 function Agent.Initialize(terminal: any, busyCallback: ((boolean) -> ())?)
 	term = terminal
@@ -90,6 +94,10 @@ end
 
 function Agent.reset()
 	conversation = {}
+end
+
+function Agent.usage(): { input: number, output: number }
+	return totals
 end
 
 function Agent.isBusy(): boolean
@@ -208,6 +216,15 @@ local function runTurn(turn: number)
 			end
 
 			bubble.setText(result.text or "(empty)")
+
+			-- Counted here rather than in the final-turn block below: a tool-use
+			-- turn returns early, and its tokens are just as billed.
+			if result.usage then
+				totals.input += (result.usage.input_tokens or 0)
+					+ (result.usage.cache_read_input_tokens or 0)
+					+ (result.usage.cache_creation_input_tokens or 0)
+				totals.output += result.usage.output_tokens or 0
+			end
 
 			-- One assistant message holding ALL content blocks. Splitting text and
 			-- tool_use into separate messages breaks the tool_use/tool_result
@@ -339,6 +356,8 @@ local function runTurn(turn: number)
 		onError = function(message: string)
 			if finish() then return end
 			warn("[Claude Code] " .. message)
+			-- Without this the thinking header keeps spinning on a dead request.
+			bubble.finishThinking()
 			bubble.setError(message)
 			if turn == 1 and #conversation > 0 then
 				table.remove(conversation, #conversation)

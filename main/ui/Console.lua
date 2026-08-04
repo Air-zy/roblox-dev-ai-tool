@@ -572,8 +572,18 @@ function Console.createBubble(): Bubble
 		Text = "⧉ raw",
 		AutoButtonColor = false,
 		Visible = false,
+		-- Faint until pointed at, so a long log doesn't read as a column of
+		-- buttons. Faded rather than hidden on purpose: hiding it would collapse
+		-- its 14px slot, and revealing it on hover would then shove every message
+		-- below down the log. Hover is on the button itself — MouseEnter on the
+		-- bubble is unreliable once the text boxes inside it are under the cursor.
+		TextTransparency = 0.55,
 		LayoutOrder = 1000,   -- below the answer; blocks number up from 1
 	})
+	sourceToggle.MouseEnter:Connect(function() sourceToggle.TextTransparency = 0 end)
+	sourceToggle.MouseLeave:Connect(function()
+		sourceToggle.TextTransparency = showingSource and 0 or 0.55
+	end)
 	local sourceBox, setSource = readOnlyBox(container, Theme.MONO, Theme.SMALL_SIZE, Theme.TEXT_MED)
 	sourceBox.Visible = false
 	sourceBox.LayoutOrder = 1001
@@ -650,6 +660,9 @@ end
 -- =============================================================================
 -- Collapsible thinking block
 -- =============================================================================
+local SPINNER = { "/", "-", "\\", "|" }
+local SPINNER_INTERVAL = 0.12
+
 function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinking
 	local host = parent or output
 	local container = make("Frame", {
@@ -670,7 +683,7 @@ function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinki
 		TextSize = Theme.SMALL_SIZE,
 		TextColor3 = Theme.THINK_CLR,
 		TextXAlignment = Enum.TextXAlignment.Left,
-		Text = "▶ thinking…",
+		Text = "▶ thinking",
 		AutoButtonColor = false,
 		LayoutOrder = 1,
 	})
@@ -695,10 +708,25 @@ function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinki
 
 	local expanded = false
 	local finished = false
+	local spinner = 1
+	local function render()
+		header.Text = (expanded and "▼ " or "▶ ") .. "thinking"
+			.. (finished and "" or (" " .. SPINNER[spinner]))
+	end
+	render()
+	task.spawn(function()
+		while not finished and container.Parent do
+			task.wait(SPINNER_INTERVAL)
+			if finished then break end   -- finish() may have landed during the wait
+			spinner = spinner % #SPINNER + 1
+			render()
+		end
+	end)
+
 	header.MouseButton1Click:Connect(function()
 		expanded = not expanded
 		body.Visible = expanded
-		header.Text = (expanded and "▼ " or "▶ ") .. (finished and "thinking" or "thinking…")
+		render()
 		Console.scrollToBottom()
 	end)
 
@@ -712,7 +740,7 @@ function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinki
 		end,
 		finish = function()
 			finished = true
-			header.Text = (expanded and "▼ " or "▶ ") .. "thinking"
+			render()
 		end,
 		destroy = function()
 			container:Destroy()

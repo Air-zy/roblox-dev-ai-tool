@@ -238,7 +238,94 @@ fitOutput()
 -- =============================================================================
 -- Settings shouldn't know about OAuth, the Terminal or the Agent, so the entry
 -- point supplies the status rows.
-local toggleSettings = Settings.mountPanel(widget, function(): { Settings.StatusRow }
+
+-- The status value column truncates at end, so a raw token count would hide the
+-- output half of the row. 1.2M / 34.5k / 812.
+local function compact(n: number): string
+	if n >= 1e6 then return string.format("%.1fM", n / 1e6) end
+	if n >= 1000 then return string.format("%.1fk", n / 1000) end
+	return tostring(n)
+end
+
+-- Plan usage ------------------------------------------------------------------
+-- Held between openings so the bars are already on screen while a refresh is in
+-- flight, and so a rate-limited fetch (the usage endpoint has its own limit)
+-- leaves the last known numbers up instead of blanking them.
+local usageWindows: { [string]: any }? = nil
+local usageError: string? = nil
+local usageFetchedAt = 0
+local usageInFlight = false
+
+-- resets_at comes back as ISO 8601 with microseconds and a numeric offset
+-- ("2026-08-04T06:50:08.843137+00:00"), which DateTime.fromIsoDate rejects.
+-- Pull the fields out and rebuild the instant, applying the offset by hand.
+local function isoToEpoch(iso: string): number?
+	local y, mo, d, h, mi, s = iso:match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
+	if not y then return nil end
+	local ok, moment = pcall(function()
+		return DateTime.fromUniversalTime(
+			tonumber(y) :: number, tonumber(mo) :: number, tonumber(d) :: number,
+			tonumber(h) :: number, tonumber(mi) :: number, tonumber(s) :: number
+		)
+	end)
+	if not ok then return nil end
+	local epoch = moment.UnixTimestamp
+	local sign, offH, offM = iso:match("([%+%-])(%d%d):(%d%d)$")
+	if sign then
+		local shift = (tonumber(offH) :: number) * 3600 + (tonumber(offM) :: number) * 60
+		epoch += if sign == "+" then -shift else shift
+	end
+	return epoch
+end
+
+local function untilReset(resetsAt: any): string
+	if type(resetsAt) == "string" then
+		resetsAt = isoToEpoch(resetsAt)
+	end
+	if type(resetsAt) ~= "number" then return "" end
+	local seconds = resetsAt - os.time()
+	if seconds <= 0 then return "resets now" end
+	if seconds < 3600 then return string.format("resets in %dm", math.floor(seconds / 60)) end
+	if seconds < 86400 then
+		return string.format("resets in %dh %dm", math.floor(seconds / 3600), math.floor(seconds % 3600 / 60))
+	end
+	return string.format("resets in %dd %dh", math.floor(seconds / 86400), math.floor(seconds % 86400 / 3600))
+end
+
+-- ponytail: the endpoint's utilization scale isn't documented, and both 0..1 and
+-- 0..100 appear in the wild. Anything above 1 is read as a percentage. Drop the
+-- branch once the live response settles it.
+local function fraction(utilization: any): number?
+	if type(utilization) ~= "number" then return nil end
+	return math.clamp(if utilization > 1 then utilization / 100 else utilization, 0, 1)
+end
+
+local function usageRows(rows: { Settings.StatusRow })
+	if not OAuth.isLoggedIn() then return end
+	if not usageWindows then
+		table.insert(rows, { label = "Plan usage", value = usageError or "loading…" })
+		return
+	end
+	for _, window in ipairs({
+		{ key = "five_hour", label = "Session (5h)" },
+		{ key = "seven_day", label = "Weekly" },
+	}) do
+		local data = usageWindows[window.key]
+		if type(data) == "table" then
+			local used = fraction(data.utilization)
+			if used then
+				local age = usageError and " · stale" or ""
+				table.insert(rows, {
+					label = window.label,
+					value = string.format("%d%% · %s%s", math.floor(used * 100 + 0.5), untilReset(data.resets_at), age),
+					bar = used,
+				})
+			end
+		end
+	end
+end
+
+local toggleSettings, refreshSettings = Settings.mountPanel(widget, function(): { Settings.StatusRow }
 	local rows: { Settings.StatusRow } = {}
 
 	if OAuth.isLoggedIn() then
@@ -252,17 +339,46 @@ local toggleSettings = Settings.mountPanel(widget, function(): { Settings.Status
 		table.insert(rows, { label = "Signed in", value = "no — /login" })
 	end
 
-	table.insert(rows, { label = "Model", value = Settings.model() })
-	table.insert(rows, { label = "Thinking", value = Settings.effortName() })
-	local searches = Settings.webSearchMaxUses()
-	table.insert(rows, { label = "Web search", value = searches > 0 and ("max " .. searches) or "disabled" })
-	table.insert(rows, { label = "Run code", value = Settings.allowRun() and "enabled" or "disabled" })
+	usageRows(rows)
+	-- Model, effort, web search and run-code are NOT repeated here: each has a
+	-- dropdown a few rows down showing the same value, and the console header
+	-- already carries model · effort.
 	table.insert(rows, { label = "Working dir", value = term:pwd() })
 	table.insert(rows, { label = "Messages", value = tostring(#Agent.conversation()) })
-	table.insert(rows, { label = "Status", value = Agent.isBusy() and "streaming" or "idle" })
+	local usage = Agent.usage()
+	table.insert(rows, {
+		label = "Tokens",
+		value = string.format("%s in · %s out", compact(usage.input), compact(usage.output)),
+	})
 	return rows
 end)
-settingsButton.MouseButton1Click:Connect(function() toggleSettings(nil) end)
+
+-- The bars come from a network call, so they can't be produced inside the
+-- synchronous status provider above. Fetch on open, redraw when it lands.
+local USAGE_MAX_AGE = 60
+local function refreshUsage()
+	if usageInFlight or not OAuth.isLoggedIn() then return end
+	if usageWindows and os.clock() - usageFetchedAt < USAGE_MAX_AGE then return end
+	usageInFlight = true
+	task.spawn(function()
+		local windows, err = OAuth.fetchUsage()
+		usageInFlight = false
+		if windows then
+			usageWindows = windows
+			usageError = nil
+			usageFetchedAt = os.clock()
+		else
+			-- Keep the previous bars; the message tells the row to mark them stale.
+			usageError = err
+		end
+		refreshSettings()
+	end)
+end
+
+settingsButton.MouseButton1Click:Connect(function()
+	refreshUsage()
+	toggleSettings(nil)
+end)
 
 local function refreshStatus()
 	statusLabel.Text = string.format("%s · %s", Settings.model(), Settings.effortName():lower())

@@ -44,6 +44,12 @@ local AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 local TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 local REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
 local SCOPES = "org:create_api_key user:profile user:inference"
+-- Subscription usage, the same endpoint Claude Code's /usage reads for its plan
+-- bars. Not in the public API reference (that documents the API-key rate limit
+-- headers, which OAuth traffic doesn't get). Confirmed live: this host answers
+-- with authentication_error on a bad bearer, so the route is real;
+-- claude.ai/api/oauth/usage is fronted by a bot check and 403s.
+local USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
 -- Setting keys (no dots, no backslashes — Plugin:SetSetting silently fails otherwise)
 local KEY_ACCESS_TOKEN = "claude_access_token"
@@ -411,6 +417,50 @@ local function getAccessToken(): (string?, string?)
 	return at, nil
 end
 
+-- Current plan usage: one entry per limit window, each carrying a utilization
+-- and the time it resets. Claude Code reads five_hour and seven_day out of this
+-- for its two bars (a seven_day_overage_included window rides along when the
+-- account has usage credits). Blocking, like every other call here — run it from
+-- a task.spawn. Returns (windows, nil) or (nil, errorMessage).
+local function fetchUsage(): ({ [string]: any }?, string?)
+	local token, tokenErr = getAccessToken()
+	if not token then
+		return nil, tokenErr or "Not logged in."
+	end
+
+	local ok, response = pcall(function()
+		return HttpService:RequestAsync({
+			Url = USAGE_URL,
+			Method = "GET",
+			Headers = {
+				["Authorization"] = "Bearer " .. token,
+				["accept"] = "application/json",
+				-- Same identifier the message stream sends. The OAuth routes gate
+				-- on it, so a request without it can come back 403 even with a
+				-- valid token.
+				["x-app"] = "cli",
+			},
+		})
+	end)
+	if not ok then
+		return nil, "usage request failed: " .. tostring(response)
+	end
+
+	local res = response :: any
+	if res.StatusCode ~= 200 then
+		return nil, string.format("usage: HTTP %d %s", res.StatusCode, tostring(res.StatusMessage))
+	end
+
+	local parsed
+	local parseOk = pcall(function()
+		parsed = HttpService:JSONDecode(res.Body)
+	end)
+	if not parseOk or type(parsed) ~= "table" then
+		return nil, "usage: response was not JSON"
+	end
+	return parsed :: any, nil
+end
+
 local function logout()
 	clearTokens()
 	clearPkceState()
@@ -428,6 +478,7 @@ return {
 	completeLogin = completeLogin,
 	isLoggedIn = isLoggedIn,
 	getAccessToken = getAccessToken,
+	fetchUsage = fetchUsage,
 	logout = logout,
 	refresh = refresh,
 	tokenExpiry = tokenExpiry,
