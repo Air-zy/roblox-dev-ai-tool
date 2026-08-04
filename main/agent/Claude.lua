@@ -181,8 +181,8 @@ local function streamMessage(args: {
 		onThinking: ((string) -> ())?,
 		onToolUseStart: ((number, string) -> ())?,  -- (index, toolName)
 		onToolUseDelta: ((number, string) -> ())?,   -- (index, partialJson)
-		onServerToolUse: ((string, any) -> ())?,     -- (toolName, parsedInput)
-		onServerToolResult: ((string, number) -> ())?, -- (toolName, resultCount)
+		onServerToolUse: ((string, string?, any) -> ())?,  -- (toolName, blockId, parsedInput)
+		onServerToolResult: ((string, string?, any) -> ())?, -- (toolName, toolUseId, rawContent)
 		onComplete: ((any) -> ())?,
 		onError: ((string, string?) -> ())?,
 	}): { cancelled: boolean, cancel: () -> () }
@@ -360,8 +360,9 @@ local function streamMessage(args: {
 						citations = nil,
 					}
 					if block.type == "web_search_tool_result" and callbacks.onServerToolResult then
-						local results = block.content
-						callbacks.onServerToolResult("web_search", type(results) == "table" and #results or 0)
+						-- Handed over raw: the caller pairs it with the server_tool_use
+						-- it answers via tool_use_id, and decides what of it to show.
+						callbacks.onServerToolResult("web_search", block.tool_use_id, block.content)
 					end
 
 				elseif currentEvent == "content_block_delta" then
@@ -417,7 +418,7 @@ local function streamMessage(args: {
 						block.inputParsed = inputParsed
 						if block.type == "server_tool_use" then
 							if callbacks.onServerToolUse then
-								callbacks.onServerToolUse(block.name or "unknown", inputParsed)
+								callbacks.onServerToolUse(block.name or "unknown", block.id, inputParsed)
 							end
 						elseif callbacks.onToolUseStart then
 							callbacks.onToolUseStart(idx, block.name or "unknown")

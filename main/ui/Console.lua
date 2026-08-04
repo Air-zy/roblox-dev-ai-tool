@@ -735,6 +735,11 @@ end
 -- Collapsed by default, same shape as the thinking block: the header carries the
 -- tool name and shortened arguments, and clicking it reveals the untruncated
 -- input and result.
+--
+-- `result` may be omitted and supplied later through the returned setResult:
+-- server tools (web search) are run by Anthropic, so their call and their result
+-- arrive as two separate stream blocks and the header has to go up before the
+-- results exist, or the user watches a silent console while a search runs.
 function Console.appendToolCall(toolName: string, input: { [string]: any }, result: string?)
 	local keys: { string } = {}
 	for k in pairs(input) do
@@ -747,16 +752,6 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 	for _, k in ipairs(keys) do
 		table.insert(summary, k .. "=" .. summarise(input[k]))
 		table.insert(detail, k .. ": " .. verbatim(input[k]))
-	end
-	if result then
-		table.insert(detail, "")
-		table.insert(detail, result)
-	end
-
-	local body = table.concat(detail, "\n")
-	if #body > MAX_DETAIL_CHARS then
-		body = body:sub(1, MAX_DETAIL_CHARS)
-			.. string.format("\n… %d more characters", #body - MAX_DETAIL_CHARS)
 	end
 
 	local order = #output:GetChildren() + 1
@@ -791,7 +786,21 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 	detailBox.Visible = false
 	detailBox.LayoutOrder = 2
 	make("UIPadding", { Parent = detailBox, PaddingLeft = UDim.new(0, 12) })
-	setDetail(body)
+
+	local function renderDetail(res: string?)
+		local lines = table.clone(detail)
+		if res then
+			table.insert(lines, "")
+			table.insert(lines, res)
+		end
+		local body = table.concat(lines, "\n")
+		if #body > MAX_DETAIL_CHARS then
+			body = body:sub(1, MAX_DETAIL_CHARS)
+				.. string.format("\n… %d more characters", #body - MAX_DETAIL_CHARS)
+		end
+		setDetail(body)
+	end
+	renderDetail(result)
 
 	local expanded = false
 	header.MouseButton1Click:Connect(function()
@@ -802,6 +811,12 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 	end)
 
 	Console.scrollToBottom()
+	return {
+		setResult = function(res: string)
+			renderDetail(res)
+			if expanded then Console.scrollToBottom() end
+		end,
+	}
 end
 
 return Console

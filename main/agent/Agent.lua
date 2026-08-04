@@ -46,6 +46,25 @@ local function toolInput(block: any): any
 	return { _unparsed = string.sub(tostring(block.input or ""), 1, 200) }
 end
 
+-- A web_search_tool_result's content is either the list of hits or a single
+-- error object. Each hit also carries `encrypted_content`, a multi-KB opaque
+-- blob that exists only so the result can be replayed on the next turn — it is
+-- deliberately not shown, or the details panel would be a wall of base64.
+local function formatServerResult(content: any): string
+	if type(content) ~= "table" then return tostring(content) end
+	if content.type == "web_search_tool_result_error" then
+		return "error: " .. tostring(content.error_code)
+	end
+	local lines: { string } = {}
+	for i, hit in ipairs(content) do
+		table.insert(lines, string.format("%d. %s", i, tostring(hit.title or "(untitled)")))
+		if hit.url then table.insert(lines, "   " .. tostring(hit.url)) end
+	end
+	if #lines == 0 then return "(no results)" end
+	table.insert(lines, 1, string.format("%d results", #content))
+	return table.concat(lines, "\n")
+end
+
 -- Our registered tools, plus Anthropic's server-side web search when the user
 -- has turned it on. Server tools need no dispatcher: the API runs them.
 --
@@ -131,6 +150,9 @@ local function runTurn(turn: number)
 	local bubble = Console.createBubble()
 	local text = ""
 	local finished = false
+	-- server_tool_use id -> the console block waiting for its result. Keyed by id
+	-- rather than "the last one", because a turn can run several searches.
+	local serverCalls: { [string]: any } = {}
 
 	local function finish()
 		if finished then return true end
@@ -187,13 +209,26 @@ local function runTurn(turn: number)
 			bubble.setText(text)
 		end,
 
-		onServerToolUse = function(name: string, input: any)
-			local query = type(input) == "table" and input.query or nil
-			Console.appendLine(string.format("[%s: %s]", name, tostring(query or "…")), "cmd")
+		onServerToolUse = function(name: string, id: string?, input: any)
+			-- Header goes up now, results are filled in when they arrive: the API
+			-- runs these itself and sends the call and its result as two separate
+			-- blocks, so waiting for both would leave the console silent for the
+			-- whole search.
+			local call = Console.appendToolCall(name, type(input) == "table" and input or {})
+			if id then serverCalls[id] = call end
 		end,
 
-		onServerToolResult = function(name: string, count: number)
-			Console.appendLine(string.format("  %d results", count), "info")
+		onServerToolResult = function(name: string, toolUseId: string?, content: any)
+			local body = formatServerResult(content)
+			local call = if toolUseId then serverCalls[toolUseId] else nil
+			if call then
+				serverCalls[toolUseId :: string] = nil
+				call.setResult(body)
+			else
+				-- No matching call block seen; still show the result rather than
+				-- dropping it on the floor.
+				Console.appendToolCall(name, {}, body)
+			end
 		end,
 
 		onComplete = function(result: any)
