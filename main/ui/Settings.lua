@@ -132,9 +132,9 @@ local function sectionLabel(parent: Instance, text: string, order: number)
 	make("TextLabel", {
 		Parent = parent,
 		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 18),
+		Size = UDim2.new(1, 0, 0, 22),
 		FontFace = Theme.SANS_BOLD,
-		TextSize = 11,
+		TextSize = 13,
 		TextColor3 = Theme.TEXT_LO,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Text = text,
@@ -175,7 +175,7 @@ local function dropdown(
 		BackgroundColor3 = Theme.BG_DARK,
 		BorderColor3 = Theme.BORDER,
 		BorderSizePixel = 1,
-		Size = UDim2.new(1, 0, 0, 28),
+		Size = UDim2.new(1, 0, 0, 32),
 		FontFace = Theme.SANS,
 		TextSize = Theme.SMALL_SIZE,
 		TextColor3 = Theme.TEXT_HI,
@@ -193,7 +193,7 @@ local function dropdown(
 		Size = UDim2.new(0, 16, 1, 0),
 		Position = UDim2.new(1, -6, 0, 0),
 		FontFace = Theme.SANS,
-		TextSize = 10,
+		TextSize = 12,
 		TextColor3 = Theme.TEXT_LO,
 		Text = "▼",
 	})
@@ -219,7 +219,7 @@ local function dropdown(
 		local row = make("TextButton", {
 			Parent = list,
 			BackgroundTransparency = 1,
-			Size = UDim2.new(1, 0, 0, 26),
+			Size = UDim2.new(1, 0, 0, 30),
 			FontFace = Theme.SANS,
 			TextSize = Theme.SMALL_SIZE,
 			TextColor3 = Theme.TEXT_MED,
@@ -236,7 +236,7 @@ local function dropdown(
 			Size = UDim2.new(0, 140, 1, 0),
 			Position = UDim2.new(1, -140, 0, 0),
 			FontFace = Theme.SANS,
-			TextSize = 10,
+			TextSize = 12,
 			TextColor3 = Theme.TEXT_LO,
 			TextXAlignment = Enum.TextXAlignment.Right,
 			Text = option.hint,
@@ -310,31 +310,33 @@ function Settings.mountPanel(
 		BackgroundColor3 = Theme.BG_SURFACE,
 		BorderColor3 = Theme.BORDER,
 		BorderSizePixel = 1,
-		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.new(1, -10, 0, 38),
-		Size = UDim2.new(0, 380, 1, -56),
+		-- Centred rather than pinned to the top-right corner: it can then be wider
+		-- than a corner card without crowding the edge, and the eye lands on it.
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.new(1, -80, 1, -60),
 	})
 	make("UICorner", { Parent = card, CornerRadius = UDim.new(0, 8) })
-	-- Docked at the bottom of Studio the widget can be very short or very tall;
-	-- clamp so the card never outgrows a useful size or collapses to nothing.
+	-- The widget can be very short or very wide depending on where it is docked;
+	-- clamp so the card never outgrows a readable measure or collapses to nothing.
 	make("UISizeConstraint", {
 		Parent = card,
-		MinSize = Vector2.new(280, 160),
-		MaxSize = Vector2.new(380, 460),
+		MinSize = Vector2.new(300, 200),
+		MaxSize = Vector2.new(520, 640),
 	})
 
 	local header = make("Frame", {
 		Parent = card,
 		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 34),
+		Size = UDim2.new(1, 0, 0, 40),
 	})
 	make("TextLabel", {
 		Parent = header,
 		BackgroundTransparency = 1,
-		Size = UDim2.new(1, -46, 1, 0),
-		Position = UDim2.new(0, 14, 0, 0),
+		Size = UDim2.new(1, -56, 1, 0),
+		Position = UDim2.new(0, 18, 0, 0),
 		FontFace = Theme.SANS_BOLD,
-		TextSize = 13,
+		TextSize = 15,
 		TextColor3 = Theme.TEXT_HI,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Text = "Settings",
@@ -342,10 +344,10 @@ function Settings.mountPanel(
 	local closeButton = make("TextButton", {
 		Parent = header,
 		BackgroundTransparency = 1,
-		Size = UDim2.new(0, 32, 1, 0),
-		Position = UDim2.new(1, -34, 0, 0),
+		Size = UDim2.new(0, 36, 1, 0),
+		Position = UDim2.new(1, -40, 0, 0),
 		FontFace = Theme.SANS,
-		TextSize = 15,
+		TextSize = 17,
 		TextColor3 = Theme.TEXT_MED,
 		Text = "✕",
 	})
@@ -361,20 +363,20 @@ function Settings.mountPanel(
 		Parent = card,
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
-		Size = UDim2.new(1, 0, 1, -34),
-		Position = UDim2.new(0, 0, 0, 34),
+		Size = UDim2.new(1, 0, 1, -40),
+		Position = UDim2.new(0, 0, 0, 40),
 		CanvasSize = UDim2.new(1, 0, 0, 0),
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
 		ScrollBarThickness = 5,
 		ScrollBarImageColor3 = Theme.TEXT_LO,
 	})
-	make("UIListLayout", { Parent = scroll, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder })
+	make("UIListLayout", { Parent = scroll, Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder })
 	make("UIPadding", {
 		Parent = scroll,
-		PaddingLeft = UDim.new(0, 14),
-		PaddingRight = UDim.new(0, 14),
-		PaddingTop = UDim.new(0, 10),
-		PaddingBottom = UDim.new(0, 14),
+		PaddingLeft = UDim.new(0, 18),
+		PaddingRight = UDim.new(0, 18),
+		PaddingTop = UDim.new(0, 12),
+		PaddingBottom = UDim.new(0, 18),
 	})
 
 	-- Status ------------------------------------------------------------------
@@ -407,15 +409,15 @@ function Settings.mountPanel(
 				BackgroundTransparency = 1,
 				-- A bar row keeps the same label/value line and hangs a 4px track
 				-- underneath it.
-				Size = UDim2.new(1, 0, 0, row.bar and 25 or 18),
+				Size = UDim2.new(1, 0, 0, row.bar and 29 or 21),
 				LayoutOrder = i,
 			})
 			make("TextLabel", {
 				Parent = line,
 				BackgroundTransparency = 1,
-				Size = UDim2.new(0.4, 0, 0, 18),
+				Size = UDim2.new(0.4, 0, 0, 21),
 				FontFace = Theme.SANS,
-				TextSize = 11,
+				TextSize = 13,
 				TextColor3 = Theme.TEXT_LO,
 				TextXAlignment = Enum.TextXAlignment.Left,
 				Text = row.label,
@@ -423,10 +425,10 @@ function Settings.mountPanel(
 			make("TextLabel", {
 				Parent = line,
 				BackgroundTransparency = 1,
-				Size = UDim2.new(0.6, 0, 0, 18),
+				Size = UDim2.new(0.6, 0, 0, 21),
 				Position = UDim2.new(0.4, 0, 0, 0),
 				FontFace = Theme.MONO,
-				TextSize = 11,
+				TextSize = 13,
 				TextColor3 = Theme.TEXT_MED,
 				TextTruncate = Enum.TextTruncate.AtEnd,
 				TextXAlignment = Enum.TextXAlignment.Right,
@@ -439,7 +441,7 @@ function Settings.mountPanel(
 					BackgroundColor3 = Theme.BG_SURFACE,
 					BorderSizePixel = 0,
 					Size = UDim2.new(1, 0, 0, 4),
-					Position = UDim2.new(0, 0, 0, 19),
+					Position = UDim2.new(0, 0, 0, 22),
 				})
 				make("UICorner", { Parent = track, CornerRadius = UDim.new(0, 2) })
 				local fill = make("Frame", {
@@ -482,7 +484,7 @@ function Settings.mountPanel(
 		Size = UDim2.new(1, 0, 0, 26),
 		AutomaticSize = Enum.AutomaticSize.Y,
 		FontFace = Theme.SANS,
-		TextSize = 10,
+		TextSize = 12,
 		TextColor3 = Theme.TEXT_LO,
 		TextWrapped = true,
 		TextXAlignment = Enum.TextXAlignment.Left,
@@ -506,7 +508,7 @@ function Settings.mountPanel(
 		Size = UDim2.new(1, 0, 0, 26),
 		AutomaticSize = Enum.AutomaticSize.Y,
 		FontFace = Theme.SANS,
-		TextSize = 10,
+		TextSize = 12,
 		TextColor3 = Theme.TEXT_LO,
 		TextWrapped = true,
 		TextXAlignment = Enum.TextXAlignment.Left,
@@ -528,7 +530,7 @@ function Settings.mountPanel(
 		Size = UDim2.new(1, 0, 0, 26),
 		AutomaticSize = Enum.AutomaticSize.Y,
 		FontFace = Theme.SANS,
-		TextSize = 10,
+		TextSize = 12,
 		TextColor3 = Theme.TEXT_LO,
 		TextWrapped = true,
 		TextXAlignment = Enum.TextXAlignment.Left,
@@ -544,9 +546,9 @@ function Settings.mountPanel(
 		BackgroundColor3 = Theme.BG_DARK,
 		BorderColor3 = Theme.BORDER,
 		BorderSizePixel = 1,
-		Size = UDim2.new(1, 0, 0, 96),
+		Size = UDim2.new(1, 0, 0, 120),
 		FontFace = Theme.MONO,
-		TextSize = 11,
+		TextSize = 13,
 		TextColor3 = Theme.TEXT_HI,
 		TextWrapped = true,
 		MultiLine = true,
@@ -572,9 +574,9 @@ function Settings.mountPanel(
 		Parent = scroll,
 		BackgroundColor3 = Theme.BG_INPUT,
 		BorderSizePixel = 0,
-		Size = UDim2.new(0, 130, 0, 24),
+		Size = UDim2.new(0, 150, 0, 28),
 		FontFace = Theme.SANS,
-		TextSize = 11,
+		TextSize = 13,
 		TextColor3 = Theme.TEXT_MED,
 		Text = "Reset to default",
 		LayoutOrder = 16,

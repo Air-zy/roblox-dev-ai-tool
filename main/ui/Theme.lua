@@ -38,8 +38,8 @@ Theme.MONO      = Font.fromName("RobotoMono", Enum.FontWeight.Regular)
 -- the markdown renderer needs this string form to switch into monospace mid-line.
 Theme.MONO_FACE = "RobotoMono"
 
-Theme.TEXT_SIZE = 14
-Theme.SMALL_SIZE = 12
+Theme.TEXT_SIZE = 16
+Theme.SMALL_SIZE = 14
 
 -- =============================================================================
 -- make — build an Instance from a property table

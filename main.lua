@@ -8,6 +8,8 @@
 
 assert(plugin ~= nil, "This script must run as a Roblox Studio plugin (the `plugin` global is missing).")
 
+local RunService = game:GetService("RunService")
+
 -- Modules are grouped by what they are, not listed flat. A module only ever
 -- reaches for a folder it does not live in when it genuinely crosses layers,
 -- which is why this is the only file that names all four.
@@ -42,13 +44,25 @@ Terminal.setRunGuard(Settings.allowRun)
 -- =============================================================================
 -- Widget + toolbar
 -- =============================================================================
+-- Float, not Bottom: there is no dock state for the centre viewport — Studio
+-- only docks to the four edges — so a floating window over the 3D view is as
+-- close as the API gets to "where the game world is".
+--
+-- initEnabled is FALSE. It is not just a first-run preference: a widget created
+-- with initEnabled true re-enables itself during playtest initialisation
+-- regardless of its saved state, which is half of why this kept appearing on
+-- Play. The other half is handled below.
+--
+-- The GUI id carries a suffix because Studio remembers dock position per id and
+-- that memory outranks InitialDockState. Under the old id the widget would stay
+-- docked to the bottom no matter what this says.
 local widgetInfo = DockWidgetPluginGuiInfo.new(
-	Enum.InitialDockState.Bottom,
-	true, false,
+	Enum.InitialDockState.Float,
+	false, false,
 	900, 320,
 	400, 140
 )
-local widget = plugin:CreateDockWidgetPluginGuiAsync("ClaudeCodeTerminal", widgetInfo)
+local widget = plugin:CreateDockWidgetPluginGuiAsync("ClaudeCodeTerminalFloat", widgetInfo)
 widget.Title = "Claude Code"
 -- DockWidgetPluginGui defaults to ZIndexBehavior.Global, where ZIndex is compared
 -- across the entire GUI rather than among siblings. Under Global, a child that
@@ -61,12 +75,46 @@ widget.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 local toolbar = plugin:CreateToolbar("Claude Code")
 local toggleButton = toolbar:CreateButton("ClaudeCodeToggle", "Claude Code", "")
 toggleButton.Click:Connect(function()
+	if RunService:IsRunning() then return end
 	widget.Enabled = not widget.Enabled
 end)
 widget:GetPropertyChangedSignal("Enabled"):Connect(function()
 	toggleButton:SetActive(widget.Enabled)
 end)
 toggleButton:SetActive(widget.Enabled)
+
+-- Edit-mode only. The plugin keeps running through a playtest — that is why the
+-- widget used to sit over the game — so the run state has to be watched, not
+-- just read once at load. IsEdit() is the inverse of IsRunning() except while
+-- paused, when both are false; IsRunning() is the one that stays true through a
+-- pause, which is what "still playtesting" means here.
+--
+-- Whether the panel was open is remembered so Stop puts it back exactly as it
+-- was, rather than leaving the user to reopen it every time.
+-- ponytail: polled once a second because Studio exposes no run-state signal.
+-- Swap it for an event the day one exists.
+local restoreAfterRun = false
+local function syncRunState()
+	if RunService:IsRunning() then
+		if widget.Enabled then
+			restoreAfterRun = true
+			widget.Enabled = false
+		end
+	elseif restoreAfterRun then
+		restoreAfterRun = false
+		widget.Enabled = true
+	end
+end
+syncRunState()
+
+local unloading = false
+plugin.Unloading:Connect(function() unloading = true end)
+task.spawn(function()
+	while not unloading do
+		task.wait(1)
+		syncRunState()
+	end
+end)
 
 -- =============================================================================
 -- Chrome

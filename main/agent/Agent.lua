@@ -215,7 +215,12 @@ local function runTurn(turn: number)
 				return
 			end
 
-			bubble.setText(result.text or "(empty)")
+			-- A turn that only thought and called a tool has no text of its own.
+			-- Printing "(empty)" for it was noise: the content is in the thinking
+			-- block and the tool call right above.
+			if result.text then
+				bubble.setText(result.text)
+			end
 
 			-- Counted here rather than in the final-turn block below: a tool-use
 			-- turn returns early, and its tokens are just as billed.
@@ -268,6 +273,9 @@ local function runTurn(turn: number)
 
 			table.insert(conversation, {
 				role = "assistant",
+				-- "(empty)" here is for the wire, not the screen: an assistant
+				-- message with empty content is rejected, and this branch only
+				-- runs when the turn produced no blocks at all.
 				content = #assistantContent > 0 and assistantContent or (result.text or "(empty)"),
 			})
 

@@ -10,6 +10,8 @@
 -- RichText survives only inside single paragraphs, where mixing weights in one
 -- wrapped label needs it.
 
+local HttpService = game:GetService("HttpService")
+
 local Theme = require(script.Parent:WaitForChild("Theme"))
 local Markdown = require(script.Parent:WaitForChild("Markdown"))
 
@@ -181,7 +183,7 @@ end
 -- block in place instead of rebuilding it.
 type Rendered = { node: GuiObject, set: (Markdown.Block) -> () }
 
-local HEADING_SIZE = { 20, 17, 15, 14, 13, 13 }
+local HEADING_SIZE = { 22, 19, 17, 16, 15, 15 }
 
 local function richLabel(parent: Instance, font: Font, size: number, color: Color3): TextLabel
 	return make("TextLabel", {
@@ -203,7 +205,7 @@ end
 -- richLabel is the RichText one, and it is deliberately NOT selectable. With
 -- RichText on, selection indices map to the RAW string — tags included — so
 -- copying a bold word would hand you `<b>word</b>`. Blocks that are already
--- verbatim (code, plain lines, the raw-source view) use readOnlyBox instead and
+-- verbatim (code, plain lines, tool detail) use readOnlyBox instead and
 -- are selectable; formatted prose stays a label.
 local renderers: { [string]: (Instance) -> Rendered } = {}
 
@@ -295,7 +297,7 @@ renderers.code = function(parent: Instance): Rendered
 	local header = make("Frame", {
 		Parent = frame,
 		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 14),
+		Size = UDim2.new(1, 0, 0, 16),
 		LayoutOrder = 1,
 	})
 	local langLabel = make("TextLabel", {
@@ -303,7 +305,7 @@ renderers.code = function(parent: Instance): Rendered
 		BackgroundTransparency = 1,
 		Size = UDim2.new(1, -72, 1, 0),
 		FontFace = Theme.SANS,
-		TextSize = 10,
+		TextSize = 12,
 		TextColor3 = Theme.TEXT_LO,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		RichText = false,
@@ -316,7 +318,7 @@ renderers.code = function(parent: Instance): Rendered
 		Position = UDim2.new(1, 0, 0, 0),
 		Size = UDim2.new(0, 68, 1, 0),
 		FontFace = Theme.SANS,
-		TextSize = 10,
+		TextSize = 12,
 		TextColor3 = Theme.TEXT_LO,
 		TextXAlignment = Enum.TextXAlignment.Right,
 		Text = "select all",
@@ -510,9 +512,6 @@ function Console.createBubble(): Bubble
 	})
 
 	local rendered: { Rendered & { kind: string } } = {}
-	-- Set while the raw-markdown view is up, so a block drawn mid-stream does
-	-- not pop back into view behind it.
-	local showingSource = false
 
 	-- Thinking lives INSIDE the bubble at LayoutOrder 0, above the answer blocks
 	-- (which start at 1). Creating it as a separate top-level child put it after
@@ -545,7 +544,6 @@ function Console.createBubble(): Bubble
 				rendered[i] = slot
 			end
 			slot.node.LayoutOrder = i
-			slot.node.Visible = not showingSource
 			slot.set(block)
 		end
 		for j = #rendered, #blocks + 1, -1 do
@@ -555,51 +553,10 @@ function Console.createBubble(): Bubble
 		Console.scrollToBottom()
 	end
 
-	-- Selection cannot cross widgets in Roblox — each TextBox is its own scope,
-	-- so there is no dragging from one paragraph into the next the way a text
-	-- editor lets you. This is the way around that: one toggle that swaps the
-	-- whole rendered reply for the raw markdown it was built from, in a single
-	-- selectable box. Raw markdown is also the more useful thing to paste back
-	-- than the rendered text would be.
-	local sourceToggle = make("TextButton", {
-		Parent = container,
-		BackgroundTransparency = 1,
-		Size = UDim2.new(0, 60, 0, 14),
-		FontFace = Theme.SANS,
-		TextSize = 10,
-		TextColor3 = Theme.TEXT_LO,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Text = "⧉ raw",
-		AutoButtonColor = false,
-		Visible = false,
-		-- Faint until pointed at, so a long log doesn't read as a column of
-		-- buttons. Faded rather than hidden on purpose: hiding it would collapse
-		-- its 14px slot, and revealing it on hover would then shove every message
-		-- below down the log. Hover is on the button itself — MouseEnter on the
-		-- bubble is unreliable once the text boxes inside it are under the cursor.
-		TextTransparency = 0.55,
-		LayoutOrder = 1000,   -- below the answer; blocks number up from 1
-	})
-	sourceToggle.MouseEnter:Connect(function() sourceToggle.TextTransparency = 0 end)
-	sourceToggle.MouseLeave:Connect(function()
-		sourceToggle.TextTransparency = showingSource and 0 or 0.55
-	end)
-	local sourceBox, setSource = readOnlyBox(container, Theme.MONO, Theme.SMALL_SIZE, Theme.TEXT_MED)
-	sourceBox.Visible = false
-	sourceBox.LayoutOrder = 1001
-
-	sourceToggle.MouseButton1Click:Connect(function()
-		showingSource = not showingSource
-		for _, slot in ipairs(rendered) do
-			slot.node.Visible = not showingSource
-		end
-		sourceBox.Visible = showingSource
-		sourceToggle.Text = showingSource and "⧉ rendered" or "⧉ raw"
-		if showingSource then
-			selectAll(sourceBox)
-		end
-		Console.scrollToBottom()
-	end)
+	-- No raw-markdown toggle here. It bought whole-reply selection (Roblox
+	-- selection cannot cross widgets, so paragraphs can't be dragged through),
+	-- but a button under every single reply was a worse cost. Code blocks keep
+	-- their own "select all", which is what actually gets copied.
 
 	local lastRender = 0
 	local pending: string? = nil
@@ -607,8 +564,6 @@ function Console.createBubble(): Bubble
 
 	local function render(md: string)
 		draw(Markdown.parse(md))
-		setSource(md)
-		sourceToggle.Visible = md ~= ""
 		lastRender = os.clock()
 	end
 
@@ -678,7 +633,7 @@ function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinki
 	local header = make("TextButton", {
 		Parent = container,
 		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 18),
+		Size = UDim2.new(1, 0, 0, 20),
 		FontFace = Theme.SANS,
 		TextSize = Theme.SMALL_SIZE,
 		TextColor3 = Theme.THINK_CLR,
@@ -751,11 +706,13 @@ end
 -- =============================================================================
 -- Tool calls
 -- =============================================================================
-local TOOL_PREVIEW_LINES = 5
-
 -- write/edit carry whole files in `content` and `old`/`new`. Printing those raw
--- would bury the console under the very source Claude just wrote.
+-- would bury the console under the very source Claude just wrote, so the header
+-- gets a one-line summary and the full text lives in the expandable body.
 local MAX_ARG_CHARS = 60
+-- A read of a large file comes back as one string. Past this the body is a wall
+-- nobody reads, and every character is a TextBox the DataModel has to lay out.
+local MAX_DETAIL_CHARS = 4000
 
 local function summarise(value: any): string
 	local text = tostring(value)
@@ -767,26 +724,84 @@ local function summarise(value: any): string
 	return truncated and (firstLine .. "…") or firstLine
 end
 
-function Console.appendToolCall(toolName: string, input: { [string]: any }, result: string?)
-	local parts: { string } = {}
-	for k, v in pairs(input) do
-		table.insert(parts, tostring(k) .. "=" .. summarise(v))
-	end
-	table.sort(parts)
-	Console.appendLine(string.format("[%s: %s]", toolName, table.concat(parts, " ")), "cmd")
+-- tostring on a table gives "table: 0x…", and multiedit's `edits` is a table.
+local function verbatim(value: any): string
+	if type(value) == "string" then return value end
+	local encoded
+	local ok = pcall(function() encoded = HttpService:JSONEncode(value) end)
+	return (ok and encoded) or tostring(value)
+end
 
-	if not result then return end
-	local shown = 0
-	for line in result:gmatch("[^\n]*") do
-		if shown >= TOOL_PREVIEW_LINES then
-			Console.appendLine("  …", "info")
-			break
-		end
-		if line ~= "" then
-			Console.appendLine("  " .. line, "info")
-			shown += 1
-		end
+-- Collapsed by default, same shape as the thinking block: the header carries the
+-- tool name and shortened arguments, and clicking it reveals the untruncated
+-- input and result.
+function Console.appendToolCall(toolName: string, input: { [string]: any }, result: string?)
+	local keys: { string } = {}
+	for k in pairs(input) do
+		table.insert(keys, tostring(k))
 	end
+	table.sort(keys)
+
+	local summary: { string } = {}
+	local detail: { string } = {}
+	for _, k in ipairs(keys) do
+		table.insert(summary, k .. "=" .. summarise(input[k]))
+		table.insert(detail, k .. ": " .. verbatim(input[k]))
+	end
+	if result then
+		table.insert(detail, "")
+		table.insert(detail, result)
+	end
+
+	local body = table.concat(detail, "\n")
+	if #body > MAX_DETAIL_CHARS then
+		body = body:sub(1, MAX_DETAIL_CHARS)
+			.. string.format("\n… %d more characters", #body - MAX_DETAIL_CHARS)
+	end
+
+	local order = #output:GetChildren() + 1
+	local container = make("Frame", {
+		Name = "ToolCall",
+		Parent = output,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		LayoutOrder = order,
+	})
+	make("UIListLayout", { Parent = container, SortOrder = Enum.SortOrder.LayoutOrder })
+
+	local label = if #summary > 0
+		then string.format("[%s: %s]", toolName, table.concat(summary, " "))
+		else string.format("[%s]", toolName)
+	local header = make("TextButton", {
+		Parent = container,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 20),
+		FontFace = Theme.MONO,
+		TextSize = Theme.SMALL_SIZE,
+		TextColor3 = Theme.ACCENT,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Text = "▶ " .. label,
+		AutoButtonColor = false,
+		LayoutOrder = 1,
+	})
+
+	local detailBox, setDetail = readOnlyBox(container, Theme.MONO, Theme.SMALL_SIZE, Theme.TEXT_MED)
+	detailBox.Visible = false
+	detailBox.LayoutOrder = 2
+	make("UIPadding", { Parent = detailBox, PaddingLeft = UDim.new(0, 12) })
+	setDetail(body)
+
+	local expanded = false
+	header.MouseButton1Click:Connect(function()
+		expanded = not expanded
+		detailBox.Visible = expanded
+		header.Text = (expanded and "▼ " or "▶ ") .. label
+		Console.scrollToBottom()
+	end)
+
+	Console.scrollToBottom()
 end
 
 return Console
