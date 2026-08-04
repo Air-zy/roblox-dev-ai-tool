@@ -105,7 +105,13 @@ local function applyReasoning(bodyTable: { [string]: any }, model: string, effor
 	end
 
 	if caps.thinking == "adaptive" then
-		bodyTable.thinking = { type = "adaptive" }
+		-- `display` defaults to "omitted" on current models, and omitted does not
+		-- mean "no thinking blocks" — it means the blocks arrive with an EMPTY
+		-- thinking field. The console's thinking drawer was therefore opening on
+		-- nothing at all. "summarized" is what actually puts words in it. Thinking
+		-- happens and is billed the same either way; this only controls whether
+		-- you get to read it.
+		bodyTable.thinking = { type = "adaptive", display = "summarized" }
 	elseif thinkingBudget and thinkingBudget > 0 then
 		bodyTable.thinking = { type = "enabled", budget_tokens = thinkingBudget }
 		-- Thinking tokens count against max_tokens, so the budget has to leave

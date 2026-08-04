@@ -377,6 +377,27 @@ HANDLERS.pwd = function(self)
 	return self:pwd()
 end
 
+-- whoami — who is running this, and where.
+--
+-- Marginal on its own, but it is a reflex command, it was answering "unknown
+-- command", and the place ids are genuinely worth having: an unpublished place
+-- reports 0, which tells the model up front that anything asset- or
+-- DataStore-shaped is going to fail for reasons that have nothing to do with
+-- its code.
+--
+-- Deliberately no username lookup. GetNameFromUserIdAsync yields, and handlers
+-- run inside the SSE stream callback where yielding stalls parsing mid-buffer.
+HANDLERS.whoami = function()
+	local StudioService = game:GetService("StudioService")
+	local ok, userId = pcall(function()
+		return StudioService:GetUserId()
+	end)
+	local who = (ok and userId and userId ~= 0) and tostring(userId) or "not signed in"
+	return string.format("user %s\nplace %d  game %d%s\nrunning as a Studio plugin",
+		who, game.PlaceId, game.GameId,
+		game.PlaceId == 0 and "  (unpublished)" or "")
+end
+
 HANDLERS.echo = function(_, argv)
 	-- Quoting is already resolved by the tokenizer, so this is also the cheapest
 	-- way to see how a line was actually split.
@@ -1071,7 +1092,7 @@ local READ_ONLY: { [string]: boolean } = {
 	cat = true, cd = true, diff = true, du = true, echo = true, file = true,
 	find = true, grep = true, egrep = true, fgrep = true, head = true, ls = true,
 	pwd = true, sed = true, stat = true, tail = true, tr = true, tree = true,
-	wc = true, which = true, basename = true, dirname = true,
+	wc = true, which = true, basename = true, dirname = true, whoami = true,
 }
 
 -- Commands that can consume a stream. Anything else in a pipeline is a mistake
@@ -1327,6 +1348,25 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		local path, count = takeCount(operands)
 		if path ~= "/a" or count ~= 20 then
 			return false, string.format("%q parsed as (%s, %s)", line, tostring(path), tostring(count))
+		end
+	end
+
+	-- Script suffixes. `ls` renders every script class as `.luau`, but a model
+	-- writes whichever form it knows, and all of them have to land on the same
+	-- instance — the class is a property in the DataModel, never part of a name.
+	for _, case in ipairs({
+		{ name = "Main.luau", want = "Main" },
+		{ name = "Main.lua", want = "Main" },
+		{ name = "Handler.server.luau", want = "Handler" },
+		{ name = "Handler.client.lua", want = "Handler" },
+		-- No suffix, and a name that is nothing but a suffix, both stay put.
+		{ name = "Main", want = nil },
+		{ name = ".luau", want = nil },
+		}) do
+		local got = Fs.stripScriptSuffix(case.name)
+		if got ~= case.want then
+			return false, string.format("stripScriptSuffix(%q) = %s, want %s",
+				case.name, tostring(got), tostring(case.want))
 		end
 	end
 

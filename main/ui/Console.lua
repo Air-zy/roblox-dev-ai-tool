@@ -26,7 +26,9 @@ local KIND_COLOR: { [string]: Color3 } = {
 	info      = Theme.TEXT_MED,
 	system    = Theme.TEXT_MED,
 }
-local KIND_PREFIX: { [string]: string } = { user = "❯ ", cmd = "$ " }
+-- No prefix for `user`: those lines are right-aligned now, and a leading arrow
+-- reads as a left-margin marker.
+local KIND_PREFIX: { [string]: string } = { cmd = "$ " }
 
 -- =============================================================================
 -- Mount
@@ -155,6 +157,18 @@ function Console.appendLine(text: string, kind: string?): TextBox
 	)
 	line.Name = "Line"
 	line.LayoutOrder = order
+
+	-- What you typed sits on the right, everything the plugin says on the left.
+	-- The console is one long column of monospace and a user turn used to be
+	-- just another line in it; side is the cheapest signal there is for "this
+	-- one was me". The left inset keeps a long message from spanning the full
+	-- width and losing the effect, and the prompt arrow comes off — it reads as
+	-- a left-margin marker and looks wrong leading a right-aligned line.
+	if kind == "user" then
+		line.TextXAlignment = Enum.TextXAlignment.Right
+		make("UIPadding", { Parent = line, PaddingLeft = UDim.new(0.22, 0) })
+	end
+
 	setLine((KIND_PREFIX[kind or ""] or "") .. text)
 	Console.scrollToBottom()
 	return line

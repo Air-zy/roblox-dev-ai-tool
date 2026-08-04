@@ -285,8 +285,26 @@ local function runTurn(turn: number)
 			end
 
 			if result.usage then
-				Console.appendLine(string.format("  %d in / %d out",
-					result.usage.input_tokens or 0, result.usage.output_tokens or 0), "system")
+				-- input_tokens is only the UNCACHED remainder, not the prompt
+				-- size. Printing it alone made a working cache look like a broken
+				-- counter: once the system prompt, the tools and the whole
+				-- conversation are cached, the fresh part of a follow-up turn
+				-- really is a couple of tokens, and "2 in" was the truth told in
+				-- the most alarming possible way. The real prompt is fresh + read
+				-- + written, so show all three.
+				local usage = result.usage
+				local fresh = usage.input_tokens or 0
+				local cacheRead = usage.cache_read_input_tokens or 0
+				local cacheWrite = usage.cache_creation_input_tokens or 0
+				local parts = { string.format("%d in", fresh + cacheRead + cacheWrite) }
+				if cacheRead > 0 then
+					table.insert(parts, string.format("%d cached", cacheRead))
+				end
+				if cacheWrite > 0 then
+					table.insert(parts, string.format("%d new to cache", cacheWrite))
+				end
+				table.insert(parts, string.format("%d out", usage.output_tokens or 0))
+				Console.appendLine("  " .. table.concat(parts, " · "), "system")
 			end
 			setBusy(false)
 		end,

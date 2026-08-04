@@ -109,9 +109,15 @@ function Fs.resolve(base: Instance, path: string?): (Instance?, string?)
 			-- files, then feeds those names straight back to cat/cd/head/grep.
 			-- Fixing this in resolve rather than in cat covers every command at
 			-- once. Exact name wins: an instance may genuinely be named "foo.luau".
+			--
+			-- Every suffix a Roblox developer might write is accepted, not just
+			-- `.luau` — `.lua`, and the `.server`/`.client` forms that name the
+			-- script class. All of them resolve to the same instance, because in
+			-- the DataModel the class is a property, not part of the name.
 			local child = current:FindFirstChild(seg)
-			if not child and seg:sub(-5) == ".luau" then
-				local stripped = current:FindFirstChild(seg:sub(1, -6))
+			if not child then
+				local bare = Fs.stripScriptSuffix(seg)
+				local stripped = bare and current:FindFirstChild(bare)
 				if stripped and isScript(stripped) then
 					child = stripped
 				end
@@ -124,6 +130,29 @@ function Fs.resolve(base: Instance, path: string?): (Instance?, string?)
 	end
 
 	return current, nil
+end
+
+-- Rojo's suffix convention, longest first so `.server.luau` is not mistaken for
+-- `.luau` with a `.server` name. `.lua` is accepted alongside `.luau` because
+-- half the ecosystem still writes it and a model will too.
+local SCRIPT_SUFFIXES = {
+	".server.luau", ".client.luau", ".server.lua", ".client.lua", ".luau", ".lua",
+}
+
+-- Strip a script suffix, or nil when there is none to strip.
+function Fs.stripScriptSuffix(name: string): string?
+	for _, suffix in ipairs(SCRIPT_SUFFIXES) do
+		if #name > #suffix and name:sub(-#suffix) == suffix then
+			return name:sub(1, -#suffix - 1)
+		end
+	end
+	return nil
+end
+
+-- What `ls` shows for an instance. Scripts get a `.luau` so a model reads them
+-- as files; everything else is its own name.
+function Fs.displayName(inst: Instance): string
+	return isScript(inst) and (inst.Name .. ".luau") or inst.Name
 end
 
 -- Split a path into parent and leaf; nil parent means "relative to the base".

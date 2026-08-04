@@ -47,6 +47,7 @@ local formatValue     = Fs.formatValue
 local countOccurrences = Fs.countOccurrences
 local splitPath       = Fs.splitPath
 local nameMatcher     = Fs.nameMatcher
+local displayName     = Fs.displayName
 
 local Terminal = {}
 Terminal.__index = Terminal
@@ -117,11 +118,8 @@ function Terminal:ls(path: string?, long: boolean?, filter: ((string) -> boolean
 	end
 	local names = {}
 	for _, child in ipairs(target:GetChildren()) do
-		local name = child.Name
-		-- Append .luau to scripts so Claude knows they're editable files
-		if isScript(child) then
-			name = name .. ".luau"
-		end
+		-- Appends .luau to scripts so Claude knows they're editable files.
+		local name = displayName(child)
 		-- Filter on the displayed name, so `ls *.luau` means what it looks like.
 		if not filter or filter(name) then
 			if long then
@@ -319,8 +317,13 @@ function Terminal:find(name: string?, path: string?, className: string?, maxDept
 			return
 		end
 		for _, child in ipairs(inst:GetChildren()) do
+			-- Matched against the DISPLAYED name as well as the real one. `ls`
+			-- prints scripts as `Main.luau`, so a model that read a listing will
+			-- reasonably search for `*.luau` — and no instance name has ever
+			-- contained that suffix, so matching only child.Name meant the most
+			-- natural search in the whole harness silently returned nothing.
 			local classOk = not className or className == "" or (child:IsA(className) ~= negate)
-			if matches(child.Name) and classOk then
+			if (matches(child.Name) or matches(displayName(child))) and classOk then
 				table.insert(results, instancePath(child) .. "  [" .. child.ClassName .. "]")
 			end
 			walk(child, depth + 1)
@@ -545,7 +548,11 @@ local function resolveDestination(self: any, destination: string, name: string?)
 	if not parent then
 		return nil, nil, parentErr
 	end
-	return parent, name or leaf, nil
+	-- `cp Main.luau Backup.luau` means an instance called Backup, not one called
+	-- "Backup.luau". The suffix is how `ls` renders a script class, not part of
+	-- any name, so carrying it into a new instance would create something that
+	-- prints as `Backup.luau.luau` the next time it is listed.
+	return parent, name or Fs.stripScriptSuffix(leaf) or leaf, nil
 end
 
 -- rm: destroy an instance.
