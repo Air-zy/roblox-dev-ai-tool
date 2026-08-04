@@ -20,6 +20,21 @@ local make = Theme.make
 local Console = {}
 local output: ScrollingFrame = nil :: any
 
+-- Sticky bottom. Writing CanvasPosition straight after adding content did not
+-- work: AutomaticCanvasSize recomputes the canvas a step LATER, so the write was
+-- clamped against the old, shorter canvas and landed short — while a reply
+-- streamed, the view sat permanently a block behind the text. Pinning from the
+-- AbsoluteCanvasSize signal instead fires exactly when the canvas has grown,
+-- which is the only moment the bottom is knowable.
+--
+-- Only follows while the reader is already at the bottom, so scrolling up to
+-- read something mid-reply is not fought; scrolling back down re-arms it. That
+-- state is recomputed from the position itself rather than by trying to tell our
+-- writes apart from the user's, which is self-correcting: our own write lands at
+-- the bottom and therefore re-arms.
+local STICK_SLOP = 16
+local stickToBottom = true
+
 local KIND_COLOR: { [string]: Color3 } = {
 	user      = Theme.ACCENT,
 	assistant = Theme.TEXT_HI,
@@ -61,16 +76,31 @@ function Console.mount(parent: Instance, layoutOrder: number): ScrollingFrame
 		PaddingTop = UDim.new(0, 6),
 		PaddingBottom = UDim.new(0, 6),
 	})
+
+	output:GetPropertyChangedSignal("AbsoluteCanvasSize"):Connect(function()
+		if stickToBottom then
+			output.CanvasPosition = Vector2.new(0, math.huge)
+		end
+	end)
+	output:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
+		stickToBottom = output.CanvasPosition.Y
+			>= output.AbsoluteCanvasSize.Y - output.AbsoluteWindowSize.Y - STICK_SLOP
+	end)
 	return output
 end
 
-function Console.scrollToBottom()
-	task.defer(function()
-		output.CanvasPosition = Vector2.new(0, math.huge)
-	end)
+-- `force` re-arms following even if the reader had scrolled up — for things they
+-- just did themselves, like sending a message.
+function Console.scrollToBottom(force: boolean?)
+	if force then stickToBottom = true end
+	if not stickToBottom then return end
+	-- Deliberately math.huge rather than the measured canvas: the engine clamps,
+	-- and the measurement can still be one step stale here.
+	output.CanvasPosition = Vector2.new(0, math.huge)
 end
 
 function Console.clear()
+	stickToBottom = true  -- an empty console is at its bottom by definition
 	for _, child in ipairs(output:GetChildren()) do
 		if child:IsA("GuiObject") then
 			child:Destroy()
@@ -172,7 +202,7 @@ function Console.appendLine(text: string, kind: string?): TextBox
 	end
 
 	setLine((KIND_PREFIX[kind or ""] or "") .. text)
-	Console.scrollToBottom()
+	Console.scrollToBottom(kind == "user")
 	return line
 end
 
@@ -740,7 +770,9 @@ end
 -- server tools (web search) are run by Anthropic, so their call and their result
 -- arrive as two separate stream blocks and the header has to go up before the
 -- results exist, or the user watches a silent console while a search runs.
-function Console.appendToolCall(toolName: string, input: { [string]: any }, result: string?)
+-- `isError` only recolours the header; the body is the same expandable detail,
+-- which is the point — a failed call is exactly the one you want to open.
+function Console.appendToolCall(toolName: string, input: { [string]: any }, result: string?, isError: boolean?)
 	local keys: { string } = {}
 	for k in pairs(input) do
 		table.insert(keys, tostring(k))
@@ -774,7 +806,7 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 		Size = UDim2.new(1, 0, 0, 20),
 		FontFace = Theme.MONO,
 		TextSize = Theme.SMALL_SIZE,
-		TextColor3 = Theme.ACCENT,
+		TextColor3 = isError and Theme.ERR_CLR or Theme.ACCENT,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextTruncate = Enum.TextTruncate.AtEnd,
 		Text = "▶ " .. label,

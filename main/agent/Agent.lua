@@ -148,11 +148,28 @@ local function runTurn(turn: number)
 	end
 
 	local bubble = Console.createBubble()
-	local text = ""
+	local text = ""        -- every text delta of the turn; what the history gets
+	local bubbleText = ""  -- only the part belonging to the CURRENT bubble
 	local finished = false
 	-- server_tool_use id -> the console block waiting for its result. Keyed by id
 	-- rather than "the last one", because a turn can run several searches.
 	local serverCalls: { [string]: any } = {}
+
+	-- A server tool runs mid-stream, so its console block lands below a bubble
+	-- that is still being written to — and the text that comes AFTER the search
+	-- then renders above the search that produced it. (Our own tools never do
+	-- this: they are dispatched in onComplete, once the bubble is finished.) So a
+	-- server tool ends the current bubble and the next text starts a new one
+	-- below its block. Deferred rather than done on the spot, so consecutive
+	-- searches do not leave a row of empty bubbles between them.
+	local splitPending = false
+	local function splitBubble()
+		if not splitPending then return end
+		splitPending = false
+		bubble.finishThinking()
+		bubble = Console.createBubble()
+		bubbleText = ""
+	end
 
 	local function finish()
 		if finished then return true end
@@ -179,7 +196,7 @@ local function runTurn(turn: number)
 		-- partial tool_use is dropped, since it has no tool_result to pair with
 		-- and Anthropic would reject the pair on the next turn.
 		if text ~= "" then
-			bubble.setText(text)
+			bubble.setText(bubbleText)
 			table.insert(conversation, { role = "assistant", content = text })
 		elseif turn == 1 and #conversation > 0 then
 			-- Nothing generated yet: roll the user message back entirely.
@@ -200,16 +217,20 @@ local function runTurn(turn: number)
 		tools = buildTools(),
 	}, {
 		onThinking = function(delta: string)
+			splitBubble()
 			-- The bubble creates its thinking block on demand, above the answer.
 			bubble.thinking().append(delta)
 		end,
 
 		onText = function(delta: string)
+			splitBubble()
 			text ..= delta
-			bubble.setText(text)
+			bubbleText ..= delta
+			bubble.setText(bubbleText)
 		end,
 
 		onServerToolUse = function(name: string, id: string?, input: any)
+			splitPending = true
 			-- Header goes up now, results are filled in when they arrive: the API
 			-- runs these itself and sends the call and its result as two separate
 			-- blocks, so waiting for both would leave the console silent for the
@@ -250,11 +271,14 @@ local function runTurn(turn: number)
 				return
 			end
 
-			-- A turn that only thought and called a tool has no text of its own.
-			-- Printing "(empty)" for it was noise: the content is in the thinking
-			-- block and the tool call right above.
-			if result.text then
-				bubble.setText(result.text)
+			-- Final render, in case the last deltas landed inside the throttle
+			-- window. The streamed text is used rather than result.text because
+			-- only it is scoped to the current bubble — result.text is every text
+			-- block of the turn, including the ones already drawn in earlier
+			-- bubbles above a search. A turn that only thought and called a tool
+			-- has no text at all, and gets no empty render.
+			if bubbleText ~= "" then
+				bubble.setText(bubbleText)
 			end
 
 			-- Counted here rather than in the final-turn block below: a tool-use
@@ -340,7 +364,18 @@ local function runTurn(turn: number)
 					toolResult = string.format(
 						"error: tool input was not valid JSON (stop_reason: %s) — if it was truncated, retry with a smaller input",
 						tostring(result.stopReason))
-					Console.appendLine("[" .. tostring(block.name) .. ": parse error]", "error")
+					-- The raw fragment is the only thing that says WHERE the JSON
+					-- died, so it goes in the expandable body rather than being
+					-- summarised away. warn() as well: MAX_DETAIL_CHARS clips the
+					-- body, and a truncated multiedit is exactly the case that
+					-- overruns it — the Output window keeps the whole thing.
+					warn(string.format("[Claude Code] %s: unparsed tool input (stop_reason: %s): %s",
+						tostring(block.name), tostring(result.stopReason), tostring(block.input)))
+					Console.appendToolCall(
+						tostring(block.name) .. " parse error",
+						{ raw_input = tostring(block.input) },
+						toolResult,
+						true)
 				end
 				table.insert(toolResults, {
 					type = "tool_result",
