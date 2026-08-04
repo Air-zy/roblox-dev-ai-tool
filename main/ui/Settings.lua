@@ -29,9 +29,7 @@ local KEY_SYSTEM = "cc_system"
 local KEY_RUN    = "cc_allow_run"
 local KEY_SEARCH = "cc_web_search"
 
-local DEFAULT_SYSTEM = "You are Claude Code for Roblox, embedded in Roblox Studio. "
-	.. "You have a 'terminal' tool to navigate the Roblox DataModel tree. "
-	.. "Use it to inspect the game before answering. Be concise and code-focused."
+local DEFAULT_SYSTEM = ""
 Settings.DEFAULT_SYSTEM = DEFAULT_SYSTEM
 
 -- maxTokens is a hard ceiling on thinking PLUS answer, so it has to scale with

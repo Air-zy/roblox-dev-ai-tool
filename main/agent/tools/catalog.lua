@@ -4,6 +4,10 @@
 -- under a parent the caller names. Nothing is loaded on search because the
 -- catalog returns dozens of plausible results per query and inserting each would
 -- fill Workspace with instances the caller never inspected.
+--
+-- No pageNum: the underlying API returns nothing past page 2, so the parameter
+-- only ever bought the model a wasted turn. Results are filtered to public-domain
+-- Models and sorted by take count — see the catalog section of Terminal.
 return {
 	name = "catalog",
 	description = "search Roblox Free Models; load one by id",
@@ -12,7 +16,6 @@ return {
 		properties = {
 			action = { type = "string", enum = { "search", "load" } },
 			query = { type = "string" },
-			pageNum = { type = "number" },
 			assetId = { type = "number" },
 			parent = { type = "string" },
 		},
@@ -21,7 +24,7 @@ return {
 	run = function(term: any, input: { [string]: any }): string
 		local action = input.action
 		if action == "search" then
-			local s, err = term:catalogSearch(input.query, input.pageNum)
+			local s, err = term:catalogSearch(input.query)
 			return s or ("catalog: " .. tostring(err))
 		elseif action == "load" then
 			local s, err = term:catalogLoad(input.assetId, input.parent)

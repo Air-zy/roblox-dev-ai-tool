@@ -13,6 +13,14 @@ hierarchy into a `.rbxmx` in your Studio plugins folder (Rojo, or by hand).
 
 Requires HTTP requests enabled (`Game Settings → Security → Allow HTTP Requests`).
 
+`catalog` loads models through `game:GetObjects`, which needs no extra setting —
+`LoadAsset`/`LoadAssetAsync` both gate on ownership, and the switch that lifts it
+(`AssetService.AllowInsertFreeAssets`) is RobloxScriptSecurity, so a plugin can
+neither read nor set it. The tradeoff is that **GetObjects does not sandbox**:
+scripts inside a loaded model arrive live, where `LoadAssetAsync` would have
+stripped their capabilities. Loads report their script count for that reason —
+inspect before running anything.
+
 ## Use
 
 1. Click the **Claude Code** toolbar button to open the widget.
@@ -62,7 +70,7 @@ system-prompt settings; they persist via `plugin:SetSetting`.
 | `edit` / `multiedit` | unique substring swaps | atomic; one undo record per batch |
 | `write` | whole `.Source` | |
 | `run` | Luau source | **off by default**, plugin-permission level, no timeout |
-| `catalog` | search / load Free Models | `InsertService` |
+| `catalog` | search / load Free Models | filtered to public-domain Models, ranked by takes; loads unsandboxed |
 
 Path mapping: `/` = `game`, `/Workspace/Parts/Brick` = absolute, `.` `..` as usual.
 Scripts are listed with a `.luau` suffix. `-type f` is a script, `-type d` is
@@ -173,5 +181,6 @@ in every `find`, and sync to disk.
 Run at startup in a background task, results go to the Output window:
 `Sha256` (known vectors), `Markdown.selfTest()` (block parsing, inline escaping,
 every streaming prefix leaves RichText balanced), `Terminal.selfTest()` (tokenizer,
-flag parsing, globs, every command survives a bare invocation), `Props.selfTest()`
-(API-dump schema, superclass walk, serialization filter).
+flag parsing, globs, every command survives a bare invocation, catalog result
+filtering and ranking), `Props.selfTest()` (API-dump schema, superclass walk,
+serialization filter).
