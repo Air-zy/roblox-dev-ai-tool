@@ -11,6 +11,7 @@
 -- wrapped label needs it.
 
 local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
 
 local Theme = require(script.Parent:WaitForChild("Theme"))
 local Markdown = require(script.Parent:WaitForChild("Markdown"))
@@ -22,18 +23,30 @@ local output: ScrollingFrame = nil :: any
 -- The "Working…" row — see Console.setWorking.
 local workingRow: TextLabel = nil :: any
 
--- Sticky bottom. Writing CanvasPosition straight after adding content did not
--- work: AutomaticCanvasSize recomputes the canvas a step LATER, so the write was
--- clamped against the old, shorter canvas and landed short — while a reply
--- streamed, the view sat permanently a block behind the text. Pinning from the
--- AbsoluteCanvasSize signal instead fires exactly when the canvas has grown,
--- which is the only moment the bottom is knowable.
+-- Sticky bottom. ScrollingFrame has no bottom-pin and no scroll method — the
+-- whole API is CanvasPosition and two read-only measurements — so following the
+-- bottom is bookkeeping, and the only question is where to do it from.
 --
--- Only follows while the reader is already at the bottom, so scrolling up to
--- read something mid-reply is not fought; scrolling back down re-arms it. That
--- state is recomputed from the position itself rather than by trying to tell our
--- writes apart from the user's, which is self-correcting: our own write lands at
--- the bottom and therefore re-arms.
+-- Not from property signals, which is what the two earlier attempts here got
+-- wrong in opposite directions. Writing CanvasPosition right after adding
+-- content landed short, because AutomaticCanvasSize recomputes the canvas a step
+-- LATER and the write was clamped against the old, shorter one. Writing it from
+-- the AbsoluteCanvasSize signal instead had the same disease one layer down: the
+-- signal says the size CHANGED, not that layout has settled, and the docs do not
+-- say when the clamp bound is recomputed relative to it — so the view still
+-- crept further behind the longer a reply ran.
+--
+-- Everything therefore runs once per frame on Heartbeat, where the numbers are
+-- settled and no ordering has to be assumed.
+--
+-- The other half is telling the reader's scroll apart from the engine's own
+-- clamp, so that reading back through a reply is not fought while a canvas
+-- shrink — the Working row hiding at the end of a turn, a thinking block
+-- collapsing, a re-render dropping trailing blocks — is not mistaken for one.
+-- That needs no input events, which is good, because a ScrollingFrame handles
+-- the wheel and its own scrollbar internally and is not obliged to surface
+-- either as an InputObject. The engine only ever moves the position UP, and only
+-- as far as a shrunken canvas forces; anything above that is the reader.
 local STICK_SLOP = 16
 local stickToBottom = true
 
@@ -102,21 +115,29 @@ function Console.mount(parent: Instance, layoutOrder: number): ScrollingFrame
 		LayoutOrder = 2147483647,
 	})
 
-	local function pin()
-		if stickToBottom then
-			output.CanvasPosition = Vector2.new(0, math.huge)
+	-- One connection does the whole thing: decide, then pin, once per frame with
+	-- settled numbers. maxY is the bottom of the scroll range — the only fact the
+	-- engine gives us to work with.
+	local lastPos = 0
+	RunService.Heartbeat:Connect(function()
+		local maxY = math.max(output.AbsoluteCanvasSize.Y - output.AbsoluteWindowSize.Y, 0)
+		local pos = output.CanvasPosition.Y
+		-- Where the view would sit if nobody but the engine had touched it: it only
+		-- ever moves the position UP, and only as far as a shrunken canvas forces.
+		local clamped = math.min(lastPos, maxY)
+		if pos < clamped - 1 then
+			-- Higher than a clamp can account for, so the reader put it there.
+			stickToBottom = false
+		elseif pos >= maxY - STICK_SLOP then
+			-- At the bottom, however it got there — scrolled back down, or the canvas
+			-- shrank out from under a position that is now the bottom.
+			stickToBottom = true
 		end
-	end
-	output:GetPropertyChangedSignal("AbsoluteCanvasSize"):Connect(pin)
-	-- The window moves the bottom too, not just the canvas. The input row grows
-	-- with a multi-line message and main.lua shrinks this frame to match, which
-	-- lifts the visible bottom edge without touching the canvas — so nothing fired
-	-- and the view sat stranded above the bottom until the next block arrived.
-	-- Resizing the widget did the same thing.
-	output:GetPropertyChangedSignal("AbsoluteWindowSize"):Connect(pin)
-	output:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
-		stickToBottom = output.CanvasPosition.Y
-			>= output.AbsoluteCanvasSize.Y - output.AbsoluteWindowSize.Y - STICK_SLOP
+		if stickToBottom and pos < maxY then
+			output.CanvasPosition = Vector2.new(0, maxY)
+			pos = maxY
+		end
+		lastPos = pos
 	end)
 	return output
 end
