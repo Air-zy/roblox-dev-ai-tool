@@ -68,7 +68,10 @@ function Sessions.Initialize(p: Plugin)
 end
 
 -- First user message, which is what the reader remembers the session by.
-local function titleOf(conversation: { any }): string
+-- Returns nil when there isn't one — a session resumed from a stop or an error
+-- can begin with a tool_result batch and nothing else, and "Untitled" tells you
+-- less than the clock does.
+local function titleOf(conversation: { any }): string?
 	for _, message in ipairs(conversation) do
 		if message.role == "user" and type(message.content) == "string" then
 			local text = (message.content :: string):gsub("%s+", " ")
@@ -76,7 +79,7 @@ local function titleOf(conversation: { any }): string
 			if text ~= "" then return text end
 		end
 	end
-	return "Untitled"
+	return nil
 end
 
 -- Returns a COPY with all but the last few tool_result contents stubbed. The
@@ -155,7 +158,7 @@ function Sessions.save()
 	-- Retitled every save rather than once at creation: /clear empties the
 	-- conversation without changing session, so the title has to follow whatever
 	-- the first message is NOW.
-	entry.title = titleOf(conversation)
+	entry.title = titleOf(conversation) or (os.date("%b %d, %H:%M") :: string)
 	entry.updated = os.time()
 
 	table.sort(index, function(a, b) return a.updated > b.updated end)
@@ -164,8 +167,9 @@ function Sessions.save()
 		pluginRef:SetSetting(KEY_PREFIX .. dropped.id, nil)
 	end
 	persistIndex()
-	-- No list refresh here: the sidebar redraws every time it opens, and this runs
-	-- once per turn whether it is on screen or not.
+	-- The drawer stays open while you work, so the row for the session you are
+	-- IN has to pick up its new title and time as they change.
+	if refreshList then refreshList() end
 end
 
 -- =============================================================================
@@ -318,28 +322,24 @@ local function ago(when: number): string
 	return string.format("%dd ago", seconds // 86400)
 end
 
--- Same scrim-over-everything shape as the settings panel, so clicking outside
--- closes and no widget below needs to know the sidebar exists.
-function Sessions.mountSidebar(parent: Instance): (boolean?) -> ()
-	local scrim = make("TextButton", {
-		Name = "SessionsScrim",
-		Parent = parent,
-		BackgroundColor3 = Color3.new(0, 0, 0),
-		BackgroundTransparency = 0.5,
-		BorderSizePixel = 0,
-		Size = UDim2.fromScale(1, 1),
-		Text = "",
-		AutoButtonColor = false,
-		Visible = false,
-		ZIndex = 50,
-	})
+-- Deliberately NOT a scrim-and-card like the settings popup. This one is a
+-- drawer: it stays until it is closed from the same button that opened it, and
+-- the caller shifts the console over by WIDTH rather than having it covered — so
+-- you can read a session and keep working. Nothing here is modal, which is why
+-- there is no full-bleed catcher to swallow clicks meant for the console.
+--
+-- Returns a toggle that reports the state it settled on, since the shift lives
+-- with the caller.
+Sessions.WIDTH = 240
 
+function Sessions.mountSidebar(parent: Instance, openSettings: () -> ()): (boolean?) -> boolean
 	local panel = make("Frame", {
 		Name = "SessionsPanel",
-		Parent = scrim,
+		Parent = parent,
 		BackgroundColor3 = Theme.BG_SURFACE,
 		BorderSizePixel = 0,
-		Size = UDim2.new(0, 240, 1, 0),
+		Size = UDim2.new(0, Sessions.WIDTH, 1, 0),
+		Visible = false,
 	})
 	make("Frame", {
 		Parent = panel,
@@ -363,24 +363,64 @@ function Sessions.mountSidebar(parent: Instance): (boolean?) -> ()
 	local newButton = make("TextButton", {
 		Parent = panel,
 		BackgroundTransparency = 1,
-		Size = UDim2.new(0, 80, 0, 32),
-		Position = UDim2.new(1, -88, 0, 0),
-		FontFace = Theme.SANS,
-		TextSize = 13,
+		Size = UDim2.new(0, 32, 0, 32),
+		Position = UDim2.new(1, -36, 0, 0),
+		FontFace = Theme.ICON,
+		TextSize = 16,
 		TextColor3 = Theme.ACCENT,
-		TextXAlignment = Enum.TextXAlignment.Right,
-		Text = "+ New",
+		Text = "plus-large",
 		AutoButtonColor = false,
 	})
+
+	-- Pinned to the bottom, out of the header: the gear is a once-a-session
+	-- control and the header row it used to sit in is now two clicks of nothing.
+	local settingsRow = make("TextButton", {
+		Parent = panel,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, -1, 0, 34),
+		Position = UDim2.new(0, 0, 1, -34),
+		Text = "",
+		AutoButtonColor = false,
+	})
+	make("Frame", {
+		Parent = settingsRow,
+		BackgroundColor3 = Theme.BORDER,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 0, 1),
+	})
+	make("TextLabel", {
+		Parent = settingsRow,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(0, 20, 1, 0),
+		Position = UDim2.new(0, 10, 0, 0),
+		FontFace = Theme.ICON,
+		TextSize = 16,
+		TextColor3 = Theme.TEXT_MED,
+		Text = "gear",
+	})
+	make("TextLabel", {
+		Parent = settingsRow,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, -44, 1, 0),
+		Position = UDim2.new(0, 36, 0, 0),
+		FontFace = Theme.SANS,
+		TextSize = 13,
+		TextColor3 = Theme.TEXT_MED,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "Settings",
+	})
+	settingsRow.MouseButton1Click:Connect(openSettings)
 
 	local list = make("ScrollingFrame", {
 		Parent = panel,
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
-		Size = UDim2.new(1, -1, 1, -36),
+		-- 36 of header above, 34 of settings row below.
+		Size = UDim2.new(1, -1, 1, -70),
 		Position = UDim2.new(0, 0, 0, 36),
-		CanvasSize = UDim2.new(1, 0, 0, 0),
+		CanvasSize = UDim2.new(0, 0, 0, 0),
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
 		ScrollBarThickness = 4,
 		ScrollBarImageColor3 = Theme.TEXT_LO,
 	})
@@ -435,17 +475,18 @@ function Sessions.mountSidebar(parent: Instance): (boolean?) -> ()
 					BackgroundTransparency = 1,
 					Size = UDim2.new(0, 28, 1, 0),
 					Position = UDim2.new(1, -28, 0, 0),
-					FontFace = Theme.SANS,
+					FontFace = Theme.ICON,
 					TextSize = 14,
 					TextColor3 = Theme.TEXT_LO,
-					Text = "✕",
+					Text = "trash-can",
 					AutoButtonColor = false,
 				})
 
 				local id = entry.id
+				-- The drawer stays open on a switch: picking the wrong session and
+				-- picking the next one should not cost two more clicks.
 				row.MouseButton1Click:Connect(function()
 					if id ~= currentId then Sessions.load(id) end
-					scrim.Visible = false
 				end)
 				remove.MouseButton1Click:Connect(function()
 					Sessions.delete(id)
@@ -465,19 +506,18 @@ function Sessions.mountSidebar(parent: Instance): (boolean?) -> ()
 			})
 		end
 	end
-	refreshList = draw
+	-- Only worth drawing while it is on screen — it stays open now, so save() can
+	-- call this on every turn without rebuilding rows nobody is looking at.
+	refreshList = function()
+		if panel.Visible then draw() end
+	end
 
-	newButton.MouseButton1Click:Connect(function()
-		Sessions.new()
-		scrim.Visible = false
-	end)
-	-- Clicks on the panel never reach the scrim, so this only fires outside it.
-	scrim.MouseButton1Click:Connect(function() scrim.Visible = false end)
+	newButton.MouseButton1Click:Connect(Sessions.new)
 
-	return function(visible: boolean?)
-		local show = if visible == nil then not scrim.Visible else visible
-		if show then draw() end
-		scrim.Visible = show
+	return function(visible: boolean?): boolean
+		panel.Visible = if visible == nil then not panel.Visible else visible
+		if panel.Visible then draw() end
+		return panel.Visible
 	end
 end
 

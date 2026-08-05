@@ -18,9 +18,17 @@ Click the toolbar button, run /login, open the URL it prints, then paste the
 code back with /code. After that just type. Enter sends, Shift+Enter adds a
 line, and / lists the commands.
 
-The gear opens settings: model, effort, web search, run code and system prompt,
-plus your plan usage for the 5 hour and weekly windows. The widget floats over
-the viewport rather than docking to an edge, and hides itself during playtests.
+The button at the top left opens the sessions drawer. Conversations are saved as
+you go and the last one for the place you are in comes back when you reopen the
+plugin, so a Studio crash costs you the turn that was running and nothing else.
+Switch between them from the list, start a new one with +, and delete one with
+the bin. /clear wipes the session you are in rather than parking it. The drawer
+stays open and moves the console aside, so you can read the list and keep going.
+
+Settings is at the bottom of that drawer: effort, web search, run code and system
+prompt, plus your plan usage for the 5 hour and weekly windows. The model has its
+own chip at the right of the input row. The widget floats over the viewport
+rather than docking to an edge, and hides itself during playtests.
 
 Plugins get no clipboard API, so instead anything worth copying is a text box
 you can select and Ctrl+C, and code blocks have a select all button. Paragraphs

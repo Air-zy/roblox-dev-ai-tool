@@ -144,39 +144,17 @@ local sessionsButton = make("TextButton", {
 	BackgroundTransparency = 1,
 	Size = UDim2.new(0, 28, 1, 0),
 	Position = UDim2.new(0, 4, 0, 0),
-	FontFace = Theme.SANS,
-	TextSize = 16,
+	FontFace = Theme.ICON,
+	TextSize = 18,
 	TextColor3 = Theme.TEXT_MED,
-	Text = "☰",
+	Text = "three-bars-horizontal",
 	AutoButtonColor = false,
 })
 -- No title label here: the widget's own title bar already says "Claude Code",
 -- and a second copy inside it only costs header width.
-local statusLabel = make("TextLabel", {
-	Name = "Status",
-	Parent = headerBar,
-	BackgroundTransparency = 1,
-	Size = UDim2.new(0, 220, 1, 0),
-	Position = UDim2.new(1, -256, 0, 0),
-	FontFace = Theme.SANS,
-	TextSize = 11,
-	TextColor3 = Theme.TEXT_LO,
-	TextTruncate = Enum.TextTruncate.AtEnd,
-	TextXAlignment = Enum.TextXAlignment.Right,
-	Text = "",
-})
-local settingsButton = make("TextButton", {
-	Name = "SettingsButton",
-	Parent = headerBar,
-	BackgroundTransparency = 1,
-	Size = UDim2.new(0, 32, 1, 0),
-	Position = UDim2.new(1, -36, 0, 0),
-	FontFace = Theme.SANS,
-	TextSize = 16,
-	TextColor3 = Theme.TEXT_MED,
-	Text = "⚙",
-	AutoButtonColor = false,
-})
+-- Nothing else lives in this bar. The model/effort readout moved to a chip in
+-- the input row that also SETS the model, and the gear moved to the bottom of
+-- the sessions drawer — a status line you cannot act on is not worth a corner.
 make("Frame", {
 	Parent = headerBar,
 	BackgroundColor3 = Theme.BORDER,
@@ -243,12 +221,46 @@ stopButton.MouseButton1Click:Connect(function()
 	Agent.stop()
 end)
 
+-- The model chip sits in the Stop button's slot and the two swap on busy: there
+-- is no width in this row for both, and a model picked mid-turn would not apply
+-- until the next one anyway. Replaces the old header status line, which spent a
+-- quarter of the header saying something nothing could act on.
+local modelButton = make("TextButton", {
+	Name = "ModelButton",
+	Parent = inputRow,
+	BackgroundColor3 = Theme.BG_DARK,
+	BorderSizePixel = 0,
+	AnchorPoint = Vector2.new(1, 0.5),
+	Position = UDim2.new(1, -8, 0.5, 0),
+	Size = UDim2.new(0, 124, 0, 22),
+	FontFace = Theme.SANS,
+	TextSize = 11,
+	TextColor3 = Theme.TEXT_MED,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Text = "",
+	AutoButtonColor = false,
+})
+make("UICorner", { Parent = modelButton, CornerRadius = UDim.new(0, 4) })
+make("UIPadding", { Parent = modelButton, PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 20) })
+make("TextLabel", {
+	Parent = modelButton,
+	BackgroundTransparency = 1,
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, 14, 0, 0),
+	Size = UDim2.new(0, 14, 1, 0),
+	FontFace = Theme.ICON,
+	TextSize = 12,
+	TextColor3 = Theme.TEXT_LO,
+	Text = "chevron-small-down",
+})
+
 local inputBox = make("TextBox", {
 	Name = "Input",
 	Parent = inputRow,
 	BackgroundTransparency = 1,
-	-- Leaves room for the Stop button, which only appears while streaming.
-	Size = UDim2.new(1, -104, 0, 32),
+	-- Leaves room for the model chip, and for the Stop button that replaces it
+	-- while streaming.
+	Size = UDim2.new(1, -164, 0, 32),
 	AutomaticSize = Enum.AutomaticSize.Y,
 	Position = UDim2.new(0, 24, 0, 0),
 	FontFace = Theme.SANS,
@@ -428,23 +440,113 @@ local function refreshUsage()
 	end)
 end
 
-settingsButton.MouseButton1Click:Connect(function()
+-- =============================================================================
+-- Sessions drawer
+-- =============================================================================
+-- A drawer, not a popup: it stays until the same button closes it, and the
+-- console is moved over rather than covered. Sessions owns the panel; the shift
+-- is the entry point's business, since it is the only thing that knows how the
+-- widget is laid out.
+--
+-- The autocomplete list is positioned against the widget rather than the console
+-- (it has to escape the input row's bounds), so it does not ride along with the
+-- shift and needs the same offset applied by hand.
+local sidebarOffset = 0
+local toggleSessions = Sessions.mountSidebar(widget, function()
 	refreshUsage()
 	toggleSettings(nil)
 end)
-
--- =============================================================================
--- Sessions sidebar
--- =============================================================================
-local toggleSessions = Sessions.mountSidebar(widget)
 sessionsButton.MouseButton1Click:Connect(function()
-	toggleSessions(nil)
+	sidebarOffset = if toggleSessions(nil) then Sessions.WIDTH else 0
+	root.Position = UDim2.new(0, sidebarOffset, 0, 0)
+	root.Size = UDim2.new(1, -sidebarOffset, 1, 0)
 end)
 
-local function refreshStatus()
-	statusLabel.Text = string.format("%s · %s", Settings.model(), Settings.effortName():lower())
+-- =============================================================================
+-- Model picker
+-- =============================================================================
+-- The same list the settings panel offers, in a popup over the input row, so
+-- switching model is one click from where you type instead of three from a
+-- panel. Both write the same setting; neither is the source of truth.
+--
+-- The chip shows a short name: the full labels ("Claude Sonnet 5 (recommended)")
+-- are written for a settings row three times this wide.
+local function shortModel(label: string): string
+	return (label:gsub("^Claude ", ""):gsub("%s*%b()", ""))
 end
-refreshStatus()
+
+local function refreshModel()
+	local id = Settings.model()
+	for _, entry in ipairs(Claude.MODELS) do
+		if entry.id == id then
+			modelButton.Text = shortModel(entry.label)
+			return
+		end
+	end
+	-- A model set by `/model claude-something` that is not in the list.
+	modelButton.Text = id
+end
+
+local modelPopup = make("Frame", {
+	Name = "ModelPopup",
+	Parent = widget,
+	BackgroundColor3 = Theme.BG_INPUT,
+	BorderColor3 = Theme.BORDER,
+	BorderSizePixel = 1,
+	AnchorPoint = Vector2.new(1, 1),
+	Size = UDim2.new(0, 220, 0, #Claude.MODELS * 26 + 4),
+	Visible = false,
+	ZIndex = 45,
+})
+make("UIListLayout", { Parent = modelPopup, SortOrder = Enum.SortOrder.LayoutOrder })
+make("UIPadding", { Parent = modelPopup, PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 2) })
+
+local modelRows: { [string]: TextButton } = {}
+for i, entry in ipairs(Claude.MODELS) do
+	local row = make("TextButton", {
+		Parent = modelPopup,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 26),
+		FontFace = Theme.SANS,
+		TextSize = 12,
+		TextColor3 = Theme.TEXT_MED,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "",
+		AutoButtonColor = true,
+		LayoutOrder = i,
+		ZIndex = 46,
+	})
+	make("UIPadding", { Parent = row, PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) })
+	row.MouseButton1Click:Connect(function()
+		Settings.setModel(entry.id)
+		modelPopup.Visible = false
+		refreshModel()
+	end)
+	modelRows[entry.id] = row
+end
+
+modelButton.MouseButton1Click:Connect(function()
+	if modelPopup.Visible then
+		modelPopup.Visible = false
+		return
+	end
+	-- Marked here rather than at build time: /model and the settings panel can
+	-- both have moved the selection since.
+	local current = Settings.model()
+	for _, entry in ipairs(Claude.MODELS) do
+		local row = modelRows[entry.id]
+		local on = entry.id == current
+		-- Full label here, unlike the chip: the parentheticals are the only thing
+		-- separating "Max only" from "fastest" at the moment of choosing.
+		row.Text = (on and "✓ " or "   ") .. entry.label
+		row.TextColor3 = on and Theme.ACCENT or Theme.TEXT_MED
+	end
+	-- Right-aligned with the chip, floating just above the input row however tall
+	-- that row currently is.
+	modelPopup.Position = UDim2.new(1, -8, 1, -inputRow.AbsoluteSize.Y - 4)
+	modelPopup.Visible = true
+end)
+refreshModel()
 
 -- =============================================================================
 -- Autocomplete dropdown
@@ -507,7 +609,8 @@ local function updateDropdown(filter: string)
 	dropdown.Size = UDim2.new(0, 320, 0, height)
 	-- Sits above the input row, whatever height the row currently is — it grows
 	-- with the message, so the old hardcoded 32 would put the list on top of it.
-	dropdown.Position = UDim2.new(0, 12, 1, -inputRow.AbsoluteSize.Y - height - 4)
+	-- The offset keeps it over the console instead of over an open drawer.
+	dropdown.Position = UDim2.new(0, 12 + sidebarOffset, 1, -inputRow.AbsoluteSize.Y - height - 4)
 	dropdown.Visible = true
 end
 
@@ -535,8 +638,9 @@ end)
 Agent.Initialize(term, function(busy: boolean)
 	Console.setWorking(busy)
 	stopButton.Visible = busy
+	modelButton.Visible = not busy
 	if not busy then
-		refreshStatus()
+		refreshModel()
 		Sessions.save()
 	end
 end)
@@ -550,7 +654,8 @@ local function submit(text: string)
 	if not Commands.handle(text) then
 		Agent.send(text, OAuth.isLoggedIn)
 	end
-	refreshStatus()
+	-- `/model` changes it from under the chip.
+	refreshModel()
 	inputBox:CaptureFocus()
 end
 
@@ -613,6 +718,12 @@ end)
 
 inputBox.FocusLost:Connect(function()
 	task.delay(0.1, function() dropdown.Visible = false end)
+end)
+
+-- Going back to typing dismisses the picker; nothing else needs to catch clicks
+-- for it.
+inputBox.Focused:Connect(function()
+	modelPopup.Visible = false
 end)
 
 -- =============================================================================

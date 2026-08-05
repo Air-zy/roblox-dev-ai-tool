@@ -346,10 +346,10 @@ function Settings.mountPanel(
 		BackgroundTransparency = 1,
 		Size = UDim2.new(0, 36, 1, 0),
 		Position = UDim2.new(1, -40, 0, 0),
-		FontFace = Theme.SANS,
-		TextSize = 17,
+		FontFace = Theme.ICON,
+		TextSize = 16,
 		TextColor3 = Theme.TEXT_MED,
-		Text = "✕",
+		Text = "x",
 	})
 	make("Frame", {
 		Parent = header,
@@ -457,16 +457,9 @@ function Settings.mountPanel(
 		end
 	end
 
-	-- Model -------------------------------------------------------------------
-	sectionLabel(scroll, "MODEL", 3)
-	local modelOptions: { Option } = {}
-	for _, entry in ipairs(Claude.MODELS) do
-		table.insert(modelOptions, { id = entry.id, label = entry.label })
-	end
-	dropdown(scroll, 4, modelOptions, Settings.model, function(id)
-		Settings.setModel(id :: string)
-		refreshStatus()
-	end)
+	-- Model is deliberately NOT here. It lives on the chip at the right of the
+	-- input row, one click from where you type; a second dropdown saying the same
+	-- thing is just another place for the two to disagree.
 
 	-- Thinking budget ---------------------------------------------------------
 	sectionLabel(scroll, "EFFORT", 5)

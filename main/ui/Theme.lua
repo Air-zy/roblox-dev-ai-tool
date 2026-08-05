@@ -38,6 +38,22 @@ Theme.MONO      = Font.fromName("RobotoMono", Enum.FontWeight.Regular)
 -- the markdown renderer needs this string form to switch into monospace mid-line.
 Theme.MONO_FACE = "RobotoMono"
 
+-- Builder Icons — the icon set Studio's own UI is drawn with. It is a LIGATURE
+-- font, not a spritesheet: the icon's name IS the text, so a TextLabel with this
+-- face and Text = "gear" draws the gear. Names are the kebab-case ones from the
+-- BuilderIcons package: three-bars-horizontal, x, plus-large, trash-can, clock…
+--
+-- The family is an rbxasset path into Studio's own LuaPackages rather than an
+-- upload, so it costs nothing, needs no asset id, and always matches the Studio
+-- it is running in. If a future Studio moves the path the buttons fall back to
+-- showing the literal name — visibly wrong, but harmless.
+--
+-- Being a font, it cannot be used for the TOOLBAR button: CreateButton takes an
+-- image, so that one still needs an uploaded decal.
+Theme.ICON = Font.new(
+	"rbxasset://LuaPackages/Packages/_Index/BuilderIcons/BuilderIcons/BuilderIcons.json",
+	Enum.FontWeight.Regular)
+
 Theme.TEXT_SIZE = 16
 Theme.SMALL_SIZE = 14
 
