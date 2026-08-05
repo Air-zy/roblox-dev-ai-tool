@@ -632,6 +632,10 @@ task.spawn(function()
 	if not propsOk then
 		warn("[Claude Code] Property lookup self-test FAILED: " .. tostring(propsErr))
 	end
+	local agentOk, agentErr = Agent.selfTest()
+	if not agentOk then
+		warn("[Claude Code] Context trimming self-test FAILED: " .. tostring(agentErr))
+	end
 end)
 
 print("[Claude Code] Loaded.")

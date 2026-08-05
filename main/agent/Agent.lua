@@ -46,6 +46,75 @@ local function toolInput(block: any): any
 	return { _unparsed = string.sub(tostring(block.input or ""), 1, 200) }
 end
 
+-- =============================================================================
+-- What a tool result costs
+-- =============================================================================
+-- A tool result goes into `conversation` and stays there for the rest of the
+-- session, re-read on every later turn. `Shell.run` returns whatever the
+-- command produced with no ceiling, so one `cat` of a large ModuleScript or one
+-- `ls -R /` is tens of thousands of tokens paid over and over — the only thing
+-- here that can blow up on a SINGLE call.
+--
+-- Claude Code splits this in two: shell output is capped at 30 000 characters,
+-- but a file READ gets 25 000 tokens, because reading a file whole is a primary
+-- operation while shell output is usually incidental. 100 000 characters is
+-- that read budget at the four-characters-per-token rule the same codebase
+-- estimates with.
+--
+-- We take the larger number for everything, because the split is not available
+-- here: `cat` is not a separate tool, it arrives as a `bash` line, and telling a
+-- read from a listing would mean parsing the command in Agent — where
+-- `cat x | grep y` has no honest answer anyway. The cost of one number is a
+-- worse worst case for `ls -R /`, which can now spend 100 000 characters
+-- instead of 30 000. Accepted: that is a ceiling only pathological output
+-- reaches, typical listings are a few hundred characters, and clearOldToolResults
+-- below reclaims it once the result is stale. The cost of the SMALLER number was
+-- truncating `cat` of a ~1000-line script, which is an ordinary thing to do.
+--
+-- Head rather than tail because shell output front-loads: the top of an `ls` or
+-- a `cat` is the part that answers the question.
+--
+-- The Console already has the whole string by the time this runs, so the user
+-- still sees everything — only the copy going on the wire is cut.
+local MODEL_RESULT_CHARS = 100000
+
+-- Cutting a byte string at a fixed offset can land mid-codepoint, and
+-- JSONEncode rejects invalid UTF-8 — a truncation that kills the request is
+-- worse than no truncation at all. A newline is always a codepoint boundary and
+-- a tidier place to stop, so prefer the last one; fall back to stepping off
+-- continuation bytes (0x80-0xBF) when there is no newline to find, which is the
+-- one-enormous-line case.
+local function safeCut(s: string, limit: number): string
+	local head = string.sub(s, 1, limit)
+	-- Greedy `.*` backtracks to the last newline; `()` captures just past it.
+	-- Ignored when it would throw away most of the budget, which happens when a
+	-- short first line is followed by one very long one.
+	local afterNewline = string.match(head, "^.*\n()")
+	if afterNewline and afterNewline > limit / 2 then
+		return string.sub(s, 1, afterNewline - 1)
+	end
+	local n = limit
+	-- A codepoint is at most 4 bytes, so this steps back at most 3 times.
+	for _ = 1, 3 do
+		local nextByte = string.byte(s, n + 1)
+		if nextByte == nil or nextByte < 0x80 or nextByte > 0xBF then break end
+		n -= 1
+	end
+	return string.sub(s, 1, n)
+end
+
+-- Naming the narrower commands is the load-bearing half. Without it the model's
+-- next move is to re-run the same unbounded command and pay for it twice.
+local function forModel(result: string): string
+	if #result <= MODEL_RESULT_CHARS then return result end
+	local kept = safeCut(result, MODEL_RESULT_CHARS)
+	return string.format(
+		"%s\n... [%d characters truncated] ...\n" ..
+		"Re-run narrowed to see the rest: `head -n`, `tail -n`, `sed -n '10,40p'`, " ..
+		"or `grep` for what you are actually looking for.",
+		kept, #result - #kept)
+end
+
 -- A web_search_tool_result's content is either the list of hits or a single
 -- error object. Each hit also carries `encrypted_content`, a multi-KB opaque
 -- blob that exists only so the result can be replayed on the next turn — it is
@@ -155,6 +224,119 @@ function Agent.stop()
 end
 
 -- =============================================================================
+-- Keeping the history bounded
+-- =============================================================================
+-- forModel() caps any single result; nothing caps the sum. `conversation` is
+-- append-only, so a long session ends by hitting the context window and dying
+-- with no way back from it. This is Claude Code's microcompact minus the half
+-- we cannot have: it persists cleared output to disk and can restore it after a
+-- compaction, and a plugin has nowhere to spill to. Cleared output here is
+-- gone, which is why the stub says so — re-running the command is the recovery.
+--
+-- Two things this has to get right, or it makes matters worse than it found
+-- them:
+--
+--   Stub the content, never remove the block. Every tool_result pairs with a
+--   tool_use already in the history; drop one and every later request fails on
+--   the same index for the rest of the session. Empty content is rejected
+--   outright (see the "(no output)" guard below), so the stub is a non-empty
+--   sentence — kept short, because it is paid once per cleared result and
+--   because anything it replaces has to be LONGER than it or clearing costs
+--   tokens instead of saving them. Claude Code's equivalent is shorter still
+--   ("[Old tool result content cleared]") and can afford to say nothing useful,
+--   since it persists the cleared output and can restore it. Ours is gone, so
+--   the stub has to earn its length by naming the recovery.
+--
+--   Run it rarely. Mutating a message invalidates the cache from that index
+--   onward, so every pass costs one full re-write of the prefix. Claude Code
+--   only fires when it would save at least 20k tokens; these are the same two
+--   thresholds at roughly 4 characters per token.
+-- ponytail: tool results only, and no thrash guard. Two ceilings follow from
+-- that. A session that grows on assistant text rather than tool output — or one
+-- with five results and nothing older — is still unbounded, because there is
+-- nothing here for this to clear. And a heavy session can re-cross the trigger
+-- every few turns, paying a prefix re-write each time; Claude Code carries an
+-- explicit circuit breaker for exactly that ("Autocompact is thrashing … 3
+-- times in a row"). Upgrade path for both is summarising compaction, which
+-- replaces spans of history with a paragraph instead of only blanking results.
+--
+-- The trigger is also on the eager side: 200k characters is ~50k tokens, about
+-- a quarter of the window, so this starts paying re-writes well before the
+-- session is in any danger. Raise it if the per-turn `N new to cache` figure
+-- looks worse than the read it saves.
+local KEEP_RECENT = 5
+local CLEARED = "[old tool result cleared — re-run the command if needed]"
+local TRIGGER_CHARS = 200000    -- ~50k tokens of history before this is worth doing at all
+local MIN_SAVING_CHARS = 80000  -- ~20k tokens; under this the cache re-write costs more than it saves
+
+-- Deliberately an estimate, not a token count: it only decides whether to look
+-- closer. tool_use inputs are tables and go uncounted, which biases it low —
+-- the right direction for a trigger that costs a cache re-write to act on.
+local function historyChars(messages: { any }): number
+	local total = 0
+	for _, message in ipairs(messages) do
+		local content = message.content
+		if type(content) == "string" then
+			total += #content
+		elseif type(content) == "table" then
+			for _, block in ipairs(content) do
+				if type(block) == "table" then
+					if type(block.text) == "string" then total += #block.text end
+					if type(block.content) == "string" then total += #block.content end
+				end
+			end
+		end
+	end
+	return total
+end
+
+-- Returns the number of characters dropped; 0 means nothing was touched and the
+-- cache is intact.
+local function clearOldToolResults(messages: { any }): number
+	if historyChars(messages) < TRIGGER_CHARS then return 0 end
+
+	local results: { any } = {}
+	for _, message in ipairs(messages) do
+		local content = message.content
+		if type(content) == "table" then
+			for _, block in ipairs(content) do
+				if type(block) == "table" and block.type == "tool_result" then
+					table.insert(results, block)
+				end
+			end
+		end
+	end
+
+	-- Counted over every result, cleared ones included, so "the last five" means
+	-- the same five however many passes have run.
+	local cutoff = #results - KEEP_RECENT
+	if cutoff <= 0 then return 0 end
+
+	-- A result at or below the stub's length would GROW if replaced. Not a
+	-- hypothetical: the "" guard turns silent commands into "(no output)", which
+	-- is 11 characters, and `echo`, `diff` of identical scripts and anything
+	-- redirected to /dev/null all produce one.
+	local function worthClearing(block: any): boolean
+		return type(block.content) == "string" and #block.content > #CLEARED
+	end
+
+	local saving = 0
+	for i = 1, cutoff do
+		if worthClearing(results[i]) then
+			saving += #results[i].content - #CLEARED
+		end
+	end
+	if saving < MIN_SAVING_CHARS then return 0 end
+
+	for i = 1, cutoff do
+		if worthClearing(results[i]) then
+			results[i].content = CLEARED
+		end
+	end
+	return saving
+end
+
+-- =============================================================================
 -- One turn
 -- =============================================================================
 -- Streams a response, renders it, runs any tools it asked for, and recurses if
@@ -164,6 +346,17 @@ local function runTurn(turn: number)
 		Console.appendLine("Tool loop exceeded " .. MAX_TURNS .. " turns — stopping.", "error")
 		setBusy(false)
 		return
+	end
+
+	-- Before the request rather than after it: the whole point is to shrink what
+	-- this turn sends. Runs on every turn including mid-tool-loop, because a
+	-- single 40-turn sweep is exactly the thing that can fill the window without
+	-- the user ever getting a prompt back.
+	local dropped = clearOldToolResults(conversation)
+	if dropped > 0 then
+		Console.appendLine(
+			string.format("  Cleared %d characters of old tool output to save context.", dropped),
+			"system")
 	end
 
 	local bubble = Console.createBubble()
@@ -403,7 +596,10 @@ local function runTurn(turn: number)
 				table.insert(toolResults, {
 					type = "tool_result",
 					tool_use_id = block.id,
-					content = toolResult,
+					-- Capped HERE and not in Tools.dispatch: setResult() above has
+					-- already handed the Console the whole thing, so the panel keeps
+					-- the full output and only the history pays.
+					content = forModel(toolResult),
 				})
 			end
 
@@ -488,6 +684,108 @@ function Agent.send(text: string, isLoggedIn: () -> boolean)
 	table.insert(conversation, { role = "user", content = text })
 	setBusy(true)
 	runTurn(1)
+end
+
+-- =============================================================================
+-- Self-test
+-- =============================================================================
+-- Both of these shape what goes on the wire, and both fail in ways that only
+-- show up as a dead session: a cut that lands mid-codepoint makes JSONEncode
+-- reject the request, and a cleared tool_result that loses its pairing or comes
+-- back empty poisons every later turn.
+function Agent.selfTest(): (boolean, string?)
+	-- Under the cap: byte-identical, no marker bolted on.
+	local short = "hello\nworld"
+	if forModel(short) ~= short then
+		return false, "forModel altered a result under the cap"
+	end
+
+	-- Sizes are derived from the cap, never written as literals: the fixtures
+	-- have to stay ON the far side of it, and a hand-typed 40000 silently stops
+	-- testing anything the moment the cap is raised past it.
+	--
+	-- Over the cap, no newline anywhere, and the cut lands mid-codepoint: the
+	-- leading "a" pushes every 2-byte "e-acute" out of alignment, so the byte
+	-- just past the limit is a continuation byte and safeCut has to step back off
+	-- it. That holds for any even cap. U+00E9 is spelled out as its two UTF-8
+	-- bytes so the thing being tested — a cut landing between them — is on the
+	-- page rather than hidden inside an escape.
+	local multibyte = "a" .. string.rep(string.char(0xC3, 0xA9), MODEL_RESULT_CHARS)
+	local cut = forModel(multibyte)
+	if #cut >= #multibyte then
+		return false, "forModel did not shorten an oversized result"
+	end
+	if not string.find(cut, "characters truncated", 1, true) then
+		return false, "forModel dropped the truncation marker"
+	end
+	if utf8.len(cut) == nil then
+		return false, "forModel cut mid-codepoint and produced invalid UTF-8"
+	end
+	if #cut > MODEL_RESULT_CHARS + 200 then
+		return false, "forModel overshot the cap"
+	end
+
+	-- With newlines it should stop on one, leaving whole lines behind. The kept
+	-- half ends in a newline, then forModel adds its own before the marker — so a
+	-- line-boundary cut shows up as two in a row. 11 chars per line, plus slack,
+	-- to land comfortably past the cap whatever it is set to.
+	local lineCount = math.floor(MODEL_RESULT_CHARS / 11) + 100
+	local cutLines = forModel(string.rep("0123456789\n", lineCount))
+	if not string.find(cutLines, "\n\n%.%.%. %[") then
+		return false, "forModel did not stop on a line boundary"
+	end
+
+	-- Clearing: 12 paired calls, well over the trigger.
+	local big = string.rep("x", 20000)
+	local messages: { any } = {}
+	for i = 1, 12 do
+		table.insert(messages, { role = "assistant", content = {
+			{ type = "tool_use", id = "t" .. i, name = "bash", input = { command = "ls" } },
+		} })
+		table.insert(messages, { role = "user", content = {
+			{ type = "tool_result", tool_use_id = "t" .. i, content = big },
+		} })
+	end
+
+	if clearOldToolResults(messages) <= 0 then
+		return false, "clearOldToolResults did nothing to an oversized history"
+	end
+
+	local seen: { any } = {}
+	for _, message in ipairs(messages) do
+		if type(message.content) == "table" then
+			for _, block in ipairs(message.content) do
+				if block.type == "tool_result" then table.insert(seen, block) end
+			end
+		end
+	end
+	if #seen ~= 12 then
+		return false, "clearOldToolResults changed the number of tool_result blocks"
+	end
+	for i, block in ipairs(seen) do
+		if type(block.content) ~= "string" or block.content == "" then
+			return false, "clearOldToolResults left tool_result " .. i .. " empty"
+		end
+		if i > 12 - KEEP_RECENT and block.content ~= big then
+			return false, "clearOldToolResults touched one of the recent results"
+		end
+		if i <= 12 - KEEP_RECENT and block.content ~= CLEARED then
+			return false, "clearOldToolResults missed an old result"
+		end
+	end
+
+	-- Idempotent: the second pass is now under the trigger and must not cost
+	-- another cache re-write.
+	if clearOldToolResults(messages) ~= 0 then
+		return false, "clearOldToolResults ran again with nothing left to save"
+	end
+
+	-- A small history is never touched.
+	if clearOldToolResults({ { role = "user", content = "hi" } }) ~= 0 then
+		return false, "clearOldToolResults acted on a small history"
+	end
+
+	return true
 end
 
 return Agent
