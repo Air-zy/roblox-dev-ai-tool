@@ -37,6 +37,11 @@ local function isSeparateTool(cmd: string): boolean
 	return cmd ~= "bash" and Tools.has(cmd)
 end
 
+-- Same number as Terminal's MAX_RESULTS, which caps find and grep. Duplicated
+-- rather than shared because Terminal requires Shell, not the other way round,
+-- and one integer is a cheaper price than inverting that.
+local MAX_LIST = 100
+
 local Shell = {}
 
 -- =============================================================================
@@ -435,6 +440,17 @@ HANDLERS.ls = function(self, argv)
 			or tostring(target)
 		return string.format("(%s) %s", glob and "no matches" or "empty", label)
 	end
+	-- find and grep stop at a cap; ls did not, so `ls /Workspace` in a place with
+	-- a few thousand parts returned every one of them and only `forModel`'s
+	-- 100 000-char cut stopped it — by which point the listing is ~25 000 tokens
+	-- that every later turn re-sends. Capped HERE rather than in Terminal:ls
+	-- because expandGlobs consumes that return value as a list of paths, and a
+	-- sentinel row would arrive at cat/head/grep as an operand.
+	if #names > MAX_LIST then
+		local extra = #names - MAX_LIST
+		return string.format("%s\n… %d more (narrow it: `ls %s/A*`, or `ls | grep <name>`)",
+			table.concat(names, "\n", 1, MAX_LIST), extra, target or ".")
+	end
 	return table.concat(names, "\n")
 end
 
@@ -738,7 +754,38 @@ HANDLERS.grep = function(self, argv, stdin)
 		end
 		return table.concat(paths, "\n")
 	end
-	return s
+	-- Group by script, ripgrep-style: the path is printed once per file rather
+	-- than once per hit. DataModel paths are deep, so on a 40-hit grep across 6
+	-- scripts that is ~430 characters of path where the flat form spends ~1800 —
+	-- and a tool result is re-sent with every remaining turn of the session.
+	--
+	-- After -c and -l on purpose. Both parse the flat `path:line: text` form, and
+	-- Terminal:grep still returns it, so this is a presentation pass and nothing
+	-- downstream has to learn a second shape.
+	--
+	-- ponytail: `grep foo / | grep bar` loses per-line file attribution, since the
+	-- downstream grep filters the header rows away. Upgrade path is telling a
+	-- handler whether it is the last stage of a pipeline, which is wider plumbing
+	-- than that case is worth.
+	local grouped: { string } = {}
+	local currentPath: string? = nil
+	for _, line in ipairs(lines) do
+		local scriptPath, rest = line:match("^([^:]*):(.*)$")
+		if not scriptPath then
+			-- The cap trailer from Terminal's capped(); it has no path to group by.
+			grouped[#grouped + 1] = line
+		else
+			if scriptPath ~= currentPath then
+				currentPath = scriptPath
+				if #grouped > 0 then
+					grouped[#grouped + 1] = ""
+				end
+				grouped[#grouped + 1] = scriptPath
+			end
+			grouped[#grouped + 1] = "  " .. rest
+		end
+	end
+	return table.concat(grouped, "\n")
 end
 
 -- Text input for the filter commands: a file operand when there is one, piped
@@ -1415,6 +1462,70 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			return false, string.format("nameMatcher(%q)(%q) should be %s",
 				case.pattern, case.name, tostring(case.want))
 		end
+	end
+
+	-- The ls cap. A detached fixture rather than a real container, so the check
+	-- asserts nothing about the user's place. Broken open, one `ls` of a big
+	-- Workspace costs ~25 000 tokens for the rest of the session; broken shut, it
+	-- truncates listings that were fine.
+	local big = Instance.new("Folder")
+	for i = 1, MAX_LIST + 5 do
+		local part = Instance.new("Folder")
+		part.Name = string.format("N%03d", i)
+		part.Parent = big
+	end
+	local savedCwd = probe.cwd
+	probe.cwd = big
+	local bigOut = Shell.run(probe, "ls")
+	local longOut = Shell.run(probe, "ls -l")
+	probe.cwd = savedCwd
+	big:Destroy()
+	if not bigOut:match("… 5 more") then
+		return false, "ls did not cap a listing of " .. tostring(MAX_LIST + 5)
+	end
+	if #splitLines(bigOut) ~= MAX_LIST + 1 then
+		return false, string.format("capped ls emitted %d lines, want %d",
+			#splitLines(bigOut), MAX_LIST + 1)
+	end
+	-- Every row here is a childless Folder, so -l must print the class and stop.
+	-- "0 children" lands on every row of every -l listing, so this is paid at
+	-- scale; the `[Folder]` half pins that -l still formatted at all.
+	if not longOut:find("N001 %[Folder%]") then
+		return false, "ls -l did not format a row: " .. longOut:sub(1, 80)
+	end
+	if longOut:find("children") then
+		return false, "ls -l printed a child count for a childless instance"
+	end
+
+	-- grep groups its hits under one header per script. The failure worth catching
+	-- is a header emitted per hit, which is silent — the output still reads fine,
+	-- it just costs what grouping was added to stop costing. -c and -l parse the
+	-- ungrouped form, so they are pinned in the same breath.
+	local grepFixture = Instance.new("Folder")
+	for _, entry in ipairs({ { "A", "needle\nx\nneedle\n" }, { "B", "y\nneedle\n" } }) do
+		local module = Instance.new("ModuleScript")
+		module.Name = entry[1]
+		module.Source = entry[2]
+		module.Parent = grepFixture
+	end
+	probe.cwd = grepFixture
+	local grepOut = Shell.run(probe, "grep needle")
+	local grepCount = Shell.run(probe, "grep -c needle")
+	local grepList = Shell.run(probe, "grep -l needle")
+	probe.cwd = savedCwd
+	grepFixture:Destroy()
+	do
+		local headers = select(2, grepOut:gsub("\n?/[AB]\n", ""))
+		if headers ~= 2 then
+			return false, string.format("grep emitted %d headers for 3 hits in 2 scripts, want 2:\n%s",
+				headers, grepOut)
+		end
+	end
+	if grepCount ~= "3" then
+		return false, "grep -c returned " .. grepCount .. ", want 3 (grouping must run after -c)"
+	end
+	if #splitLines(grepList) ~= 2 then
+		return false, "grep -l returned " .. grepList .. ", want 2 paths"
 	end
 
 	-- COMMANDS is derived from HANDLERS now, so it cannot drift. What this

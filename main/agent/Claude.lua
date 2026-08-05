@@ -143,13 +143,29 @@ local function applyMessageCache(messages: { any })
 		end
 	end
 
+	-- 1h, the same TTL the system and tool breakpoints use.
+	--
+	-- This used to be the default 5m, on the reasoning that a breakpoint which
+	-- moves and grows every turn would have its write cost doubled. That is not
+	-- what happens while the cache is warm: the lookup is a longest-prefix
+	-- match, so turn N+1 reads turn N's entry and writes only the delta. The
+	-- 2x lands on one turn's new messages; a 5m expiry costs a 1.25x rewrite of
+	-- the entire history. This is a plugin people leave docked while they read
+	-- code, so the gaps this UI is made of are exactly the ones that expire it.
+	--
+	-- ponytail: no overage gating. Claude Code drops to 5m for a subscriber who
+	-- is into overage, and latches the choice for the whole session because
+	-- flipping TTL mid-session busts the server-side cache. If plan usage ever
+	-- drives this, latch it once at session start — never per turn.
+	local CACHE = { type = "ephemeral", ttl = "1h" }
+
 	local lastMessage = messages[#messages]
 	local content = lastMessage and lastMessage.content
 	if type(content) == "table" and #content > 0 then
-		(content[#content] :: any).cache_control = { type = "ephemeral" }
+		(content[#content] :: any).cache_control = CACHE
 	elseif type(content) == "string" and content ~= "" then
 		lastMessage.content = {
-			{ type = "text", text = content, cache_control = { type = "ephemeral" } },
+			{ type = "text", text = content, cache_control = CACHE },
 		}
 	end
 end
@@ -226,8 +242,10 @@ local function streamMessage(args: {
 	-- the gaps this UI is made of, and every expiry reprocesses system + tools
 	-- from cold. A 1h write costs 2x instead of 1.25x, but this prefix is small
 	-- and static — the whole thing is paid once an hour. The conversation
-	-- breakpoint below deliberately stays at 5m: it moves and grows every turn,
-	-- so doubling its write cost would swamp the saving.
+	-- breakpoint below is 1h for the same reason; see applyMessageCache, which
+	-- is where the argument for the other answer used to live.
+	--
+	-- No beta header is needed for `ttl` — it is GA, not gated.
 	(systemBlocks[#systemBlocks] :: any).cache_control = { type = "ephemeral", ttl = "1h" }
 
 	local bodyTable: { [string]: any } = {

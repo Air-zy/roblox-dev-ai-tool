@@ -105,14 +105,48 @@ end
 
 -- Naming the narrower commands is the load-bearing half. Without it the model's
 -- next move is to re-run the same unbounded command and pay for it twice.
-local function forModel(result: string): string
-	if #result <= MODEL_RESULT_CHARS then return result end
-	local kept = safeCut(result, MODEL_RESULT_CHARS)
+local function forModel(result: string, limit: number?): string
+	local cap = limit or MODEL_RESULT_CHARS
+	if #result <= cap then return result end
+	local kept = safeCut(result, cap)
 	return string.format(
 		"%s\n... [%d characters truncated] ...\n" ..
 		"Re-run narrowed to see the rest: `head -n`, `tail -n`, `sed -n '10,40p'`, " ..
 		"or `grep` for what you are actually looking for.",
 		kept, #result - #kept)
+end
+
+-- One turn's tool_results all travel in ONE user message, so a per-result cap
+-- is not the whole story. Parallel tool use is on and is the largest lever in
+-- this file — which makes it also the largest way to blow the window: six calls
+-- that each stop just under MODEL_RESULT_CHARS put 600 000 characters into a
+-- single message, and once that pair is in the history it is there for good.
+--
+-- Claude Code caps the same thing (MAX_TOOL_RESULTS_PER_MESSAGE_CHARS) and
+-- spills the largest blocks to a file, handing the model a path. A plugin has
+-- nowhere to spill, so the big ones are simply cut harder.
+--
+-- Smallest-first fair share: every result already under its share releases the
+-- remainder to the ones over it. A turn of three short listings and one huge
+-- `tree` therefore spends nearly the whole budget on the tree instead of
+-- quartering it. At 2x the per-result cap this only binds from the third large
+-- result onward, so the ordinary ls+cat+grep sweep never notices it.
+local MODEL_TURN_CHARS = 2 * MODEL_RESULT_CHARS
+
+local function capTurn(results: { any })
+	-- Shallow: the entries are the same tables, so assigning content mutates
+	-- the blocks that are about to go on the wire.
+	local order = table.clone(results)
+	table.sort(order, function(a, b)
+		return #a.content < #b.content
+	end)
+
+	local budget = MODEL_TURN_CHARS
+	for index, entry in ipairs(order) do
+		local share = math.min(MODEL_RESULT_CHARS, budget // (#order - index + 1))
+		entry.content = forModel(entry.content, share)
+		budget -= #entry.content
+	end
 end
 
 -- A web_search_tool_result's content is either the list of hits or a single
@@ -226,9 +260,10 @@ end
 -- =============================================================================
 -- Keeping the history bounded
 -- =============================================================================
--- forModel() caps any single result; nothing caps the sum. `conversation` is
--- append-only, so a long session ends by hitting the context window and dying
--- with no way back from it. This is Claude Code's microcompact minus the half
+-- forModel() caps any single result and capTurn() caps one turn's batch of
+-- them; nothing caps the sum across turns. `conversation` is append-only, so a
+-- long session ends by hitting the context window and dying with no way back
+-- from it. This is Claude Code's microcompact minus the half
 -- we cannot have: it persists cleared output to disk and can restore it after a
 -- compaction, and a plugin has nowhere to spill to. Cleared output here is
 -- gone, which is why the stub says so — re-running the command is the recovery.
@@ -596,12 +631,15 @@ local function runTurn(turn: number)
 				table.insert(toolResults, {
 					type = "tool_result",
 					tool_use_id = block.id,
-					-- Capped HERE and not in Tools.dispatch: setResult() above has
-					-- already handed the Console the whole thing, so the panel keeps
-					-- the full output and only the history pays.
-					content = forModel(toolResult),
+					content = toolResult,
 				})
 			end
+			-- Capped HERE and not in Tools.dispatch: setResult() above has already
+			-- handed the Console the whole thing, so the panel keeps the full
+			-- output and only the history pays. After the loop rather than inside
+			-- it, because the budget is a property of the batch — and cutting
+			-- twice would leave a result carrying two truncation notes.
+			capTurn(toolResults)
 
 			-- pause_turn: a long-running server tool was interrupted mid-turn.
 			-- Anthropic expects the paused assistant content sent straight back so
@@ -733,6 +771,66 @@ function Agent.selfTest(): (boolean, string?)
 	local cutLines = forModel(string.rep("0123456789\n", lineCount))
 	if not string.find(cutLines, "\n\n%.%.%. %[") then
 		return false, "forModel did not stop on a line boundary"
+	end
+
+	-- capTurn. Both directions matter and both fail silently: too eager and it
+	-- truncates ordinary sweeps that were never near the budget, too slack and
+	-- one turn of parallel calls buries the window in a single user message that
+	-- can never be taken back out.
+	local function batch(sizes: { number }): { any }
+		local blocks: { any } = {}
+		for index, size in ipairs(sizes) do
+			blocks[index] = { type = "tool_result", tool_use_id = "t" .. index,
+				content = string.rep("y", size) }
+		end
+		return blocks
+	end
+	local function sumOf(blocks: { any }): number
+		local total = 0
+		for _, entry in ipairs(blocks) do
+			total += #entry.content
+		end
+		return total
+	end
+
+	-- A normal sweep: four small results must come back byte-identical.
+	local sweep = batch({ 10, 200, 3000, 40 })
+	local sweepBefore = sumOf(sweep)
+	capTurn(sweep)
+	if sumOf(sweep) ~= sweepBefore then
+		return false, "capTurn truncated a turn that was nowhere near the budget"
+	end
+
+	-- Six results that each clear the per-result cap on their own. Without the
+	-- batch cap this is 6 x MODEL_RESULT_CHARS on the wire.
+	local floodSizes: { number } = {}
+	for i = 1, 6 do
+		floodSizes[i] = MODEL_RESULT_CHARS + 50000
+	end
+	local flood = batch(floodSizes)
+	capTurn(flood)
+	-- Slack for one truncation note per result; the point is the order of
+	-- magnitude, not the byte.
+	if sumOf(flood) > MODEL_TURN_CHARS + 6 * 400 then
+		return false, string.format("capTurn let a turn through at %d chars (budget %d)",
+			sumOf(flood), MODEL_TURN_CHARS)
+	end
+	for _, entry in ipairs(flood) do
+		if #entry.content == 0 then
+			return false, "capTurn produced an empty tool_result, which the API rejects"
+		end
+	end
+
+	-- Fair share: three tiny results must not cost the big one its full
+	-- per-result allowance. Splitting the budget evenly would leave it a quarter.
+	local lopsided = batch({ 5, 5, 5 })
+	lopsided[4] = { type = "tool_result", tool_use_id = "big",
+		content = string.rep("w", 5 * MODEL_RESULT_CHARS) }
+	capTurn(lopsided)
+	if #lopsided[4].content < MODEL_RESULT_CHARS then
+		return false, string.format(
+			"capTurn gave the only large result %d chars; small siblings should have released their share",
+			#lopsided[4].content)
 	end
 
 	-- Clearing: 12 paired calls, well over the trigger.

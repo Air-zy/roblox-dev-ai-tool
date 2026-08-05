@@ -2,28 +2,32 @@
 
 What is actually in `main/`, and why.
 
-Comparisons to Claude Code throughout were taken from the shipped binary
-(v2.1.221, `~/.local/share/claude/versions/`), whose bundled JS is stored as
-plaintext and can be read with
-`tr -c '\11\12\15\40-\176' '\n' < <binary> | grep -av '^.\{0,7\}$'`. There is no
-public source repo for it — the GitHub one carries issues, docs and plugins,
-not the CLI.
+References are by symbol, not line number — line numbers rot on the first edit,
+and several in an earlier draft already pointed at the wrong code.
 
-Two limits on that evidence. It is one version, and several of the constants
-are read through gated lookups (`Je("tengu_…", default)`) or environment
-overrides, so the figures quoted are **built-in defaults**, not necessarily
-what any given install runs. And the bundle is minified: string and numeric
-constants are unambiguous, but the control flow around them was read from
-mangled identifiers.
+Comparisons to Claude Code are read from its TypeScript source, exposed by a
+source map shipped to npm on 2026-03-31 and archived at
+`github.com/tanbiralam/claude-code`. An earlier pass read the shipped binary
+(v2.1.221) instead, which gets constants right and the mangled control flow
+around them wrong: **three claims here were wrong until the source settled
+them** (§1, §7, and the no-such-floor note below). Two limits remain — the
+archive is one snapshot, not the binary's version, and most of these constants
+are GrowthBook-gated or environment-overridable, so they are built-in defaults,
+several of which ship switched off.
 
 **Do not read this as a list of things Claude Code does.** Most of it is this
-repo's own design, and the two differ more than they overlap:
+repo's own design:
 
 | | |
 |---|---|
-| Borrowed, verified against the binary | keeping the last 5 tool results and stubbing older ones (`H2p=5`, `[Old tool result content cleared]`); a floor on how little a clearing pass may save (`Uzs=20000`); head-only truncation with a marker; the read-versus-shell budget split (`Ro_=25000` vs `igs=30000`) and the 4-chars-per-token estimator (`Ton=4`) behind §6's number; rewriting schema-validation failures into instructions |
-| This repo's, predating any of this work | the three-breakpoint cache scheme and the strip-then-retag in §1 — Claude Code uses up to two message breakpoints and rebuilds the array rather than mutating one; tool ordering as a cache concern (§2); putting the manual in the error rather than the prompt (§4), which is more aggressive than anything Claude Code does; minimal tool definitions (§3); parallel tool use (§8); the usage line (§9) |
-| Derived here, not quoted from anywhere | the 100 000-char cap (25 000 tokens × 4, not a constant of theirs — their byte cap is 262 144); the 200 000 / 80 000 clearing thresholds, where Claude Code instead triggers off a server context hint or context pressure; `safeCut`'s UTF-8 handling, which has no counterpart because JS string slicing cannot produce invalid UTF-8 |
+| Borrowed, verified in source | keeping the last 5 tool results and stubbing older ones (§7); head-only truncation with a marker; the read-versus-shell budget split and the 4-chars-per-token estimator behind §6; a per-*message* budget on top of the per-result one (§6); the same `cache_control`, 1 h TTL included, on the message breakpoint as on system and tools (§1); rewriting schema-validation failures into instructions (§4) |
+| This repo's | the three-breakpoint scheme and the strip-then-retag (§1); tool ordering as a cache concern (§2); minimal tool definitions (§3); putting the manual in the error rather than the prompt (§4), which is more aggressive than anything Claude Code does; parallel tool use (§8); per-file rather than per-line listings (§9); the usage line (§10) |
+| Derived here, not quoted | the 100 000-char cap (25 000 tokens × 4; their read byte cap is `MAX_OUTPUT_SIZE`, 256 KB); the 200 000 / 80 000 clearing thresholds (§7); `safeCut`'s UTF-8 handling, which has no counterpart because JS string slicing cannot produce invalid UTF-8 |
+
+One correction worth keeping visible, because the number is still out there:
+**there is no floor on how little a clearing pass may save.** Claude Code's
+guard is `if (tokensSaved === 0) return null`. The `20000` the binary reading
+attached to it is `GrepTool.maxResultSizeChars`, a cap on one tool's output.
 
 The unit that matters here is the **turn**, not the byte. Every turn re-sends
 the whole conversation, so one avoidable turn costs more than the entire tool
@@ -33,170 +37,218 @@ block does in a session. Most of what follows is shaped by that.
 
 ## 1. Three cache breakpoints, placed deliberately
 
-Anthropic caps a request at four `cache_control` blocks across system, tools
-and messages combined. This uses three.
+Anthropic caps a request at four `cache_control` blocks across system, tools and
+messages combined. This uses three — system prompt, last tool definition, and
+the last block of the last message — **all at 1 h**. `ttl` needs no beta header;
+there is no cache-related beta string anywhere in Claude Code's source, which is
+also what makes the TTL real rather than a field the API quietly ignores.
 
-| block | TTL | where |
-|---|---|---|
-| system prompt (last block) | 1 h | `Claude.lua:231` |
-| tool definitions (last tool) | 1 h | `Claude.lua:248` |
-| conversation (last block of last message) | 5 min | `Claude.lua:149` |
+The conversation breakpoint sat on 5 min until the source settled it; the
+argument is in `applyMessageCache` and comes down to the cache being a
+longest-prefix match, so a warm turn writes only its delta while an expiry
+rewrites everything. Claude Code agrees — `userMessageToMessageParam` and
+`assistantMessageToMessageParam` tag the message breakpoint with the *same*
+`getCacheControl({ querySource })` the system and tool blocks use.
 
-The first two are small and static, so an hour costs one write per hour. The
-third moves every turn, which is why `Claude.lua:224-230` leaves it on the
-default TTL — see the open decision at the bottom of this file, which disputes
-that.
+Two details not copied, both marked as ceilings: eligibility is
+`USER_TYPE === 'ant'` or a subscriber **not in overage** — a 1 h write costs 2×
+base against 5 min's 1.25×, and that is quota, so they stop paying it when quota
+is tight — and the choice is latched per session, because flipping TTL
+mid-session busts the server cache, which their comment prices at ~20 k tokens.
+(Those multipliers are Anthropic's published cache pricing; the source states
+neither.)
 
-**The breakpoint on the conversation is stripped before it is re-applied**
-(`applyMessageCache`, `Claude.lua:136-155`). `conversation` is the same table
-across turns and is only ever appended to, so tagging the last block without
-clearing the previous tag leaves turn 1's breakpoint in place while turn 2 adds
-another. By turn 3 the request is over the four-block limit and every call
-fails with *"A maximum of 4 blocks with cache_control may be provided."*
+**The breakpoint is stripped before it is re-applied** (`applyMessageCache`).
+The conversation is the same table across turns and only ever appended to, so
+tagging the last block without clearing the previous tag leaves turn 1's
+breakpoint in place while turn 2 adds another. By turn 3 the request is over the
+four-block limit and every call fails with *"A maximum of 4 blocks with
+cache_control may be provided."*
 
 ## 2. Tool order is load-bearing
 
-`Tools.lua:31-35` sorts the tool modules by name before registering them.
-`GetChildren()` guarantees no order, so without the sort the tool block could
-serialise differently between two Studio launches. Caching is a prefix match
-and tool definitions render ahead of everything else, so a reorder invalidates
-the system *and* conversation breakpoints too — a silently halved hit rate with
-no visible symptom.
+`Tools.register` sorts the tool modules by name. `GetChildren()` guarantees no
+order, so without the sort the tool block could serialise differently between
+two Studio launches. Caching is a prefix match and tool definitions render ahead
+of everything else, so a reorder invalidates the system *and* conversation
+breakpoints too — a silently halved hit rate with no visible symptom.
 
-For the same reason `buildTools()` (`Agent.lua:84-91`) appends web search
-**last**, so toggling it only ever invalidates from the end of the tool block
-onward, and `Tools.definitions()` builds fresh tables per call so a
-`cache_control` tag can never persist onto a shared definition.
+For the same reason `buildTools()` appends web search **last**, so toggling it
+only invalidates from the end of the tool block onward, and `Tools.definitions()`
+builds fresh tables per call so a `cache_control` tag can never persist onto a
+shared definition.
 
 ## 3. Only what the API reads is sent
 
-`Tools.definitions()` (`Tools.lua:58-68`) emits `name`, `description` and
-`input_schema` and nothing else. The registry's own fields — the `run`
-function, aliases — stay client-side.
+`Tools.definitions()` emits `name`, `description` and `input_schema` and nothing
+else; the registry's own fields — the `run` function, aliases — stay client-side.
 
-The whole tool block is **1 436 characters, ~360 tokens**, written to cache
-once an hour. The default system prompt is empty (`Settings.lua:32`) and the
-identity line is one sentence, so that is very nearly the entire static prefix.
-This is the number that makes trimming descriptions pointless and makes
-avoiding a single turn worth ~8× more.
+The whole tool block is **1 436 characters, ~360 tokens**, written once an hour.
+The default system prompt is empty and the identity line is one sentence, so
+that is very nearly the entire static prefix. This is the number that makes
+trimming descriptions pointless and makes avoiding a single turn worth ~8× more.
+It is also why Claude Code's `defer_loading` / tool-search machinery has no
+place here: it exists for installs where MCP tool descriptions pass 10 % of the
+context window.
 
 ## 4. Explanation lives in errors, not in the prompt
 
-The most distinctive thing in this codebase. Rather than describing the shell
-in the tool description — where every turn pays for it — the explanation sits
-in the error that the one call needing it receives:
+The most distinctive thing in this codebase. Rather than describing the shell in
+the tool description — where every turn pays for it — the explanation sits in
+the error that the one call needing it receives:
 
-- Unknown command lists the entire real command set (`Shell.lua:1154`),
-  derived from the `HANDLERS` table so it cannot go stale.
-- `UNSUPPORTED` (`Shell.lua:287-298`) names *why* and *what instead*:
-  *"chmod: instances have no permission bits; use the run tool to change
-  properties"*, *"awk: use the run tool"*.
+- Unknown command lists the entire real command set, derived from `HANDLERS` so
+  it cannot go stale.
+- `UNSUPPORTED` names *why* and *what instead*: *"chmod: instances have no
+  permission bits; use the run tool to change properties"*.
 - A tool name typed as a command gets *"X is a separate tool, not a shell
-  command"* (`Shell.lua:1148`), asked of the registry so a tool added later is
-  recognised the moment its file lands.
+  command"*, asked of the registry so a tool added later is recognised the
+  moment its file lands.
 - Ambiguous edits get *"old_string appears 3 times — include surrounding lines
-  to make it unique; nothing was applied"* (`Terminal.lua:508`).
+  to make it unique; nothing was applied"*.
 
-Every one of those turns a wrong guess into exactly one corrective turn, at
-zero cost to the turns that guessed right. Claude Code arrives at the same
-pattern from the other direction, rewriting schema-validation failures into
-instructions — *"The required parameter `x` is missing"*, *"The parameter `z`
-type is expected as `string` but provided as `number`"* — rather than dumping
-the validator's own error.
+Each turns a wrong guess into exactly one corrective turn, at zero cost to the
+turns that guessed right. Claude Code reaches the same pattern from the other
+direction, rewriting schema-validation failures into instructions — *"The
+required parameter `x` is missing"*, *"The parameter `z` type is expected as
+`string` but provided as `number`"* (`utils/toolErrors.ts`) — rather than
+dumping the validator's own error.
 
 ## 5. Tool results are summaries, not echoes
 
-`write` returns `"wrote /X (12 lines)"`; `multiedit` returns
-`"edited /X (2 changes, -3/+5 lines)"` (`Terminal.lua:463,524`). Neither echoes
-the source it just wrote — the model already has it, and the file is one `cat`
-away if it does not.
+`write` returns `"wrote /X (12 lines)"`; `multiedit` returns `"edited /X
+(2 changes, -3/+5 lines)"`. Neither echoes the source it just wrote — the model
+already has it, and the file is one `cat` away if it does not.
 
 ## 6. Tool output is capped before it goes on the wire
 
-`forModel` / `safeCut` (`Agent.lua:65-102`), applied at `Agent.lua:562`.
+`forModel` / `safeCut` / `capTurn`, in `Agent.lua`.
 
-**100 000 characters, head-only.** Claude Code caps shell output at 30 000
-chars but gives file reads 25 000 tokens; that split is not available here
-because `cat` arrives as a `bash` line rather than a separate tool, so this
-takes the larger of the two. 100 000 chars is that read budget at 4 chars per
-token.
+**100 000 characters per result, head-only.** Claude Code caps shell output at
+30 000 chars but gives file reads 25 000 tokens; that split is not available
+here because `cat` arrives as a `bash` line rather than a separate tool, so this
+takes the larger of the two — the read budget at 4 chars per token. Their 30 000
+is itself a default, raisable via `BASH_MAX_OUTPUT_LENGTH` as far as
+`BASH_MAX_OUTPUT_UPPER_LIMIT = 150_000`, so 100 000 sits inside the range the
+same codebase treats as sane. Head rather than tail because shell output
+front-loads: the top of an `ls` or a `cat` answers the question.
 
-Head rather than tail because shell output front-loads — the top of an `ls` or
-a `cat` answers the question.
+**200 000 characters per turn.** `capTurn` runs once after the tool loop. One
+turn's `tool_result` blocks all travel in a single user message, so the
+per-result cap alone is not a bound — parallel tool use is on, and six calls
+that each stop just under the cap put 600 000 characters into one message that
+can never be taken back out. Claude Code caps the same thing
+(`MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 200_000`) and spills the largest blocks
+to a file, handing the model a path; with nowhere to spill, the big ones are cut
+harder instead. The split is smallest-first fair share, so a turn of three short
+listings and one huge `tree` spends nearly the whole budget on the tree rather
+than quartering it, and at 2× the per-result cap it only binds from the third
+large result onward. After the loop rather than inside it, so no result ends up
+carrying two truncation notes.
 
 **The cut is UTF-8 safe.** A fixed byte offset can land mid-codepoint and
 `JSONEncode` rejects invalid UTF-8, so a careless truncation kills the request
-outright. `safeCut` prefers the last newline (always a codepoint boundary, and
-a tidier stop) and otherwise steps back off continuation bytes.
+outright. `safeCut` prefers the last newline (always a codepoint boundary, and a
+tidier stop) and otherwise steps back off continuation bytes. No counterpart
+exists upstream: Claude Code slices UTF-16 JS strings, which cannot produce
+invalid UTF-8, so its bash truncation is a bare `slice(0, max)`.
 
-No counterpart exists upstream: Claude Code slices UTF-16 JS strings, which
-cannot produce invalid UTF-8, so its bash truncation is a bare
-`slice(0, 30000)`. This half is Lua's problem alone.
-
-**The Console keeps everything.** `call.setResult()` has already been handed
-the full string by the time this runs (`Agent.lua:382`), so truncation is
-invisible to the user and only the history pays.
+**The Console keeps everything.** `call.setResult()` has already been handed the
+full string by the time this runs, so truncation is invisible to the user and
+only the history pays.
 
 **The message names the way out** — `head -n`, `tail -n`, `sed -n`, `grep` —
-because otherwise the model's next move is to re-run the same unbounded
-command and pay for it twice.
+because otherwise the model's next move is to re-run the same unbounded command
+and pay for it twice.
 
-> Claude Code splits this differently: its marker is bare
-> (`... [N lines truncated] ...`) and the instruction lives in the cached tool
-> prompt — *"If you receive truncation warnings … reduce the chunk size … Bash
-> output is limited to N chars."* That is the better trade at a 30 000-char cap
-> where truncation is routine. At 100 000 it is rare, so paying ~40 tokens on
-> the rare truncation beats paying them on every turn forever.
+> Claude Code puts that instruction in the cached tool prompt instead and keeps
+> its marker bare — the better trade at 30 000 chars, where truncation is
+> routine. At 100 000 it is rare, so ~40 tokens on the rare truncation beats
+> paying them every turn forever.
 
 ## 7. Old tool results are cleared in place
 
-`clearOldToolResults` (`Agent.lua:264-303`), run at the top of every turn.
+`clearOldToolResults`, run at the top of every turn. Keeps the last 5 tool
+results, replaces the content of older ones with a stub, and only acts once the
+history passes 200 000 chars *and* the pass would save at least 80 000. Both
+thresholds exist because mutating a message invalidates the cache from that
+index onward, so every pass costs one full prefix re-write.
 
-Keeps the last 5 tool results, replaces the content of older ones with a stub,
-and only acts once the history passes 200 000 chars *and* the pass would save
-at least 80 000. Both thresholds exist because mutating a message invalidates
-the cache from that index onward, so every pass costs one full prefix re-write.
+Keeping 5 is Claude Code's shape (`keepRecent: 5`, floored at 1 because
+`slice(-0)` returns the whole array). The trigger is not, and the binary reading
+had it wrong. Theirs is **time-based**: it fires when the gap since the last
+assistant message exceeds 60 minutes, on the reasoning that the server's 1 h
+cache TTL is then guaranteed expired, so the prefix is going to be rewritten
+anyway and clearing first shrinks what gets rewritten. Context pressure is a
+different mechanism (autocompact), and this pass ships `enabled: false`.
 
-Keeping 5 and stubbing the rest is Claude Code's shape. The trigger is not:
-it clears on a context hint from the server or on context pressure, with a
-20 000-token floor on how little a pass may save. A fixed history size is the
-version available to a plugin that cannot see how full the window is.
+Two things it does that this plugin does not. It only clears results from a
+fixed set of tools — Read, shell, Grep, Glob, WebFetch, WebSearch, Edit, Write —
+so a tool whose output is small or load-bearing is never stubbed. And where the
+cache is *warm* it does not mutate messages at all: it sends a `cache_edits`
+block that deletes tool results server-side, leaving the cached prefix intact,
+and reads back `cache_deleted_input_tokens` to find out what that saved. That is
+the escape from the tradeoff this section is built around, and a plugin has no
+such API — though the time-based trigger itself is portable, since a TTL is
+knowable client-side and clearing *before* the first request after a long pause
+is strictly better than clearing after it.
 
 Three rules it must not break, all of them the difference between saving tokens
 and killing the session:
 
-- **Stub the content, never remove the block.** Every `tool_result` pairs with
-  a `tool_use` already in the history; drop one and every later request fails
-  on the same index for the rest of the session.
+- **Stub the content, never remove the block.** Every `tool_result` pairs with a
+  `tool_use` already in the history; drop one and every later request fails on
+  the same index for the rest of the session.
 - **Never write empty content.** An empty `tool_result` is rejected outright —
-  the same reason `""` becomes `"(no output)"` at `Agent.lua:381`.
+  the same reason `""` becomes `"(no output)"`.
 - **Never replace something shorter than the stub**, or clearing costs tokens
   instead of saving them. `"(no output)"` is 11 characters and the `""` guard
-  produces it routinely, so this is a live case rather than a hypothetical.
-  Claude Code has no equivalent check — its stub is 33 characters and it
-  computes savings in tokens — so keeping ours short (58 bytes) is what keeps
-  the guard incidental instead of load-bearing.
+  produces it routinely, so this is live rather than hypothetical. Claude Code
+  has no such check; its stub is 33 characters.
 
 What survives: the assistant's own messages. So what the model *concluded* from
 a cleared result is still there — only the raw bytes go.
 
 ## 8. Turns are minimised where the protocol allows
 
-Parallel tool use is left on (`Claude.lua:250-256`). `runTurn` walks every
-`tool_use` block and returns all results in **one** user message, which is the
-shape the API requires anyway — so an `ls` + `cat` + `grep` sweep is one turn
-rather than three. Since a turn re-sends the whole conversation, turns are the
-expensive unit and this is the largest single lever in the file.
+Parallel tool use is left on. `runTurn` walks every `tool_use` block and returns
+all results in **one** user message, which is the shape the API requires anyway
+— so an `ls` + `cat` + `grep` sweep is one turn rather than three. Since a turn
+re-sends the whole conversation, turns are the expensive unit and this is the
+largest single lever in the file. `capTurn` (§6) is the counterweight: the same
+parallelism is also the fastest way to fill a message.
 
-## 9. The numbers are visible
+## 9. Listings pay once per file, not once per line
 
-Every turn prints fresh / cached / written / output tokens
-(`Agent.lua:432-453`), because `input_tokens` alone is only the *uncached
-remainder* — once the prefix is cached the fresh part really is a couple of
-tokens, and printing that number by itself made a working cache look like a
-broken counter.
+Three shapes in the terminal output cost per *row* what they only owe per
+*container*. None of the three loses information.
 
-`/context`-equivalent totals for the session come from `Agent.usage()`.
+**`grep` groups by script** (end of `HANDLERS.grep`). DataModel paths are deep —
+`/ServerScriptService/Modules/Combat/DamageHandler` is 45 characters — and the
+flat `path:line: text` form repeated that on every hit. One header per script;
+on a 40-hit search across 6 scripts that is ~430 characters of path where the
+flat form spent ~1800. (Worked example, not a measurement.) The grouping is a
+presentation pass on top of `Terminal:grep`, which still returns the flat form,
+so `-c` and `-l` parse what they always parsed.
+
+**`ls` is capped at 100 rows** (`MAX_LIST`). It was the one listing with no cap:
+`find` and `grep` stop at `MAX_RESULTS`, but `ls /Workspace` in a place with a
+few thousand parts returned every one of them, stopped only by `forModel`'s
+100 000-character cut — by which point the result is ~25 000 tokens re-sent on
+every remaining turn. The cap lives in the `ls` *handler* rather than in
+`Terminal:ls`, because `expandGlobs` consumes that return value as a list of
+paths and a `… N more` sentinel would arrive at `cat` as an operand.
+
+**`ls -l` dropped its column padding and its zero counts.** `%-32s` aligns for
+an eye that is not reading this, and `0 children` landed on every leaf.
+
+## 10. The numbers are visible
+
+Every turn prints fresh / cached / written / output tokens, because
+`input_tokens` alone is only the *uncached remainder* — once the prefix is
+cached the fresh part really is a couple of tokens, and printing that number by
+itself made a working cache look like a broken counter. `/context`-equivalent
+session totals come from `Agent.usage()`.
 
 ---
 
@@ -210,66 +262,75 @@ Marked with `ponytail:` in the source, per this repo's convention.
 | No anti-thrash breaker; a heavy session can re-cross the trigger every few turns, paying a prefix re-write each time | same |
 | Trigger is eager — 200 000 chars is ~25 % of the window, so re-writes start well before the session is at risk | same |
 | Cleared output is unrecoverable; a plugin has nowhere to spill it | same |
-| One result cap for reads and listings alike, so `ls -R /` may now spend 100 000 chars | `Agent.lua`, above `MODEL_RESULT_CHARS` |
+| `tree` and `du` are still bounded only by the per-result cap | `Agent.lua`, above `MODEL_RESULT_CHARS` |
+| No overage gating or session latch on the 1 h TTL | `Claude.lua`, `applyMessageCache` |
+| `grep` grouping costs per-line file attribution when piped into another `grep` | `Shell.lua`, end of `HANDLERS.grep` |
 
 Upgrade path for the first three is summarising compaction — replacing spans of
-history with a paragraph instead of only blanking results.
+history with a paragraph instead of only blanking results. Claude Code's version
+sizes its threshold off the model's context window rather than a char constant,
+and carries a 3-strike circuit breaker added after sessions were found retrying
+a failing compaction dozens of times.
+
+## Not adopted, deliberately
+
+Mechanisms in the source that were examined and left alone, so nobody re-derives
+them: **spilling large results to disk** (no filesystem, and with the caps in §6
+and §9 almost nothing reaches the threshold); **`defer_loading` / tool search**
+(§3 — the whole tool block is ~360 tokens); **`bytesPerTokenForFileType`**,
+which estimates JSON at 2 chars per token rather than 4 (this plugin reads real
+usage off the response instead of estimating).
+
+Still open: **server-side `context_management`** (`clear_tool_uses_20250919`),
+which would move clearing to the API and stop it invalidating the cached prefix
+— collapsing the first three ceilings above. Untried; needs a live request to
+know whether OAuth accepts the beta.
 
 ## Open decisions
 
-Four things examined and deliberately left alone. Each is a judgement call, not
-an oversight.
+Three judgement calls, not oversights.
 
-**1 h TTL on the conversation breakpoint.** `Claude.lua:224-230` argues the
-conversation breakpoint should stay at 5 min because *"it moves and grows every
-turn, so doubling its write cost would swamp the saving."* That holds only if
-each turn re-writes the whole conversation — it does not, while the cache is
-warm, because the lookup is a longest-prefix match, so turn N+1 reads turn N's
-entry and writes only the delta. The doubled cost lands on one turn's new
-messages; a 5 min expiry costs a full re-write of everything. On a 60 k-token
-thread that is roughly a 6 k-token read versus a 75 k-token write on the first
-turn back after a pause — and this is a plugin people leave docked while they
-think. It is one line in two places (`Claude.lua:149` and the string branch at
-`151-153`) and `Agent.lua:432-453` already prints the two numbers that settle
-it. Not changed, because it contradicts a documented decision.
+**`run` is offered even while disabled.** `Settings.allowRun` defaults false and
+the guard is in `Terminal:run`, but `buildTools()` offers the tool every turn, so
+each attempt is a wasted turn. Filtering it out is not a clean win: the error it
+returns — *"enable it in Settings > Run code"* — is the only thing that ever
+tells the user the capability exists, and `isSeparateTool` asks the registry, so
+`bash` would still claim *"run is a separate tool"* for a tool no longer offered.
 
-**`run` is offered even while disabled.** `Settings.allowRun` defaults false
-and the guard is in `Terminal:run` (`Terminal.lua:704`), but `buildTools()`
-offers the tool every turn, so each attempt is a wasted turn. Filtering it out
-is not a clean win though: the error it returns — *"enable it in Settings > Run
-code"* — is the only thing that ever tells the user the capability exists, and
-`isSeparateTool` asks the registry, so `bash` would still claim *"run is a
-separate tool"* for a tool no longer offered. A trade, not a saving.
+**Two comments describe behaviour the code lacks.** `tools/bash.lua` says its
+description *"carries the MAPPING … that this filesystem is a DataModel"* — it
+does not. And `Terminal:run` justifies having no timeout with *"The tool
+description tells Claude to bound its loops"* — `tools/run.lua` states the
+hazard but never gives the instruction. The second is worth ~10 tokens to fix
+regardless, since the failure mode is Studio freezing.
 
-**Two comments describe behaviour the code lacks.** `tools/bash.lua:3-6` says
-the description *"carries the MAPPING … that this filesystem is a DataModel"* —
-it does not; the description never mentions it. And `Terminal.lua:715-717`
-justifies having no timeout with *"The tool description tells Claude to bound
-its loops"* — `tools/run.lua:7` states the hazard but never gives the
-instruction. The second is worth ~10 tokens to fix regardless, since the
-failure mode is Studio freezing. The first may cost nothing: a bare `ls` at
-root returns `Workspace`, `Players`, `Lighting`, which may be signal enough.
-
-**`write` and `bash`'s `>` are one operation behind two doors.**
-`applyRedirect` (`Shell.lua:367`) calls the same `Terminal:write` the `write`
-tool calls, and nothing tells the model which to prefer. `edit.lua:3-5` already
-knows the answer — shell quoting eventually corrupts source — it just never
-says it anywhere the model reads. Remove neither: `>` is what lets pipelines
-terminate, `write` is what keeps Luau source out of the tokenizer.
+**`write` and `bash`'s `>` are one operation behind two doors.** `applyRedirect`
+calls the same `Terminal:write` the `write` tool calls, and nothing tells the
+model which to prefer. `edit.lua` already knows the answer — shell quoting
+eventually corrupts source — it just never says it anywhere the model reads.
+Remove neither: `>` is what lets pipelines terminate, `write` is what keeps Luau
+source out of the tokenizer.
 
 Also considered and rejected: merging `edit` into `multiedit`. `Terminal:edit`
-is already `multiedit(path, {one})` (`Terminal.lua:530`) so there is no
-duplicated logic to remove, only ~267 chars of schema — and forcing every
-single-hunk edit to carry an `edits` array walks straight into the failure
-`Agent.lua:27-40` documents, where a long `edits` payload truncated by
-`max_tokens` arrives as invalid JSON and poisons the history.
+is already `multiedit(path, {one})`, so there is no duplicated logic to remove,
+only ~267 chars of schema — and forcing every single-hunk edit to carry an
+`edits` array walks straight into the documented failure where a long payload
+truncated by `max_tokens` arrives as invalid JSON and poisons the history.
 
 ## Checks
 
-`Agent.selfTest()` (`Agent.lua:662`), wired into `main.lua` alongside the
-Markdown, Terminal and Props self-tests. Covers the truncation shape, the UTF-8
-boundary, the line-boundary cut, and every rule in §7 — pairing preserved, no
-empty content, recent results untouched, idempotent, and a small history left
-alone. Fixture sizes derive from `MODEL_RESULT_CHARS` rather than being written
-as literals, so raising the cap cannot silently stop the tests exercising
+`Agent.selfTest()` and `Shell.selfTest()`, wired into `main.lua` alongside the
+Markdown, Terminal and Props self-tests.
+
+Agent covers the truncation shape, the UTF-8 boundary, the line-boundary cut,
+`capTurn` in both directions (a normal sweep must come back byte-identical, a
+flood of oversized results must land inside the turn budget with no empty
+block, and a lone large result must not be starved by small siblings), and every
+rule in §7 — pairing preserved, no empty content, recent results untouched,
+idempotent, small history left alone. Shell covers the `ls` cap and its row
+count, `ls -l` emitting no zero counts, and `grep` emitting one header per
+script while `-c` and `-l` still read the ungrouped form.
+
+Fixture sizes derive from `MODEL_RESULT_CHARS` and `MAX_LIST` rather than being
+written as literals, so raising a cap cannot silently stop the tests exercising
 anything.

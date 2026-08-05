@@ -123,7 +123,12 @@ function Terminal:ls(path: string?, long: boolean?, filter: ((string) -> boolean
 		-- Filter on the displayed name, so `ls *.luau` means what it looks like.
 		if not filter or filter(name) then
 			if long then
-				name = string.format("%-32s [%s]  %d children", name, child.ClassName, #child:GetChildren())
+				-- No column padding and no "0 children". Alignment is for eyes; the
+				-- reader here is a model, and on a 200-part listing the padding
+				-- plus a zero count on every leaf is most of the bytes.
+				local kids = #child:GetChildren()
+				name = string.format("%s [%s]%s", name, child.ClassName,
+					kids > 0 and string.format("  %d children", kids) or "")
 			end
 			table.insert(names, name)
 		end
@@ -219,9 +224,7 @@ function Terminal:stat(path: string?): (string?, string?)
 		table.insert(lines, string.format("Lines: %d", #splitLines(source)))
 		table.insert(lines, "Type: script")
 	end
-	if target.Parent then
-		table.insert(lines, string.format("Parent: %s", target.Parent.Name))
-	end
+	-- No `Parent:` line — `Path:` above already ends with it.
 	if not source then
 		-- stat is metadata, the way it is everywhere else, and `cat` is what
 		-- prints the property values. That split is obvious once you know it and
