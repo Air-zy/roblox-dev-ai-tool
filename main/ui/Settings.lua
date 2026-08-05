@@ -316,7 +316,7 @@ function Settings.mountPanel(
 		Position = UDim2.fromScale(0.5, 0.5),
 		Size = UDim2.new(1, -80, 1, -60),
 	})
-	make("UICorner", { Parent = card, CornerRadius = UDim.new(0, 8) })
+	make("UICorner", { Parent = card, CornerRadius = UDim.new(0, 4) })
 	-- The widget can be very short or very wide depending on where it is docked;
 	-- clamp so the card never outgrows a readable measure or collapses to nothing.
 	make("UISizeConstraint", {
@@ -448,7 +448,7 @@ function Settings.mountPanel(
 					Parent = track,
 					-- Red once the window is nearly spent, so a full bar reads as a
 					-- warning without needing a legend.
-					BackgroundColor3 = fraction >= 0.9 and Theme.ERR_CLR or Theme.ACCENT,
+					BackgroundColor3 = fraction >= 0.9 and Theme.ERR_CLR or Theme.BAR_CLR,
 					BorderSizePixel = 0,
 					Size = UDim2.fromScale(fraction, 1),
 				})
@@ -457,33 +457,10 @@ function Settings.mountPanel(
 		end
 	end
 
-	-- Model is deliberately NOT here. It lives on the chip at the right of the
-	-- input row, one click from where you type; a second dropdown saying the same
-	-- thing is just another place for the two to disagree.
-
-	-- Thinking budget ---------------------------------------------------------
-	sectionLabel(scroll, "EFFORT", 5)
-	local effortOptions: { Option } = {}
-	for index, level in ipairs(EFFORT_LEVELS) do
-		table.insert(effortOptions, { id = index, label = level.name, hint = level.hint })
-	end
-	dropdown(scroll, 6, effortOptions, function() return state.effort end, function(id)
-		Settings.setEffort(id :: number)
-		refreshStatus()
-	end)
-	make("TextLabel", {
-		Parent = scroll,
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 26),
-		AutomaticSize = Enum.AutomaticSize.Y,
-		FontFace = Theme.SANS,
-		TextSize = 12,
-		TextColor3 = Theme.TEXT_LO,
-		TextWrapped = true,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Text = "Caps total token spend. Low effort may skip thinking entirely.",
-		LayoutOrder = 7,
-	})
+	-- Neither MODEL nor EFFORT is here. Both live on the chip at the right of the
+	-- input row — the model on its first page, effort behind it — one click from
+	-- where you type. A second copy of either is just another place for the two to
+	-- disagree.
 
 	-- Web search --------------------------------------------------------------
 	sectionLabel(scroll, "WEB SEARCH", 8)

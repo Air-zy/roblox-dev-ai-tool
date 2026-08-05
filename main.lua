@@ -155,13 +155,8 @@ local sessionsButton = make("TextButton", {
 -- Nothing else lives in this bar. The model/effort readout moved to a chip in
 -- the input row that also SETS the model, and the gear moved to the bottom of
 -- the sessions drawer — a status line you cannot act on is not worth a corner.
-make("Frame", {
-	Parent = headerBar,
-	BackgroundColor3 = Theme.BORDER,
-	BorderSizePixel = 0,
-	Size = UDim2.new(1, 0, 0, 1),
-	Position = UDim2.new(0, 0, 1, -1),
-})
+-- No rule under the bar either: the header is empty enough that a divider only
+-- draws a line across nothing.
 
 local outputFrame = Console.mount(root, 2)
 
@@ -221,22 +216,31 @@ stopButton.MouseButton1Click:Connect(function()
 	Agent.stop()
 end)
 
--- The model chip sits in the Stop button's slot and the two swap on busy: there
--- is no width in this row for both, and a model picked mid-turn would not apply
--- until the next one anyway. Replaces the old header status line, which spent a
--- quarter of the header saying something nothing could act on.
+-- The model chip sits at the right of the input row; while streaming, Stop takes
+-- that corner and the chip slides left of it rather than disappearing — which
+-- model is answering is exactly what you want to read mid-turn. Replaces the old
+-- header status line, which spent a quarter of the header saying something
+-- nothing could act on.
+local CHIP_X_IDLE = -8
+local CHIP_X_BUSY = -76 -- clears the 62px Stop button plus a 6px gap
 local modelButton = make("TextButton", {
 	Name = "ModelButton",
 	Parent = inputRow,
 	BackgroundColor3 = Theme.BG_DARK,
+	-- Invisible until you go for it: at rest this is a label saying which model
+	-- is answering, and a filled pill would read as the loudest thing in a row
+	-- whose actual job is the text you are typing.
+	BackgroundTransparency = 1,
 	BorderSizePixel = 0,
 	AnchorPoint = Vector2.new(1, 0.5),
-	Position = UDim2.new(1, -8, 0.5, 0),
-	Size = UDim2.new(0, 124, 0, 22),
+	Position = UDim2.new(1, CHIP_X_IDLE, 0.5, 0),
+	Size = UDim2.new(0, 160, 0, 22),
 	FontFace = Theme.SANS,
-	TextSize = 11,
-	TextColor3 = Theme.TEXT_MED,
+	TextSize = 13,
+	TextColor3 = Theme.TEXT_HI,
 	TextXAlignment = Enum.TextXAlignment.Left,
+	-- The effort rides along in a dimmer, smaller span after the model name.
+	RichText = true,
 	Text = "",
 	AutoButtonColor = false,
 })
@@ -253,14 +257,22 @@ make("TextLabel", {
 	TextColor3 = Theme.TEXT_LO,
 	Text = "chevron-small-down",
 })
+-- AutoButtonColor is off across this UI (it tints by transparency, which does
+-- nothing to a transparent background), so hover is done by hand.
+modelButton.MouseEnter:Connect(function()
+	modelButton.BackgroundTransparency = 0
+end)
+modelButton.MouseLeave:Connect(function()
+	modelButton.BackgroundTransparency = 1
+end)
 
 local inputBox = make("TextBox", {
 	Name = "Input",
 	Parent = inputRow,
 	BackgroundTransparency = 1,
-	-- Leaves room for the model chip, and for the Stop button that replaces it
-	-- while streaming.
-	Size = UDim2.new(1, -164, 0, 32),
+	-- Leaves room for the model chip; the busy callback widens the gap again for
+	-- the Stop button that appears beside it while streaming.
+	Size = UDim2.new(1, -196, 0, 32),
 	AutomaticSize = Enum.AutomaticSize.Y,
 	Position = UDim2.new(0, 24, 0, 0),
 	FontFace = Theme.SANS,
@@ -469,24 +481,50 @@ end)
 -- switching model is one click from where you type instead of three from a
 -- panel. Both write the same setting; neither is the source of truth.
 --
--- The chip shows a short name: the full labels ("Claude Sonnet 5 (recommended)")
--- are written for a settings row three times this wide.
+-- The registry labels ("Claude Sonnet 5 (recommended)") are written for a
+-- settings row several times wider than anything here, and at this width they
+-- truncate to "Claude Sonnet 5 (recomm…". Split them instead: the name loses the
+-- "Claude " every entry shares, and the parenthetical becomes the dim value on
+-- the right, where the row already has a column for it.
+local function splitModel(label: string): (string, string?)
+	local name = (label:gsub("^Claude ", ""))
+	local hint = name:match("%((.-)%)$")
+	if hint then
+		name = (name:gsub("%s*%b()$", ""))
+	end
+	return name, hint
+end
+
 local function shortModel(label: string): string
-	return (label:gsub("^Claude ", ""):gsub("%s*%b()", ""))
+	local name = splitModel(label)
+	return name
 end
 
 local function refreshModel()
 	local id = Settings.model()
+	local effort = string.format(
+		'  <font color="#6B6862" size="12">%s</font>',
+		Settings.effortName():lower()
+	)
 	for _, entry in ipairs(Claude.MODELS) do
 		if entry.id == id then
-			modelButton.Text = shortModel(entry.label)
+			modelButton.Text = shortModel(entry.label) .. effort
 			return
 		end
 	end
 	-- A model set by `/model claude-something` that is not in the list.
-	modelButton.Text = id
+	modelButton.Text = id .. effort
 end
 
+-- Effort hangs off this menu rather than getting its own control, which is where
+-- Claude Code puts it too — there it is a slider you nudge with left/right while
+-- a model row is highlighted, plus a separate /effort command. A slider is a
+-- keyboard shape; with a mouse the same idea is a submenu, so the Effort row
+-- swaps this popup to a second page and back.
+--
+-- No "More models" page, which Claude Code does have: it is there because that
+-- list runs to a dozen entries including legacy ones. Ours is three, and
+-- `/model claude-anything` already takes an id the list has never heard of.
 local modelPopup = make("Frame", {
 	Name = "ModelPopup",
 	Parent = widget,
@@ -494,35 +532,157 @@ local modelPopup = make("Frame", {
 	BorderColor3 = Theme.BORDER,
 	BorderSizePixel = 1,
 	AnchorPoint = Vector2.new(1, 1),
-	Size = UDim2.new(0, 220, 0, #Claude.MODELS * 26 + 4),
+	-- Height follows the page, which is two different lengths.
+	Size = UDim2.new(0, 240, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
 	Visible = false,
 	ZIndex = 45,
 })
 make("UIListLayout", { Parent = modelPopup, SortOrder = Enum.SortOrder.LayoutOrder })
 make("UIPadding", { Parent = modelPopup, PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 2) })
 
-local modelRows: { [string]: TextButton } = {}
-for i, entry in ipairs(Claude.MODELS) do
+-- marker is a Builder Icons name drawn in the left column: a check for the
+-- current selection, a back chevron for the row that returns to the models.
+-- `trailing` is the dim value on the right, `chevron` the "opens a page" hint.
+local function popupRow(
+	order: number,
+	label: string,
+	marker: string?,
+	trailing: string?,
+	chevron: boolean,
+	onClick: () -> ()
+)
+	local selected = marker == "check-small"
 	local row = make("TextButton", {
 		Parent = modelPopup,
+		BackgroundColor3 = Theme.BG_DARK,
 		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 26),
-		FontFace = Theme.SANS,
-		TextSize = 12,
-		TextColor3 = Theme.TEXT_MED,
-		TextXAlignment = Enum.TextXAlignment.Left,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 0, 28),
 		Text = "",
-		AutoButtonColor = true,
-		LayoutOrder = i,
+		AutoButtonColor = false,
+		LayoutOrder = order,
 		ZIndex = 46,
 	})
-	make("UIPadding", { Parent = row, PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) })
-	row.MouseButton1Click:Connect(function()
-		Settings.setModel(entry.id)
-		modelPopup.Visible = false
-		refreshModel()
+	row.MouseEnter:Connect(function() row.BackgroundTransparency = 0 end)
+	row.MouseLeave:Connect(function() row.BackgroundTransparency = 1 end)
+	if marker then
+		make("TextLabel", {
+			Parent = row,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(0, 16, 1, 0),
+			Position = UDim2.new(0, 8, 0, 0),
+			FontFace = Theme.ICON,
+			TextSize = 14,
+			-- The back chevron is navigation, not a selection: only the check earns
+			-- the accent.
+			TextColor3 = selected and Theme.ACCENT or Theme.TEXT_MED,
+			Text = marker,
+		})
+	end
+	make("TextLabel", {
+		Parent = row,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, -132, 1, 0),
+		Position = UDim2.new(0, 28, 0, 0),
+		FontFace = Theme.SANS,
+		TextSize = 14,
+		TextColor3 = selected and Theme.ACCENT or Theme.TEXT_HI,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = label,
+	})
+	if trailing then
+		make("TextLabel", {
+			Parent = row,
+			BackgroundTransparency = 1,
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, chevron and -22 or -10, 0, 0),
+			Size = UDim2.new(0, 96, 1, 0),
+			FontFace = Theme.SANS,
+			TextSize = 13,
+			TextColor3 = Theme.TEXT_MED,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			TextXAlignment = Enum.TextXAlignment.Right,
+			Text = trailing,
+		})
+	end
+	if chevron then
+		make("TextLabel", {
+			Parent = row,
+			BackgroundTransparency = 1,
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -6, 0, 0),
+			Size = UDim2.new(0, 14, 1, 0),
+			FontFace = Theme.ICON,
+			TextSize = 14,
+			TextColor3 = Theme.TEXT_MED,
+			Text = "chevron-small-right",
+		})
+	end
+	row.MouseButton1Click:Connect(onClick)
+end
+
+-- Rebuilt on every open and every page flip, rather than kept in sync: it is
+-- eight rows, and /model, /effort and the settings panel can all have moved the
+-- selection since the last time this was on screen.
+local effortPage = false
+local function drawPopup()
+	for _, child in ipairs(modelPopup:GetChildren()) do
+		if child:IsA("GuiObject") then child:Destroy() end
+	end
+
+	if effortPage then
+		popupRow(1, "Models", "chevron-small-left", nil, false, function()
+			effortPage = false
+			drawPopup()
+		end)
+		make("Frame", {
+			Parent = modelPopup,
+			BackgroundColor3 = Theme.BORDER,
+			BorderSizePixel = 0,
+			Size = UDim2.new(1, 0, 0, 1),
+			LayoutOrder = 2,
+			ZIndex = 46,
+		})
+		local current = Settings.effortName()
+		for i, level in ipairs(Settings.EFFORT_LEVELS) do
+			popupRow(i + 2, level.name, level.name == current and "check-small" or nil,
+				level.hint, false, function()
+					Settings.setEffort(i)
+					refreshModel()
+					-- Stays open: effort is the setting you are most likely to try a
+					-- couple of values of before sending.
+					drawPopup()
+				end)
+		end
+		return
+	end
+
+	local current = Settings.model()
+	for i, entry in ipairs(Claude.MODELS) do
+		-- The parenthetical rides in the trailing column rather than being dropped:
+		-- it is the only thing separating "Max only" from "fastest" at the moment
+		-- of choosing.
+		local name, hint = splitModel(entry.label)
+		popupRow(i, name, entry.id == current and "check-small" or nil, hint, false, function()
+			Settings.setModel(entry.id)
+			modelPopup.Visible = false
+			refreshModel()
+		end)
+	end
+	make("Frame", {
+		Parent = modelPopup,
+		BackgroundColor3 = Theme.BORDER,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 0, 1),
+		LayoutOrder = #Claude.MODELS + 1,
+		ZIndex = 46,
+	})
+	popupRow(#Claude.MODELS + 2, "Effort", nil, Settings.effortName():lower(), true, function()
+		effortPage = true
+		drawPopup()
 	end)
-	modelRows[entry.id] = row
 end
 
 modelButton.MouseButton1Click:Connect(function()
@@ -530,17 +690,8 @@ modelButton.MouseButton1Click:Connect(function()
 		modelPopup.Visible = false
 		return
 	end
-	-- Marked here rather than at build time: /model and the settings panel can
-	-- both have moved the selection since.
-	local current = Settings.model()
-	for _, entry in ipairs(Claude.MODELS) do
-		local row = modelRows[entry.id]
-		local on = entry.id == current
-		-- Full label here, unlike the chip: the parentheticals are the only thing
-		-- separating "Max only" from "fastest" at the moment of choosing.
-		row.Text = (on and "✓ " or "   ") .. entry.label
-		row.TextColor3 = on and Theme.ACCENT or Theme.TEXT_MED
-	end
+	effortPage = false
+	drawPopup()
 	-- Right-aligned with the chip, floating just above the input row however tall
 	-- that row currently is.
 	modelPopup.Position = UDim2.new(1, -8, 1, -inputRow.AbsoluteSize.Y - 4)
@@ -638,7 +789,8 @@ end)
 Agent.Initialize(term, function(busy: boolean)
 	Console.setWorking(busy)
 	stopButton.Visible = busy
-	modelButton.Visible = not busy
+	modelButton.Position = UDim2.new(1, busy and CHIP_X_BUSY or CHIP_X_IDLE, 0.5, 0)
+	inputBox.Size = UDim2.new(1, busy and -264 or -196, 0, 32)
 	if not busy then
 		refreshModel()
 		Sessions.save()

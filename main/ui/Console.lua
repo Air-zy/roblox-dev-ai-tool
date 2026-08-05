@@ -735,11 +735,15 @@ function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinki
 	})
 	make("UIListLayout", { Parent = container, SortOrder = Enum.SortOrder.LayoutOrder })
 
+	-- MONO, matching a tool call's header and detail box. The two are the same
+	-- affordance — a collapsed row you click to expand — and they were already the
+	-- same TextSize; the only thing making them look different was BuilderSans
+	-- next to RobotoMono at the same nominal size.
 	local header = make("TextButton", {
 		Parent = container,
 		BackgroundTransparency = 1,
 		Size = UDim2.new(1, 0, 0, 20),
-		FontFace = Theme.SANS,
+		FontFace = Theme.MONO,
 		TextSize = Theme.SMALL_SIZE,
 		TextColor3 = Theme.THINK_CLR,
 		TextXAlignment = Enum.TextXAlignment.Left,
@@ -753,7 +757,7 @@ function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinki
 		BackgroundTransparency = 1,
 		Size = UDim2.new(1, -12, 0, 0),
 		AutomaticSize = Enum.AutomaticSize.Y,
-		FontFace = Theme.SANS,
+		FontFace = Theme.MONO,
 		TextSize = Theme.SMALL_SIZE,
 		TextColor3 = Theme.TEXT_MED,
 		TextWrapped = true,

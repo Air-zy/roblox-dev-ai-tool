@@ -22,6 +22,7 @@ Theme.ACCENT_HI   = Color3.fromRGB(193, 95, 60)   -- #C15F3C Crail
 Theme.THINK_CLR   = Color3.fromRGB(184, 168, 156) -- #B8A89C warm light brown
 Theme.CODE_CLR    = Color3.fromRGB(226, 183, 148) -- #E2B794 sand, for code spans
 Theme.ERR_CLR     = Color3.fromRGB(229, 120, 110) -- #E5786E lighter red
+Theme.BAR_CLR     = Color3.fromRGB(140, 178, 214) -- #8CB2D6 creamy blue, usage bars
 
 -- =============================================================================
 -- Fonts

@@ -374,11 +374,13 @@ function Sessions.mountSidebar(parent: Instance, openSettings: () -> ()): (boole
 
 	-- Pinned to the bottom, out of the header: the gear is a once-a-session
 	-- control and the header row it used to sit in is now two clicks of nothing.
+	-- 32px, the same as the header bar and the input row, so the drawer's top and
+	-- bottom edges line up with the console's.
 	local settingsRow = make("TextButton", {
 		Parent = panel,
 		BackgroundTransparency = 1,
-		Size = UDim2.new(1, -1, 0, 34),
-		Position = UDim2.new(0, 0, 1, -34),
+		Size = UDim2.new(1, -1, 0, 32),
+		Position = UDim2.new(0, 0, 1, -32),
 		Text = "",
 		AutoButtonColor = false,
 	})
@@ -415,9 +417,10 @@ function Sessions.mountSidebar(parent: Instance, openSettings: () -> ()): (boole
 		Parent = panel,
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
-		-- 36 of header above, 34 of settings row below.
-		Size = UDim2.new(1, -1, 1, -70),
-		Position = UDim2.new(0, 0, 0, 36),
+		-- 32 of header above, 32 of settings row below — both the same height as
+		-- the console's header and input row.
+		Size = UDim2.new(1, -1, 1, -64),
+		Position = UDim2.new(0, 0, 0, 32),
 		CanvasSize = UDim2.new(0, 0, 0, 0),
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
 		ScrollingDirection = Enum.ScrollingDirection.Y,
@@ -479,8 +482,27 @@ function Sessions.mountSidebar(parent: Instance, openSettings: () -> ()): (boole
 					TextSize = 14,
 					TextColor3 = Theme.TEXT_LO,
 					Text = "trash-can",
+					-- Hidden by transparency, not Visible: an invisible button stops
+					-- receiving MouseEnter, and the row fires MouseLeave the moment the
+					-- cursor crosses onto a child, so Visible = false would make the icon
+					-- flicker itself out from under the mouse.
+					TextTransparency = 1,
 					AutoButtonColor = false,
 				})
+
+				row.MouseEnter:Connect(function()
+					remove.TextTransparency = 0
+					remove.TextColor3 = Theme.TEXT_LO
+				end)
+				row.MouseLeave:Connect(function() remove.TextTransparency = 1 end)
+				remove.MouseEnter:Connect(function()
+					remove.TextTransparency = 0
+					remove.TextColor3 = Theme.TEXT_HI
+				end)
+				remove.MouseLeave:Connect(function()
+					remove.TextTransparency = 1
+					remove.TextColor3 = Theme.TEXT_LO
+				end)
 
 				local id = entry.id
 				-- The drawer stays open on a switch: picking the wrong session and
