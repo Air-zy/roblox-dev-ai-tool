@@ -13,6 +13,7 @@ local ui = script.Parent:WaitForChild("ui")
 local OAuth = require(script.Parent:WaitForChild("auth"):WaitForChild("OAuth"))
 local Console = require(ui:WaitForChild("Console"))
 local Settings = require(ui:WaitForChild("Settings"))
+local Sessions = require(ui:WaitForChild("Sessions"))
 local Claude = require(agent:WaitForChild("Claude"))
 local Agent = require(agent:WaitForChild("Agent"))
 local Terminal = require(script.Parent:WaitForChild("fs"):WaitForChild("Terminal"))
@@ -137,9 +138,10 @@ handlers["/model"] = function(arg)
 	end
 end
 
+-- Wipes the stored session too, not just the screen: leaving the saved copy
+-- behind would have the next open restore what was just cleared.
 handlers["/clear"] = function()
-	Console.clear()
-	Agent.reset()
+	Sessions.clear()
 end
 
 -- Read-only passthrough to the terminal Claude uses. The whole line goes through

@@ -19,6 +19,8 @@ local make = Theme.make
 
 local Console = {}
 local output: ScrollingFrame = nil :: any
+-- The "Working…" row — see Console.setWorking.
+local workingRow: TextLabel = nil :: any
 
 -- Sticky bottom. Writing CanvasPosition straight after adding content did not
 -- work: AutomaticCanvasSize recomputes the canvas a step LATER, so the write was
@@ -77,6 +79,29 @@ function Console.mount(parent: Instance, layoutOrder: number): ScrollingFrame
 		PaddingBottom = UDim.new(0, 6),
 	})
 
+	-- Made once here and hidden, rather than appended and destroyed each turn:
+	-- every appender numbers its block from #output:GetChildren(), so a child that
+	-- comes and goes makes that count shrink and lets a later block reuse a
+	-- LayoutOrder that is still on screen. A permanent child is just another
+	-- constant in the count, like the layout and padding objects. UIListLayout
+	-- skips invisible children, so it takes no space while idle.
+	--
+	-- LayoutOrder is the int32 ceiling so the row stays last however long the
+	-- conversation runs.
+	workingRow = make("TextLabel", {
+		Name = "Working",
+		Parent = output,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 20),
+		FontFace = Theme.MONO,
+		TextSize = Theme.TEXT_SIZE,
+		TextColor3 = Theme.TEXT_MED,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "",
+		Visible = false,
+		LayoutOrder = 2147483647,
+	})
+
 	local function pin()
 		if stickToBottom then
 			output.CanvasPosition = Vector2.new(0, math.huge)
@@ -109,7 +134,7 @@ end
 function Console.clear()
 	stickToBottom = true  -- an empty console is at its bottom by definition
 	for _, child in ipairs(output:GetChildren()) do
-		if child:IsA("GuiObject") then
+		if child:IsA("GuiObject") and child ~= workingRow then
 			child:Destroy()
 		end
 	end
@@ -673,6 +698,25 @@ function Console.spin(render: (string) -> (), alive: Instance?): () -> ()
 	end)
 	return function()
 		running = false
+	end
+end
+
+-- Sits below everything in the console for as long as a turn is running, which
+-- is where the next block is about to appear. It covers the gap between sending
+-- and the first token — thinking blocks and tool calls carry their own spinners
+-- once they exist, but until then the console is silent.
+local stopWorking: (() -> ())? = nil
+function Console.setWorking(on: boolean)
+	if stopWorking then
+		stopWorking()
+		stopWorking = nil
+	end
+	workingRow.Visible = on
+	if on then
+		stopWorking = Console.spin(function(frame: string)
+			workingRow.Text = frame .. " Working…"
+		end)
+		Console.scrollToBottom()
 	end
 end
 

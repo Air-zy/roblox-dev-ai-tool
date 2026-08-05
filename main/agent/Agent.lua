@@ -228,6 +228,12 @@ function Agent.reset()
 	conversation = {}
 end
 
+-- Adopts a saved conversation wholesale (Sessions). Takes the table rather than
+-- copying it, so later turns append to the same list the caller holds.
+function Agent.restore(messages: { any })
+	conversation = messages
+end
+
 function Agent.usage(): { input: number, output: number }
 	return totals
 end

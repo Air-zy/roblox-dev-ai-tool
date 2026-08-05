@@ -27,6 +27,7 @@ local Theme    = require(ui:WaitForChild("Theme"))
 local Markdown = require(ui:WaitForChild("Markdown"))
 local Console  = require(ui:WaitForChild("Console"))
 local Settings = require(ui:WaitForChild("Settings"))
+local Sessions = require(ui:WaitForChild("Sessions"))
 local Agent    = require(agent:WaitForChild("Agent"))
 local Commands = require(script:WaitForChild("Commands"))
 
@@ -35,6 +36,7 @@ local make = Theme.make
 OAuth.Initialize(plugin)
 Claude.Initialize(OAuth)
 Settings.Initialize(plugin)
+Sessions.Initialize(plugin)
 
 local term = Terminal.new(game)
 -- Terminal asks this before executing anything, rather than importing Settings
@@ -136,17 +138,20 @@ local headerBar = make("Frame", {
 	Size = UDim2.new(1, 0, 0, 32),
 	LayoutOrder = 1,
 })
-make("TextLabel", {
+local sessionsButton = make("TextButton", {
+	Name = "SessionsButton",
 	Parent = headerBar,
 	BackgroundTransparency = 1,
-	Size = UDim2.new(1, -80, 1, 0),
-	Position = UDim2.new(0, 12, 0, 0),
-	FontFace = Theme.SANS_BOLD,
-	TextSize = 13,
+	Size = UDim2.new(0, 28, 1, 0),
+	Position = UDim2.new(0, 4, 0, 0),
+	FontFace = Theme.SANS,
+	TextSize = 16,
 	TextColor3 = Theme.TEXT_MED,
-	TextXAlignment = Enum.TextXAlignment.Left,
-	Text = "Claude Code",
+	Text = "☰",
+	AutoButtonColor = false,
 })
+-- No title label here: the widget's own title bar already says "Claude Code",
+-- and a second copy inside it only costs header width.
 local statusLabel = make("TextLabel", {
 	Name = "Status",
 	Parent = headerBar,
@@ -428,6 +433,14 @@ settingsButton.MouseButton1Click:Connect(function()
 	toggleSettings(nil)
 end)
 
+-- =============================================================================
+-- Sessions sidebar
+-- =============================================================================
+local toggleSessions = Sessions.mountSidebar(widget)
+sessionsButton.MouseButton1Click:Connect(function()
+	toggleSessions(nil)
+end)
+
 local function refreshStatus()
 	statusLabel.Text = string.format("%s · %s", Settings.model(), Settings.effortName():lower())
 end
@@ -510,23 +523,22 @@ end)
 -- =============================================================================
 -- Input handling
 -- =============================================================================
-local stopBusySpin: (() -> ())? = nil
+-- The spinner runs at the bottom of the console, not in the input. It used to
+-- take over the placeholder with TextEditable off, which meant a turn you were
+-- waiting on also cost you the ability to type the next one. The box stays
+-- editable and keeps its own text; only SENDING is blocked while busy — see the
+-- Enter handler.
+--
+-- The idle edge is also where the session is written to disk: it fires on a
+-- finished turn, an error and a Stop alike, so a crash only ever costs the turn
+-- that was in flight.
 Agent.Initialize(term, function(busy: boolean)
-	inputBox.TextEditable = not busy
-	if stopBusySpin then
-		stopBusySpin()
-		stopBusySpin = nil
-	end
-	if busy then
-		stopBusySpin = Console.spin(function(frame: string)
-			inputBox.PlaceholderText = frame .. " Working…  (Stop to cancel)"
-		end)
-	else
-		inputBox.PlaceholderText = "Message Claude…  ( / for commands · shift+enter for a new line )"
-	end
-	inputBox.TextColor3 = busy and Theme.TEXT_LO or Theme.TEXT_HI
+	Console.setWorking(busy)
 	stopButton.Visible = busy
-	if not busy then refreshStatus() end
+	if not busy then
+		refreshStatus()
+		Sessions.save()
+	end
 end)
 Commands.Initialize(term, toggleSettings)
 
@@ -575,6 +587,18 @@ inputBox:GetPropertyChangedSignal("Text"):Connect(function()
 	local without = atCaret
 		and (text:sub(1, caret - 2) .. text:sub(caret))
 		or text:sub(1, -2)
+
+	-- Busy: the draft stays put and nothing is sent. Only the newline goes, so
+	-- holding Enter while waiting doesn't pad the message with blank lines.
+	-- Assigning .Text re-enters this handler, which is harmless — the text shrank,
+	-- so `grew` is false and it returns after resyncing previousText.
+	if Agent.isBusy() then
+		previousText = without
+		inputBox.Text = without
+		inputBox.CursorPosition = if atCaret then caret - 1 else #without + 1
+		return
+	end
+
 	previousText = ""
 	submit(without)
 end)
@@ -619,6 +643,11 @@ task.spawn(function()
 	end
 	Console.appendLine("CWD: " .. term:pwd(), "info")
 
+	-- Straight back into the last conversation for this place, which is the whole
+	-- point of saving them: a Studio crash should cost nothing but the turn that
+	-- was running. Silent when there is nothing to restore.
+	Sessions.restoreLast()
+
 	-- Warm the API dump so no `cat` pays the fetch. This yields, which is exactly
 	-- why it can't happen lazily: the first cat runs inside a stream callback,
 	-- and yielding there would stall SSE parsing mid-buffer.
@@ -635,6 +664,10 @@ task.spawn(function()
 	local agentOk, agentErr = Agent.selfTest()
 	if not agentOk then
 		warn("[Claude Code] Context trimming self-test FAILED: " .. tostring(agentErr))
+	end
+	local sessionsOk, sessionsErr = Sessions.selfTest()
+	if not sessionsOk then
+		warn("[Claude Code] Session storage self-test FAILED: " .. tostring(sessionsErr))
 	end
 end)
 
