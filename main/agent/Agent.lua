@@ -249,6 +249,10 @@ end
 -- copying it, so later turns append to the same list the caller holds.
 function Agent.restore(messages: { any })
 	conversation = messages
+	-- This prefix was last written by whatever session saved it, so nothing here
+	-- is cached under the current one. Clearing the stamp says so, which makes
+	-- the first turn after a restore the free one to clear on.
+	lastRequestAt = nil
 end
 
 function Agent.usage(): { input: number, output: number }
@@ -305,27 +309,54 @@ end
 --   since it persists the cleared output and can restore it. Ours is gone, so
 --   the stub has to earn its length by naming the recovery.
 --
---   Run it rarely. Mutating a message invalidates the cache from that index
---   onward, so every pass costs one full re-write of the prefix. Claude Code
---   only fires when it would save at least 20k tokens; these are the same two
---   thresholds at roughly 4 characters per token.
--- ponytail: tool results only, and no thrash guard. Two ceilings follow from
--- that. A session that grows on assistant text rather than tool output — or one
--- with five results and nothing older — is still unbounded, because there is
--- nothing here for this to clear. And a heavy session can re-cross the trigger
--- every few turns, paying a prefix re-write each time; Claude Code carries an
--- explicit circuit breaker for exactly that ("Autocompact is thrashing … 3
--- times in a row"). Upgrade path for both is summarising compaction, which
--- replaces spans of history with a paragraph instead of only blanking results.
---
--- The trigger is also on the eager side: 200k characters is ~50k tokens, about
--- a quarter of the window, so this starts paying re-writes well before the
--- session is in any danger. Raise it if the per-turn `N new to cache` figure
--- looks worse than the read it saves.
+--   Run it only when the prefix is being re-written anyway. Mutating a message
+--   invalidates the cache from that index onward, and old results sit near the
+--   FRONT of the history, so a pass re-writes almost the entire prefix at the 1h
+--   write rate. Size it: at 50k tokens of history, clearing 20k costs 2.0x30k
+--   now against 0.1x50k for the read it replaced, and returns 0.1x20k per later
+--   turn — about 28 turns to break even, on a session that will re-cross the
+--   trigger long before that. The saving scales with what is cleared; the cost
+--   scales with the whole prefix, so no saving threshold can make a warm-cache
+--   pass pay for itself. Hence cacheIsCold() below.
+-- ponytail: tool results only. A session that grows on assistant text rather
+-- than tool output — or one with five results and nothing older — is still
+-- unbounded, because there is nothing here for this to clear. Upgrade path is
+-- summarising compaction, which replaces spans of history with a paragraph
+-- instead of only blanking results.
 local KEEP_RECENT = 5
 local CLEARED = "[old tool result cleared — re-run the command if needed]"
-local TRIGGER_CHARS = 200000    -- ~50k tokens of history before this is worth doing at all
-local MIN_SAVING_CHARS = 80000  -- ~20k tokens; under this the cache re-write costs more than it saves
+local TRIGGER_CHARS = 200000    -- ~50k tokens of history before this is worth looking at
+local MIN_SAVING_CHARS = 80000  -- ~20k tokens; below this even a paid-for re-write is not worth it
+local URGENT_CHARS = 600000     -- ~150k tokens; past here the window, not the cache, is the risk
+local COLD_AFTER = 60 * 60      -- seconds; the full 1h TTL withMessageCache asks for, not a hair under
+
+-- os.time() of the last request. nil means none has gone out, so there is no
+-- cached prefix to protect — a restored session starts here too, since its
+-- prefix was last written by whichever session saved it.
+local lastRequestAt: number? = nil
+
+-- Past COLD_AFTER the 1h TTL has expired, the whole prefix is re-written on the
+-- next request whatever we do, and clearing first only shrinks what gets
+-- re-written — so the pass is free. This is Claude Code's time-based
+-- microcompact trigger (evaluateTimeBasedTrigger); it is the one part of that
+-- mechanism a plugin can have, since the TTL we asked for is knowable
+-- client-side while their other two free paths are not (cache_edits needs a
+-- server-side context_management API, autocompact needs somewhere to spill).
+--
+-- The full hour, not a hair under. Their comment gives the rule: 60 minutes is
+-- "the safe choice: the server's 1h cache TTL is guaranteed expired for all
+-- users, so we never force a miss that wouldn't have happened." Anything short
+-- of the TTL can still land on a live cache, which is the exact miss this gate
+-- exists to avoid — erring early here does the damage it is meant to prevent,
+-- while erring late costs one turn of carrying results that were free to carry.
+--
+-- Wall clock rather than a monotonic one, because the gap being measured is the
+-- user leaving the widget docked, not CPU time. A clock stepped backwards reads
+-- as warm and skips a pass; forwards, it buys one unnecessary re-write. Neither
+-- is worth guarding.
+local function cacheIsCold(): boolean
+	return lastRequestAt == nil or os.time() - lastRequestAt >= COLD_AFTER
+end
 
 -- Deliberately an estimate, not a token count: it only decides whether to look
 -- closer. tool_use inputs are tables and go uncounted, which biases it low —
@@ -351,7 +382,18 @@ end
 -- Returns the number of characters dropped; 0 means nothing was touched and the
 -- cache is intact.
 local function clearOldToolResults(messages: { any }): number
-	if historyChars(messages) < TRIGGER_CHARS then return 0 end
+	local chars = historyChars(messages)
+	if chars < TRIGGER_CHARS then return 0 end
+
+	-- Cheap enough to re-check every turn, and it has to be: the same history
+	-- that is not worth clearing during an active sweep becomes worth clearing
+	-- the moment the user walks away from it.
+	local cold = cacheIsCold()
+	-- Warm and merely large: leave it. The one exception is a history close
+	-- enough to the window that the next few turns could fail outright — there
+	-- the re-write is the cheaper of two bad options, because nothing else here
+	-- reclaims anything.
+	if not cold and chars < URGENT_CHARS then return 0 end
 
 	local results: { any } = {}
 	for _, message in ipairs(messages) do
@@ -384,7 +426,11 @@ local function clearOldToolResults(messages: { any }): number
 			saving += #results[i].content - #CLEARED
 		end
 	end
-	if saving < MIN_SAVING_CHARS then return 0 end
+	-- A free pass only has to beat zero, which is Claude Code's guard in this
+	-- exact position (`if (tokensSaved === 0) return null` — there is no saving
+	-- floor upstream). MIN_SAVING_CHARS applies to the urgent path only, where
+	-- the re-write is actually being paid for.
+	if saving < (if cold then 1 else MIN_SAVING_CHARS) then return 0 end
 
 	for i = 1, cutoff do
 		if worthClearing(results[i]) then
@@ -467,6 +513,12 @@ local function runTurn(turn: number)
 		Console.appendLine("Stopped.", "info")
 		setBusy(false)
 	end
+
+	-- Stamped as the request goes out, which is close enough: the server writes
+	-- the cache when it serves this, and the difference is seconds against
+	-- COLD_AFTER. Every request in the session comes through here, tool-loop
+	-- recursions included, so a long sweep keeps the cache correctly marked warm.
+	lastRequestAt = os.time()
 
 	stream = Claude.streamMessage({
 		model = Settings.model(),
@@ -885,20 +937,37 @@ function Agent.selfTest(): (boolean, string?)
 			#lopsided[4].content)
 	end
 
-	-- Clearing: 12 paired calls, well over the trigger.
-	local big = string.rep("x", 20000)
-	local messages: { any } = {}
-	for i = 1, 12 do
-		table.insert(messages, { role = "assistant", content = {
-			{ type = "tool_use", id = "t" .. i, name = "bash", input = { command = "ls" } },
-		} })
-		table.insert(messages, { role = "user", content = {
-			{ type = "tool_result", tool_use_id = "t" .. i, content = big },
-		} })
+	-- Clearing. Sizes derive from the thresholds for the same reason the
+	-- truncation fixtures do, and here it matters twice: the warm case has to sit
+	-- BETWEEN TRIGGER_CHARS and URGENT_CHARS, so a hand-typed size stops
+	-- exercising the gate the moment either constant moves.
+	local function pairedHistory(count: number, size: number): { any }
+		local body = string.rep("x", size)
+		local messages: { any } = {}
+		for i = 1, count do
+			table.insert(messages, { role = "assistant", content = {
+				{ type = "tool_use", id = "t" .. i, name = "bash", input = { command = "ls" } },
+			} })
+			table.insert(messages, { role = "user", content = {
+				{ type = "tool_result", tool_use_id = "t" .. i, content = body },
+			} })
+		end
+		return messages
 	end
 
+	-- Driven directly, because which side of cacheIsCold() a history falls on is
+	-- the whole decision the pass makes.
+	local savedStamp = lastRequestAt
+
+	-- Cold: nothing has been sent, so no prefix is cached and the pass is free.
+	-- 12 paired calls, over the trigger and under the urgent line.
+	local coldSize = TRIGGER_CHARS // 10
+	local big = string.rep("x", coldSize)
+	lastRequestAt = nil
+	local messages = pairedHistory(12, coldSize)
+
 	if clearOldToolResults(messages) <= 0 then
-		return false, "clearOldToolResults did nothing to an oversized history"
+		return false, "clearOldToolResults did nothing to an oversized history on a cold cache"
 	end
 
 	local seen: { any } = {}
@@ -935,6 +1004,21 @@ function Agent.selfTest(): (boolean, string?)
 		return false, "clearOldToolResults acted on a small history"
 	end
 
+	-- Warm: the same history moments after a request. Clearing now would re-write
+	-- the entire cached prefix to save a fraction of it, which is the failure this
+	-- gate exists to prevent — and it is silent, so only a test catches it.
+	lastRequestAt = os.time()
+	if clearOldToolResults(pairedHistory(12, coldSize)) ~= 0 then
+		return false, "clearOldToolResults re-wrote a warm cached prefix to save a fraction of it"
+	end
+
+	-- Warm, but past URGENT_CHARS: the window is now the risk rather than the
+	-- cache, and nothing else here reclaims anything, so it has to clear anyway.
+	if clearOldToolResults(pairedHistory(12, URGENT_CHARS // 10)) <= 0 then
+		return false, "clearOldToolResults left a history near the context window uncleared"
+	end
+
+	lastRequestAt = savedStamp
 	return true
 end
 

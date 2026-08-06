@@ -6,23 +6,23 @@ References are by symbol, not line number — line numbers rot on the first edit
 and several in an earlier draft already pointed at the wrong code.
 
 Comparisons to Claude Code are read from its TypeScript source, exposed by a
-source map shipped to npm on 2026-03-31 and archived at
-`github.com/tanbiralam/claude-code`. An earlier pass read the shipped binary
-(v2.1.221) instead, which gets constants right and the mangled control flow
-around them wrong: **three claims here were wrong until the source settled
-them** (§1, §7, and the no-such-floor note below). Two limits remain — the
-archive is one snapshot, not the binary's version, and most of these constants
-are GrowthBook-gated or environment-overridable, so they are built-in defaults,
-several of which ship switched off.
+source map shipped to npm and archived at
+`github.com/davccavalcante/claude-code-leaked` (the v2.1.88 sourcemap CLAUDE.md
+points at). An earlier pass read the shipped binary instead, which gets
+constants right and the mangled control flow around them wrong: **three claims
+here were wrong until the source settled them** (§1, §7, and the no-such-floor
+note below). Two limits remain — the archive is one snapshot, and most of these
+constants are GrowthBook-gated or environment-overridable, so they are built-in
+defaults, several of which ship switched off.
 
 **Do not read this as a list of things Claude Code does.** Most of it is this
 repo's own design:
 
 | | |
 |---|---|
-| Borrowed, verified in source | keeping the last 5 tool results and stubbing older ones (§7); head-only truncation with a marker; the read-versus-shell budget split and the 4-chars-per-token estimator behind §6; a per-*message* budget on top of the per-result one (§6); the same `cache_control`, 1 h TTL included, on the message breakpoint as on system and tools (§1); rewriting schema-validation failures into instructions (§4) |
-| This repo's | the three-breakpoint scheme and the strip-then-retag (§1); tool ordering as a cache concern (§2); minimal tool definitions (§3); putting the manual in the error rather than the prompt (§4), which is more aggressive than anything Claude Code does; parallel tool use (§8); per-file rather than per-line listings (§9); the usage line (§10) |
-| Derived here, not quoted | the 100 000-char cap (25 000 tokens × 4; their read byte cap is `MAX_OUTPUT_SIZE`, 256 KB); the 200 000 / 80 000 clearing thresholds (§7); `safeCut`'s UTF-8 handling, which has no counterpart because JS string slicing cannot produce invalid UTF-8 |
+| Borrowed, verified in source | keeping the last 5 tool results and stubbing older ones, and clearing them only when the cache is already cold (§7); head-only truncation with a marker; preferring the last newline, with the same half-the-budget guard (§6); the read-versus-shell budget split and the 4-chars-per-token estimator behind §6; a per-*message* budget on top of the per-result one (§6); the same `cache_control`, 1 h TTL included, on the message breakpoint as on system and tools, and rebuilding rather than mutating so exactly one lands (§1); rewriting schema-validation failures into instructions (§4) |
+| This repo's | the three-breakpoint scheme (§1); tool ordering as a cache concern (§2); minimal tool definitions (§3); putting the manual in the error rather than the prompt (§4), which is more aggressive than anything Claude Code does; parallel tool use (§8); per-file rather than per-line listings (§9); the usage line (§10) |
+| Derived here, not quoted | the 100 000-char cap (25 000 tokens × 4; their read byte cap is `MAX_OUTPUT_SIZE`, 256 KB, and their system-wide default is `DEFAULT_MAX_RESULT_SIZE_CHARS`, 50 000 — looser here because we truncate where they spill to disk); `URGENT_CHARS` (§7); `safeCut`'s continuation-byte walk, which has no counterpart because JS string slicing cannot produce invalid UTF-8 |
 
 One correction worth keeping visible, because the number is still out there:
 **there is no floor on how little a clearing pass may save.** Claude Code's
@@ -44,7 +44,7 @@ there is no cache-related beta string anywhere in Claude Code's source, which is
 also what makes the TTL real rather than a field the API quietly ignores.
 
 The conversation breakpoint sat on 5 min until the source settled it; the
-argument is in `applyMessageCache` and comes down to the cache being a
+argument is in `withMessageCache` and comes down to the cache being a
 longest-prefix match, so a warm turn writes only its delta while an expiry
 rewrites everything. Claude Code agrees — `userMessageToMessageParam` and
 `assistantMessageToMessageParam` tag the message breakpoint with the *same*
@@ -58,12 +58,17 @@ mid-session busts the server cache, which their comment prices at ~20 k tokens.
 (Those multipliers are Anthropic's published cache pricing; the source states
 neither.)
 
-**The breakpoint is stripped before it is re-applied** (`applyMessageCache`).
-The conversation is the same table across turns and only ever appended to, so
-tagging the last block without clearing the previous tag leaves turn 1's
-breakpoint in place while turn 2 adds another. By turn 3 the request is over the
-four-block limit and every call fails with *"A maximum of 4 blocks with
-cache_control may be provided."*
+**The tagged message is copied, not mutated** (`withMessageCache`). The
+conversation is the same table across turns and only ever appended to, so
+tagging the last block in place leaves turn 1's breakpoint sitting there while
+turn 2 adds another; by turn 3 the request is over the four-block limit and
+every call fails with *"A maximum of 4 blocks with cache_control may be
+provided."* Copying the last message, its block list and its last block — three
+small tables, however long the conversation — cannot accumulate a tag. Claude
+Code solves it the same way and for the same reason: `addCacheBreakpoints` maps
+the whole history into fresh `MessageParam`s each request with
+`addCache = index === markerIndex`, and its comment states the invariant
+outright — *"Exactly one message-level cache_control marker per request."*
 
 ## 2. Tool order is load-bearing
 
@@ -149,9 +154,14 @@ carrying two truncation notes.
 **The cut is UTF-8 safe.** A fixed byte offset can land mid-codepoint and
 `JSONEncode` rejects invalid UTF-8, so a careless truncation kills the request
 outright. `safeCut` prefers the last newline (always a codepoint boundary, and a
-tidier stop) and otherwise steps back off continuation bytes. No counterpart
-exists upstream: Claude Code slices UTF-16 JS strings, which cannot produce
-invalid UTF-8, so its bash truncation is a bare `slice(0, max)`.
+tidier stop) and otherwise steps back off continuation bytes.
+
+Only the second half is ours. The newline preference has an exact counterpart in
+`generatePreview` (`toolResultStorage.ts`), down to the guard that stops a short
+first line from throwing away the budget — `lastNewline > maxBytes * 0.5` there
+against `afterNewline > limit / 2` here. The continuation-byte walk has none,
+because JS string slicing cannot produce invalid UTF-8; upstream bash truncation
+is a bare `slice(0, max)`.
 
 **The Console keeps everything.** `call.setResult()` has already been handed the
 full string by the time this runs, so truncation is invisible to the user and
@@ -169,29 +179,65 @@ and pay for it twice.
 ## 7. Old tool results are cleared in place
 
 `clearOldToolResults`, run at the top of every turn. Keeps the last 5 tool
-results, replaces the content of older ones with a stub, and only acts once the
-history passes 200 000 chars *and* the pass would save at least 80 000. Both
-thresholds exist because mutating a message invalidates the cache from that
-index onward, so every pass costs one full prefix re-write.
+results and replaces the content of older ones with a stub.
 
 Keeping 5 is Claude Code's shape (`keepRecent: 5`, floored at 1 because
-`slice(-0)` returns the whole array). The trigger is not, and the binary reading
-had it wrong. Theirs is **time-based**: it fires when the gap since the last
-assistant message exceeds 60 minutes, on the reasoning that the server's 1 h
-cache TTL is then guaranteed expired, so the prefix is going to be rewritten
-anyway and clearing first shrinks what gets rewritten. Context pressure is a
-different mechanism (autocompact), and this pass ships `enabled: false`.
+`slice(-0)` returns the whole array). So, now, is the trigger — **it fires on
+cache coldness, not on size.**
 
-Two things it does that this plugin does not. It only clears results from a
-fixed set of tools — Read, shell, Grep, Glob, WebFetch, WebSearch, Edit, Write —
-so a tool whose output is small or load-bearing is never stubbed. And where the
-cache is *warm* it does not mutate messages at all: it sends a `cache_edits`
-block that deletes tool results server-side, leaving the cached prefix intact,
-and reads back `cache_deleted_input_tokens` to find out what that saved. That is
-the escape from the tradeoff this section is built around, and a plugin has no
-such API — though the time-based trigger itself is portable, since a TTL is
-knowable client-side and clearing *before* the first request after a long pause
-is strictly better than clearing after it.
+The earlier trigger was two size thresholds (200 000 chars of history, 80 000
+saved) and it was wrong in a way no threshold could fix. Mutating a message
+invalidates the cache from that index onward, and cleared results are the *old*
+ones, sitting near the front — so a pass re-writes essentially the whole prefix
+at the 1 h write rate. Priced at 50 000 tokens of history with 20 000 cleared:
+
+| | |
+|---|---|
+| pass turn | `2.0 × 30 000` written = 60 000, against `0.1 × 50 000` = 5 000 for the cached read it replaced |
+| later turns | `0.1 × 20 000` = 2 000 saved each |
+| break-even | ~28 turns, on a session that re-crosses the trigger long before that |
+
+The saving scales with what is cleared. The cost scales with the whole prefix.
+No saving floor closes that gap, which is why this was a net loss whenever it
+fired — and it fired at ~25 % of the context window, with a warm cache, by
+choice.
+
+Claude Code never pays a voluntary re-write. All three of its paths are free:
+**time-based microcompact** fires only when the gap since the last assistant
+message exceeds 60 minutes, at which point the 1 h TTL is guaranteed expired and
+the prefix is being re-written regardless (`evaluateTimeBasedTrigger`; ships
+`enabled: false`); **cached microcompact** sends a `cache_edits` block that
+deletes results server-side and leaves the cached prefix intact, reading back
+`cache_deleted_input_tokens` to find out what that saved; **autocompact** fires
+near the window limit, where the alternative is a failed request rather than a
+cost.
+
+`cacheIsCold()` is the one of those three a plugin can have, because the TTL we
+asked for is knowable client-side: past 60 minutes since the last request the
+prefix is gone anyway, so clearing first is free. `TRIGGER_CHARS` survives as a
+cheap "is there anything here worth walking" pre-filter, and the saving floor
+drops to 1 on the cold path — the same guard Claude Code has in that position
+(`if (tokensSaved === 0) return null`; there is no saving floor upstream, and
+the `20000` an earlier reading attached to it is `GrepTool.maxResultSizeChars`).
+
+`URGENT_CHARS` (600 000, ~150 000 tokens) is the case they do not have to
+handle. With nowhere to spill and no summarising compaction, a history that
+close to the window has to shrink even at full price, because the alternative is
+the session ending. `MIN_SAVING_CHARS` applies there and only there.
+
+The other half of the fix is knowing when the last request went out.
+`lastRequestAt` is stamped in `runTurn` beside the `streamMessage` call — every
+request comes through it, tool-loop recursions included, so a long sweep keeps
+the cache correctly marked warm — and `Agent.restore` clears it, since a
+restored session's prefix was last written by whichever session saved it.
+
+One thing it does that this plugin does not: it only clears results from a fixed
+set of tools (`COMPACTABLE_TOOLS` — Read, shell, Grep, Glob, WebFetch,
+WebSearch, Edit, Write), so a tool whose output is small or load-bearing is
+never stubbed. Here every `tool_result` is fair game, which is defensible while
+the tools are what they are — `bash`, `edit`, `write` and `catalog` all map onto
+that list — and stops being defensible the moment a tool is added whose result
+the model cannot re-derive by re-running it.
 
 Three rules it must not break, all of them the difference between saving tokens
 and killing the session:
@@ -259,18 +305,20 @@ Marked with `ponytail:` in the source, per this repo's convention.
 | ceiling | where |
 |---|---|
 | Clearing only touches tool results — a session that grows on assistant text, or one with ≤5 results, is still unbounded | `Agent.lua`, above `KEEP_RECENT` |
-| No anti-thrash breaker; a heavy session can re-cross the trigger every few turns, paying a prefix re-write each time | same |
-| Trigger is eager — 200 000 chars is ~25 % of the window, so re-writes start well before the session is at risk | same |
+| A session held under 60 min between turns never clears until it reaches `URGENT_CHARS`, where the re-write is paid at full price | same |
 | Cleared output is unrecoverable; a plugin has nowhere to spill it | same |
 | `tree` and `du` are still bounded only by the per-result cap | `Agent.lua`, above `MODEL_RESULT_CHARS` |
-| No overage gating or session latch on the 1 h TTL | `Claude.lua`, `applyMessageCache` |
+| No overage gating or session latch on the 1 h TTL | `Claude.lua`, `withMessageCache` |
 | `grep` grouping costs per-line file attribution when piped into another `grep` | `Shell.lua`, end of `HANDLERS.grep` |
 
-Upgrade path for the first three is summarising compaction — replacing spans of
+Upgrade path for the first two is summarising compaction — replacing spans of
 history with a paragraph instead of only blanking results. Claude Code's version
-sizes its threshold off the model's context window rather than a char constant,
-and carries a 3-strike circuit breaker added after sessions were found retrying
-a failing compaction dozens of times.
+sizes its threshold off the model's context window rather than a char constant
+(`getAutoCompactThreshold`, `AUTOCOMPACT_BUFFER_TOKENS = 13_000`) and carries a
+`MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3` circuit breaker — which guards
+against retrying a compaction that keeps *failing*, not against re-triggering
+one that keeps succeeding. Nothing upstream guards the latter; the cold-cache
+gate is what makes it a non-issue here.
 
 ## Not adopted, deliberately
 
@@ -282,9 +330,12 @@ which estimates JSON at 2 chars per token rather than 4 (this plugin reads real
 usage off the response instead of estimating).
 
 Still open: **server-side `context_management`** (`clear_tool_uses_20250919`),
-which would move clearing to the API and stop it invalidating the cached prefix
-— collapsing the first three ceilings above. Untried; needs a live request to
-know whether OAuth accepts the beta.
+which would move clearing to the API and stop it invalidating the cached prefix,
+so it could run on a warm cache and collapse the second ceiling above.
+`apiMicrocompact.ts` is the shape of it — `USER_TYPE === 'ant'` plus
+`USE_API_CLEAR_TOOL_RESULTS`, with `DEFAULT_MAX_INPUT_TOKENS = 180_000` as the
+trigger and `DEFAULT_TARGET_INPUT_TOKENS = 40_000` kept. Untried; needs a live
+request to know whether OAuth accepts the beta.
 
 ## Open decisions
 
@@ -327,10 +378,20 @@ Agent covers the truncation shape, the UTF-8 boundary, the line-boundary cut,
 flood of oversized results must land inside the turn budget with no empty
 block, and a lone large result must not be starved by small siblings), and every
 rule in §7 — pairing preserved, no empty content, recent results untouched,
-idempotent, small history left alone. Shell covers the `ls` cap and its row
-count, `ls -l` emitting no zero counts, and `grep` emitting one header per
-script while `-c` and `-l` still read the ungrouped form.
+idempotent, small history left alone.
 
-Fixture sizes derive from `MODEL_RESULT_CHARS` and `MAX_LIST` rather than being
-written as literals, so raising a cap cannot silently stop the tests exercising
-anything.
+All three sides of the cache gate are covered, because each fails silently: an
+oversized history on a **cold** cache must clear, the same history **warm** must
+not (this is the whole point of the change, and the fixture is sized so the old
+saving floor would have let it through), and a warm history past
+`URGENT_CHARS` must clear anyway. The tests drive `lastRequestAt` directly and
+restore it.
+
+Shell covers the `ls` cap and its row count, `ls -l` emitting no zero counts,
+and `grep` emitting one header per script while `-c` and `-l` still read the
+ungrouped form.
+
+Fixture sizes derive from `MODEL_RESULT_CHARS`, `MAX_LIST`, `TRIGGER_CHARS` and
+`URGENT_CHARS` rather than being written as literals, so moving a threshold
+cannot silently stop the tests exercising anything — and here it matters twice,
+since the warm fixture has to stay *between* two of them.
