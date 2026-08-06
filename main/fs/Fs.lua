@@ -58,6 +58,72 @@ end
 Fs.splitLines = splitLines
 
 -- =============================================================================
+-- Searching a buffer
+-- =============================================================================
+export type GrepHit = { line: number, text: string, match: boolean }
+export type GrepOpts = {
+	usePattern: boolean?,
+	ignoreCase: boolean?,
+	invert: boolean?,
+	before: number?,
+	after: number?,
+	limit: number?,
+}
+
+-- One buffer's worth of grep: which lines matched, plus the -A/-B/-C context
+-- window around them, in line order and deduplicated where windows overlap.
+--
+-- Shared because grep runs over two different things — a script's Source and a
+-- piped stream — and those two paths had already drifted once. A windowing loop
+-- written twice is two places for an off-by-one to live, and an off-by-one here
+-- is a context line reported under the wrong line number.
+--
+-- `limit` caps how many MATCHES get expanded, so a wide `-C 5` cannot smuggle
+-- five times the intended output past the caller's cap. Returns the hits, the
+-- number of matches expanded, and the number refused by the limit.
+function Fs.grepLines(lines: { string }, needle: string, opts: GrepOpts?): ({ GrepHit }, number, number)
+	local o = opts or {}
+	local probe = o.ignoreCase and needle:lower() or needle
+	local before, after = o.before or 0, o.after or 0
+	local limit = o.limit or math.huge
+
+	local matched: { [number]: boolean } = {}
+	local wanted: { [number]: boolean } = {}
+	local taken, skipped = 0, 0
+	for index, line in ipairs(lines) do
+		local subject = o.ignoreCase and line:lower() or line
+		local hit
+		if o.usePattern then
+			hit = subject:find(probe) ~= nil
+		else
+			hit = subject:find(probe, 1, true) ~= nil
+		end
+		if o.invert then
+			hit = not hit
+		end
+		if hit then
+			matched[index] = true
+			if taken >= limit then
+				skipped += 1
+			else
+				taken += 1
+				for i = math.max(1, index - before), math.min(#lines, index + after) do
+					wanted[i] = true
+				end
+			end
+		end
+	end
+
+	local hits: { GrepHit } = {}
+	for index = 1, #lines do
+		if wanted[index] then
+			hits[#hits + 1] = { line = index, text = lines[index], match = matched[index] == true }
+		end
+	end
+	return hits, taken, skipped
+end
+
+-- =============================================================================
 -- Paths
 -- =============================================================================
 local function instancePath(inst: Instance): string

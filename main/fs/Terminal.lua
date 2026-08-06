@@ -126,8 +126,15 @@ function Terminal:ls(path: string?, long: boolean?, filter: ((string) -> boolean
 				-- No column padding and no "0 children". Alignment is for eyes; the
 				-- reader here is a model, and on a 200-part listing the padding
 				-- plus a zero count on every leaf is most of the bytes.
+				--
+				-- Line count for scripts, because "how big is this file" is the
+				-- question `ls -l` is asked and children were the only answer it
+				-- had — which sent people to `stat` one path at a time, or to the
+				-- run tool to count `#Source` themselves.
 				local kids = #child:GetChildren()
-				name = string.format("%s [%s]%s", name, child.ClassName,
+				local source = getSource(child)
+				name = string.format("%s [%s]%s%s", name, child.ClassName,
+					source and string.format("  %d lines", #splitLines(source)) or "",
 					kids > 0 and string.format("  %d children", kids) or "")
 			end
 			table.insert(names, name)
@@ -152,10 +159,13 @@ function Terminal:cat(path: string?): (string?, string?)
 		if #lines <= MAX_CAT_LINES then
 			return source, nil
 		end
+		-- The range form rather than `head | tail`, which needed a subtraction on
+		-- every call — `head -640 | tail -80` for lines 560-640 — and getting it
+		-- wrong returns a plausible block from the wrong part of the file.
 		return string.format("%s\n… TRUNCATED: %d of %d lines shown. Page the rest with " ..
-			"`head -n <end> %s | tail -n <count>`, or grep for what you need.",
+			"`sed -n '%d,%dp' %s`, or grep for what you need.",
 			table.concat(lines, "\n", 1, MAX_CAT_LINES), MAX_CAT_LINES, #lines,
-			instancePath(target)), nil
+			MAX_CAT_LINES + 1, math.min(#lines, MAX_CAT_LINES * 2), instancePath(target)), nil
 	end
 
 	local className = target.ClassName
@@ -266,19 +276,6 @@ function Terminal:tail(path: string?, n: number?): (string?, string?)
 	return table.concat(all, "\n", startIdx, #all), nil
 end
 
--- wc: line count (scripts) or children count (other instances)
-function Terminal:wc(path: string?): (string?, string?)
-	local target, err = self:resolve(path)
-	if not target then
-		return nil, err
-	end
-	local source = getSource(target)
-	if source then
-		return string.format("%d lines", #splitLines(source)), nil
-	end
-	return string.format("%d children", #target:GetChildren()), nil
-end
-
 -- find: recursively match instance names, optionally filtered by class and depth.
 function Terminal:find(name: string?, path: string?, className: string?, maxDepth: number?): (string?, string?)
 	if not name or name == "" then
@@ -344,7 +341,16 @@ end
 -- for code search, where `game.Workspace` and `foo(bar)` are full of characters
 -- a regex would eat. `usePattern` switches to Lua patterns, which is the dialect
 -- actually available here; there is no POSIX regex engine to fall back to.
-function Terminal:grep(pattern: string?, path: string?, usePattern: boolean?): (string?, string?)
+--
+-- Returns STRUCTURED results, not text. It used to return `path:N: text` lines
+-- joined into one string, which the shell then re-parsed three separate ways —
+-- splitting on "\n" to count for -c, regexing the path back out for -l, and
+-- splitting on ":" again to group by file. Every one of those was undoing work
+-- this function had just done, and none of them could carry a context line.
+-- Formatting belongs to the caller; finding belongs here.
+export type GrepMatch = { path: string, line: number, text: string, match: boolean }
+
+function Terminal:grep(pattern: string?, path: string?, opts: Fs.GrepOpts?): ({ GrepMatch }?, string?)
 	if not pattern or pattern == "" then
 		return nil, "grep requires a pattern"
 	end
@@ -352,18 +358,20 @@ function Terminal:grep(pattern: string?, path: string?, usePattern: boolean?): (
 	if not target then
 		return nil, err
 	end
+	local o: Fs.GrepOpts = opts or {}
 
-	local needle = pattern:lower()
-	if usePattern then
+	if o.usePattern then
 		-- Validate once. A malformed pattern throws from find(), and checking
 		-- per line would mean a pcall for every line of every script in scope.
-		local ok = pcall(string.find, "", needle)
+		local ok = pcall(string.find, "", o.ignoreCase and pattern:lower() or pattern)
 		if not ok then
 			return nil, "not a valid Lua pattern: " .. pattern
 		end
 	end
 
-	local results = {}
+	local results: { GrepMatch } = {}
+	local budget = MAX_RESULTS
+	local skipped = 0
 	-- Include the target: `grep foo Main.luau` means search Main, and walking
 	-- only descendants made that silently return "no matches". GetDescendants
 	-- hands back a fresh table, so prepending to it is safe.
@@ -372,24 +380,36 @@ function Terminal:grep(pattern: string?, path: string?, usePattern: boolean?): (
 	for _, inst in ipairs(scope) do
 		local source = getSource(inst)
 		if source then
-			for lineNum, line in ipairs(splitLines(source)) do
-				local lowered = line:lower()
-				local hit
-				if usePattern then
-					hit = lowered:find(needle) ~= nil
-				else
-					hit = lowered:find(needle, 1, true) ~= nil
-				end
-				if hit then
-					table.insert(results, string.format("%s:%d: %s", instancePath(inst), lineNum, line))
+			-- The cap counts MATCHES, not emitted lines, and is applied before the
+			-- context window opens — otherwise `-C 5` would quietly return six
+			-- times the budget and evict the context that made the search worth
+			-- running, which is the one thing MAX_RESULTS exists to prevent.
+			local hits, taken, refused = Fs.grepLines(splitLines(source), pattern, {
+				usePattern = o.usePattern,
+				ignoreCase = o.ignoreCase,
+				before = o.before,
+				after = o.after,
+				limit = budget,
+			})
+			budget -= taken
+			skipped += refused
+			if #hits > 0 then
+				local instPath = instancePath(inst)
+				for _, hit in ipairs(hits) do
+					results[#results + 1] = {
+						path = instPath, line = hit.line, text = hit.text, match = hit.match,
+					}
 				end
 			end
 		end
 	end
-	if #results == 0 then
-		return "no matches", nil
+	-- The cap trailer rides on the list rather than coming back as a third return
+	-- value, which is the one a caller drops.
+	local tagged: any = results
+	if skipped > 0 then
+		tagged.skipped = skipped
 	end
-	return capped(results, "matching lines"), nil
+	return results, nil
 end
 
 function Terminal:tree(path: string?, depth: number?): (string?, string?)
