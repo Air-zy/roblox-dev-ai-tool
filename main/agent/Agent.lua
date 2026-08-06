@@ -470,12 +470,19 @@ local function runTurn(turn: number)
 	-- below its block. Deferred rather than done on the spot, so consecutive
 	-- searches do not leave a row of empty bubbles between them.
 	local splitPending = false
+	-- Adaptive thinking streams a thinking block whether or not there is a
+	-- summary to go with it: a short thought summarises to nothing, and the
+	-- deltas arrive as empty strings. The drawer was created on the FIRST delta
+	-- whatever it held, so those turns put up a "▶ thinking" row that opened on
+	-- an empty body. Hold off until a delta carries an actual character.
+	local thinkingSeen = false
 	local function splitBubble()
 		if not splitPending then return end
 		splitPending = false
 		bubble.finishThinking()
 		bubble = Console.createBubble()
 		bubbleText = ""
+		thinkingSeen = false
 	end
 
 	local function finish()
@@ -530,6 +537,12 @@ local function runTurn(turn: number)
 		tools = buildTools(),
 	}, {
 		onThinking = function(delta: string)
+			if not thinkingSeen then
+				-- Leading blank deltas are dropped with the empty ones; a summary
+				-- that starts on a newline reads the same without it.
+				if not delta:match("%S") then return end
+				thinkingSeen = true
+			end
 			splitBubble()
 			-- The bubble creates its thinking block on demand, above the answer.
 			bubble.thinking().append(delta)
@@ -629,7 +642,28 @@ local function runTurn(turn: number)
 			local assistantContent: { any } = {}
 			local toolUses: { any } = {}
 			for _, block in ipairs(result.contentBlocks or {}) do
-				if block.type == "text" and block.text ~= "" then
+				if block.type == "thinking" and block.signature then
+					-- REQUIRED inside a tool-use turn, not an optimisation: the model
+					-- pauses mid-response to call the tool and resumes the same
+					-- response when the result comes back, so the reasoning that
+					-- chose the call has to still be there. Anthropic's rule is that
+					-- the run of thinking blocks in the latest assistant message must
+					-- match what it generated — they cannot be reordered, edited, or
+					-- partly dropped. Replayed verbatim: under display "summarized"
+					-- the text is a summary, and the signature is what the server
+					-- decrypts to recover the real thinking.
+					table.insert(assistantContent, {
+						type = "thinking",
+						thinking = block.thinking,
+						signature = block.signature,
+					})
+				elseif block.type == "redacted_thinking" and block.raw then
+					-- Safety-redacted reasoning: no deltas and no readable text, so
+					-- the whole block lands at content_block_start and the raw copy IS
+					-- the block. Matching only on "thinking" would drop these silently
+					-- and break the same pairing.
+					table.insert(assistantContent, block.raw)
+				elseif block.type == "text" and block.text ~= "" then
 					table.insert(assistantContent, {
 						type = "text",
 						text = block.text,

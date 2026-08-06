@@ -414,6 +414,14 @@ local function streamMessage(args: {
 					elseif delta.type == "thinking_delta" then
 						block.thinking = block.thinking .. delta.thinking
 						if callbacks.onThinking then callbacks.onThinking(delta.thinking) end
+					elseif delta.type == "signature_delta" then
+						-- Exactly one per thinking block, immediately before its
+						-- content_block_stop — it arrives under display "omitted" too,
+						-- where no thinking_delta ever does. The signature is what the
+						-- server decrypts to rebuild the real reasoning when the block
+						-- is replayed, so a thinking block without it cannot be sent
+						-- back: Anthropic rejects a missing or altered signature.
+						block.signature = delta.signature
 					elseif delta.type == "input_json_delta" then
 						block.input = block.input .. delta.partial_json
 					elseif delta.type == "citations_delta" then

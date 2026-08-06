@@ -199,8 +199,10 @@ end
 -- =============================================================================
 -- Replay
 -- =============================================================================
--- Thinking blocks are not in the history (Agent never stores them), so a replay
--- shows prose and tool calls only.
+-- Thinking blocks ARE in the history now — the tool-use protocol requires them —
+-- but nothing here matches their type, so a replay still shows prose and tool
+-- calls only. Rendering a restored session's reasoning would mean a drawer per
+-- block; the live view is where reasoning is worth reading.
 -- ponytail: renders the whole session in one go, so a very long one is a visible
 -- hitch on open. Paginate from the tail if that ever bites.
 local function replay(conversation: { any })
