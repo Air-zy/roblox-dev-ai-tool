@@ -15,7 +15,15 @@ local Settings = require(ui:WaitForChild("Settings"))
 
 local Agent = {}
 
-local MAX_TURNS = 40  -- hard stop on the tool-use loop
+-- There is deliberately NO cap on the tool-use loop, which is what Claude Code
+-- does: `maxTurns` (src/query.ts) is optional and left unset in its interactive
+-- path, enforced only for `--max-turns`, the SDK and subagents. A turn count of
+-- 40 was stopping real work mid-refactor, and the thing it was guarding against
+-- is already covered — the loop only continues while the model asks for more
+-- tools, Stop and Escape both cancel, and clearOldToolResults keeps the history
+-- from growing without bound. runTurn recurses through task.spawn, so depth
+-- costs no stack either. `turn` survives as the depth, which the rollback paths
+-- below still need to tell the first turn from the rest.
 
 -- Block types Anthropic executes and returns complete; replayed as-is.
 local SERVER_RESULT_BLOCKS: { [string]: boolean } = {
@@ -35,7 +43,15 @@ local SERVER_RESULT_BLOCKS: { [string]: boolean } = {
 -- sends, so multiedit is where it shows up.
 --
 -- Roblox has no object sentinel, so the fallback carries the raw fragment
--- instead of nothing: an object either way, and it shows what was cut off.
+-- instead of nothing: an object either way, and it shows what was cut off. This
+-- is what Anthropic's own guidance says to do — "if you need to pass invalid
+-- JSON back to the model in an error response block, you may wrap it in a JSON
+-- object … with a reasonable key" — so a truncated call costs one corrective
+-- turn and nothing else. The other half of the recovery is the stop_reason in
+-- the error text below, which is what tells the model to send LESS rather than
+-- resend the same payload. Nothing further is worth building here; the lever
+-- that actually reduces how often it happens is max_tokens, which Settings ties
+-- to the effort level.
 -- Capped because a truncated multiedit can be thousands of characters and this
 -- stays in the history for the rest of the session.
 local function toolInput(block: any): any
@@ -204,8 +220,9 @@ local stopCurrent: (() -> ())? = nil
 -- Code's /usage. Plan limits are a separate thing and come from the usage
 -- endpoint (OAuth.fetchUsage); this is just what this session has spent.
 local totals = { input = 0, output = 0 }
--- server_tool_use id -> the console block waiting for its result. Keyed by id
--- rather than "the last one", because a turn can run several searches.
+-- tool_use / server_tool_use id -> the console block waiting for its result.
+-- Keyed by id rather than "the last one", because a turn can run several calls
+-- and parallel tool use means their blocks are all open at once.
 --
 -- Deliberately NOT per-turn. On stop_reason "pause_turn" Anthropic interrupts a
 -- long-running search, so the server_tool_use lands in one stream and its
@@ -213,7 +230,7 @@ local totals = { input = 0, output = 0 }
 -- table lost the pairing across that boundary: the first block spun forever and
 -- the result arrived as a second, argument-less [web_search] below it. Parallel
 -- searches hit it most, being the slowest turns and the likeliest to be paused.
-local serverCalls: { [string]: any } = {}
+local pendingCalls: { [string]: any } = {}
 
 function Agent.Initialize(terminal: any, busyCallback: ((boolean) -> ())?)
 	term = terminal
@@ -249,9 +266,9 @@ local function setBusy(value: boolean)
 		-- The request is over, so anything still waiting on a result is never
 		-- getting one — a cancel or an error mid-search. Stop the spinners rather
 		-- than leave them turning until the widget closes.
-		for id, call in pairs(serverCalls) do
+		for id, call in pairs(pendingCalls) do
 			call.finish()
-			serverCalls[id] = nil
+			pendingCalls[id] = nil
 		end
 	end
 	if onBusyChanged then onBusyChanged(value) end
@@ -383,15 +400,9 @@ end
 -- Streams a response, renders it, runs any tools it asked for, and recurses if
 -- Claude wants another round. `turn` is the recursion depth.
 local function runTurn(turn: number)
-	if turn > MAX_TURNS then
-		Console.appendLine("Tool loop exceeded " .. MAX_TURNS .. " turns — stopping.", "error")
-		setBusy(false)
-		return
-	end
-
 	-- Before the request rather than after it: the whole point is to shrink what
-	-- this turn sends. Runs on every turn including mid-tool-loop, because a
-	-- single 40-turn sweep is exactly the thing that can fill the window without
+	-- this turn sends. Runs on every turn including mid-tool-loop, because a long
+	-- uninterrupted sweep is exactly the thing that can fill the window without
 	-- the user ever getting a prompt back.
 	local dropped = clearOldToolResults(conversation)
 	if dropped > 0 then
@@ -479,6 +490,24 @@ local function runTurn(turn: number)
 			bubble.setText(bubbleText)
 		end,
 
+		-- Fired when the model STARTS writing a call to one of our tools, before
+		-- its arguments have streamed. The block goes up empty and is filled in
+		-- twice: setInput when the input parses, setResult when the tool has run.
+		-- Without this the header only appeared once the whole message was over,
+		-- so a `write` of a large file was minutes of a console showing nothing
+		-- but the reply above it.
+		--
+		-- Same bubble split as a server tool, and for the same reason: the block
+		-- lands below a bubble that may still be written to, so the text that
+		-- comes after the call must start a new bubble under it.
+		onToolUseStart = function(id: string?, name: string)
+			splitPending = true
+			local call = Console.appendToolCall(name, {})
+			-- Nothing can pair a result to a block with no id, so it must not be
+			-- left spinning for one.
+			if id then pendingCalls[id] = call else call.finish() end
+		end,
+
 		onServerToolUse = function(name: string, id: string?, input: any)
 			splitPending = true
 			-- Header goes up now, results are filled in when they arrive: the API
@@ -488,14 +517,14 @@ local function runTurn(turn: number)
 			local call = Console.appendToolCall(name, type(input) == "table" and input or {})
 			-- No id means nothing can ever pair a result to this block, so it must
 			-- not be left spinning for one.
-			if id then serverCalls[id] = call else call.finish() end
+			if id then pendingCalls[id] = call else call.finish() end
 		end,
 
 		onServerToolResult = function(name: string, toolUseId: string?, content: any)
 			local body = formatServerResult(content)
-			local call = if toolUseId then serverCalls[toolUseId] else nil
+			local call = if toolUseId then pendingCalls[toolUseId] else nil
 			if call then
-				serverCalls[toolUseId :: string] = nil
+				pendingCalls[toolUseId :: string] = nil
 				call.setResult(body)
 			else
 				-- No matching call block seen; still show the result rather than
@@ -596,12 +625,23 @@ local function runTurn(turn: number)
 			local toolResults: { any } = {}
 			for _, block in ipairs(toolUses) do
 				local toolResult: string
+				-- The block onToolUseStart put up while the input was streaming.
+				-- Claimed here so the cleanup in setBusy cannot finish a block this
+				-- loop is about to write a result into.
+				local call = block.id and pendingCalls[block.id] or nil
+				if block.id then pendingCalls[block.id] = nil end
 				if block.inputParsed then
-					-- Header goes up before the tool runs, not after: dispatch blocks
-					-- this thread for as long as the tool takes, and catalog/run/web
-					-- calls take seconds. The spinner is the only thing saying which
-					-- call the wait belongs to.
-					local call = Console.appendToolCall(block.name, block.inputParsed)
+					-- The arguments only exist now; the header has been up since the
+					-- model started writing the call. The fallback covers a stream
+					-- that somehow produced no start event — dispatch blocks this
+					-- thread for as long as the tool takes, and catalog/run/web calls
+					-- take seconds, so a spinner has to be saying which call the wait
+					-- belongs to either way.
+					if call then
+						call.setInput(block.inputParsed)
+					else
+						call = Console.appendToolCall(block.name, block.inputParsed)
+					end
 					toolResult = Tools.dispatch(term, block.name, block.inputParsed)
 					-- A tool_result whose content is "" is rejected outright, and on
 					-- turn > 1 it cannot be rolled back: the tool_use is already in
@@ -628,11 +668,17 @@ local function runTurn(turn: number)
 					-- overruns it — the Output window keeps the whole thing.
 					warn(string.format("[Claude Code] %s: unparsed tool input (stop_reason: %s): %s",
 						tostring(block.name), tostring(result.stopReason), tostring(block.input)))
-					Console.appendToolCall(
-						tostring(block.name) .. " parse error",
-						{ raw_input = tostring(block.input) },
-						toolResult,
-						true)
+					local raw = { raw_input = tostring(block.input) }
+					if call then
+						-- Same block, now red and carrying the fragment. It has been
+						-- on screen spinning since the model started the call, so
+						-- appending a second one would leave the first hanging.
+						call.setInput(raw)
+						call.setResult(toolResult, true)
+					else
+						Console.appendToolCall(
+							tostring(block.name) .. " parse error", raw, toolResult, true)
+					end
 				end
 				table.insert(toolResults, {
 					type = "tool_result",

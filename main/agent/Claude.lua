@@ -124,25 +124,25 @@ end
 
 -- The moving cache breakpoint on the conversation.
 --
--- Anthropic caps a request at 4 cache_control blocks total (system + tools +
--- messages combined), and the conversation table is the SAME table across
--- turns — Agent.luau never rebuilds it, only appends to it. Tagging the last
--- block without clearing the previous tag means turn 1's breakpoint is still
--- sitting on an earlier message when turn 2 adds a new one, turn 3 adds a
--- third, and by turn 3 the request is already over the limit and every call
--- fails with "A maximum of 4 blocks with cache_control may be provided."
--- Stripping first keeps exactly one breakpoint in the messages array, however
--- many turns the conversation has grown across.
-local function applyMessageCache(messages: { any })
-	for _, message in ipairs(messages) do
-		local content = message.content
-		if type(content) == "table" then
-			for _, block in ipairs(content) do
-				(block :: any).cache_control = nil
-			end
-		end
-	end
-
+-- Returns a COPY. The conversation table is the SAME table across turns —
+-- Agent.luau never rebuilds it, only appends — and it is also what Sessions
+-- persists and replays, so writing anything into it here leaks request-shaping
+-- into stored history. That is not hypothetical: this used to REPLACE a user
+-- message's string content with a one-element block array so the breakpoint had
+-- a block to sit on, which turned every user message in the history into a
+-- table. Sessions.replay draws user turns from string content, so a restored
+-- session showed the assistant's side and none of yours, and titleOf fell
+-- through to a date for the same reason.
+--
+-- Copying also removes the need to strip old breakpoints. Anthropic caps a
+-- request at 4 cache_control blocks (system + tools + messages combined); a tag
+-- written into the live table survived into later turns, so turn 3 sent three
+-- of them and every call failed with "A maximum of 4 blocks with cache_control
+-- may be provided." A fresh copy per request cannot accumulate.
+--
+-- Shallow throughout: only the last message, its block list and its last block
+-- are cloned, so this is three small tables however long the conversation is.
+local function withMessageCache(messages: { any }): { any }
 	-- 1h, the same TTL the system and tool breakpoints use.
 	--
 	-- This used to be the default 5m, on the reasoning that a breakpoint which
@@ -159,15 +159,23 @@ local function applyMessageCache(messages: { any })
 	-- drives this, latch it once at session start — never per turn.
 	local CACHE = { type = "ephemeral", ttl = "1h" }
 
-	local lastMessage = messages[#messages]
+	local out = table.clone(messages)
+	local lastMessage = out[#out]
 	local content = lastMessage and lastMessage.content
-	if type(content) == "table" and #content > 0 then
-		(content[#content] :: any).cache_control = CACHE
+	if type(content) == "table" and #content > 0 and type(content[#content]) == "table" then
+		local blocks = table.clone(content)
+		local tail = table.clone(blocks[#blocks])
+		tail.cache_control = CACHE
+		blocks[#blocks] = tail
+		local copy = table.clone(lastMessage)
+		copy.content = blocks
+		out[#out] = copy
 	elseif type(content) == "string" and content ~= "" then
-		lastMessage.content = {
-			{ type = "text", text = content, cache_control = CACHE },
-		}
+		local copy = table.clone(lastMessage)
+		copy.content = { { type = "text", text = content, cache_control = CACHE } }
+		out[#out] = copy
 	end
+	return out
 end
 
 -- =============================================================================
@@ -195,8 +203,7 @@ local function streamMessage(args: {
 	}, callbacks: {
 		onText: ((string) -> ())?,
 		onThinking: ((string) -> ())?,
-		onToolUseStart: ((number, string) -> ())?,  -- (index, toolName)
-		onToolUseDelta: ((number, string) -> ())?,   -- (index, partialJson)
+		onToolUseStart: ((string?, string) -> ())?,  -- (blockId, toolName), before any input
 		onServerToolUse: ((string, string?, any) -> ())?,  -- (toolName, blockId, parsedInput)
 		onServerToolResult: ((string, string?, any) -> ())?, -- (toolName, toolUseId, rawContent)
 		onComplete: ((any) -> ())?,
@@ -242,7 +249,7 @@ local function streamMessage(args: {
 	-- the gaps this UI is made of, and every expiry reprocesses system + tools
 	-- from cold. A 1h write costs 2x instead of 1.25x, but this prefix is small
 	-- and static — the whole thing is paid once an hour. The conversation
-	-- breakpoint below is 1h for the same reason; see applyMessageCache, which
+	-- breakpoint below is 1h for the same reason; see withMessageCache, which
 	-- is where the argument for the other answer used to live.
 	--
 	-- No beta header is needed for `ttl` — it is GA, not gated.
@@ -277,9 +284,9 @@ local function streamMessage(args: {
 	-- The conversation itself is the part that grows every turn. Marking the
 	-- last block of the last message means everything before it — the whole
 	-- prior history — is a cache read on the next call, not a reprocess. This
-	-- is the breakpoint that actually matters as MAX_TURNS climbs; the system
-	-- and tools breakpoints above are small and static by comparison.
-	applyMessageCache(args.messages)
+	-- is the breakpoint that actually matters as the tool loop climbs; the
+	-- system and tools breakpoints above are small and static by comparison.
+	bodyTable.messages = withMessageCache(args.messages)
 
 	local bodyStr = HttpService:JSONEncode(bodyTable)
 
@@ -377,6 +384,14 @@ local function streamMessage(args: {
 						id = block.id,
 						citations = nil,
 					}
+					-- The name and id are final here; only the arguments are still
+					-- coming. Announcing the call now is the difference between a
+					-- header that appears as the model starts writing it and one
+					-- that appears when the whole message has finished — seconds
+					-- apart for a `write`, whose input IS the file.
+					if block.type == "tool_use" and callbacks.onToolUseStart then
+						callbacks.onToolUseStart(block.id, block.name or "unknown")
+					end
 					if block.type == "web_search_tool_result" and callbacks.onServerToolResult then
 						-- Handed over raw: the caller pairs it with the server_tool_use
 						-- it answers via tool_use_id, and decides what of it to show.
@@ -401,7 +416,6 @@ local function streamMessage(args: {
 						if callbacks.onThinking then callbacks.onThinking(delta.thinking) end
 					elseif delta.type == "input_json_delta" then
 						block.input = block.input .. delta.partial_json
-						if callbacks.onToolUseDelta then callbacks.onToolUseDelta(idx, delta.partial_json) end
 					elseif delta.type == "citations_delta" then
 						-- Cited text blocks carry their sources alongside the text;
 						-- dropping them on replay loses the grounding for later turns.
@@ -434,12 +448,12 @@ local function streamMessage(args: {
 						-- Agent.toolInput, which owns that fallback. block.input keeps the
 						-- raw accumulated JSON for it, so do not stop retaining it.
 						block.inputParsed = inputParsed
-						if block.type == "server_tool_use" then
-							if callbacks.onServerToolUse then
-								callbacks.onServerToolUse(block.name or "unknown", block.id, inputParsed)
-							end
-						elseif callbacks.onToolUseStart then
-							callbacks.onToolUseStart(idx, block.name or "unknown")
+						-- Our own tool_use blocks were already announced at
+						-- content_block_start; server ones are announced here
+						-- instead, because the API runs them the moment they
+						-- complete and their arguments are one short query.
+						if block.type == "server_tool_use" and callbacks.onServerToolUse then
+							callbacks.onServerToolUse(block.name or "unknown", block.id, inputParsed)
 						end
 					end
 
@@ -601,9 +615,68 @@ local function streamMessage(args: {
 	return handle
 end
 
+-- =============================================================================
+-- Self-test
+-- =============================================================================
+-- withMessageCache both shapes the request and has to leave the caller's
+-- history alone, and each half fails silently in its own way: a tag written
+-- into the live conversation accumulates until Anthropic rejects the request
+-- over the 4-breakpoint cap, and a rewritten user message survives into the
+-- saved session, where replay no longer recognises it.
+local function selfTest(): (boolean, string?)
+	local function countTags(messages: { any }): number
+		local tags = 0
+		for _, message in ipairs(messages) do
+			if type(message.content) == "table" then
+				for _, block in ipairs(message.content) do
+					if type(block) == "table" and block.cache_control then tags += 1 end
+				end
+			end
+		end
+		return tags
+	end
+
+	local conversation: { any } = {
+		{ role = "user", content = "hello" },
+		{ role = "assistant", content = { { type = "text", text = "hi" } } },
+		{ role = "user", content = "again" },
+	}
+
+	local wire = withMessageCache(conversation)
+	if conversation[3].content ~= "again" then
+		return false, "withMessageCache rewrote a live user message; session replay loses it"
+	end
+	if countTags(conversation) ~= 0 then
+		return false, "withMessageCache tagged the live conversation"
+	end
+	if countTags(wire) ~= 1 then
+		return false, string.format("withMessageCache put %d breakpoints in the request, expected 1", countTags(wire))
+	end
+	if type(wire[3].content) ~= "table" or wire[3].content[1].text ~= "again" then
+		return false, "withMessageCache lost the text of the message it tagged"
+	end
+
+	-- Turn two: the same conversation, one message longer. Breakpoints must not
+	-- accumulate across requests — that is the 4-cap failure.
+	table.insert(conversation, { role = "assistant", content = { { type = "text", text = "ok" } } })
+	table.insert(conversation, { role = "user", content = {
+		{ type = "tool_result", tool_use_id = "t1", content = "ok" },
+	} })
+	local wire2 = withMessageCache(conversation)
+	if countTags(wire2) ~= 1 then
+		return false, string.format("withMessageCache accumulated %d breakpoints by turn two", countTags(wire2))
+	end
+	if conversation[#conversation].content[1].cache_control ~= nil then
+		return false, "withMessageCache tagged a live tool_result block"
+	end
+
+	return true
+end
+
 return {
 	Initialize = Initialize,
 	streamMessage = streamMessage,
+	selfTest = selfTest,
 	MODELS = MODELS,
 	webSearchTool = webSearchTool,
 	DEFAULT_MODEL = DEFAULT_MODEL,

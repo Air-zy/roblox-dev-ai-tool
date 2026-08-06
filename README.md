@@ -103,8 +103,10 @@ return locations rather than content, output is capped and tells you the command
 that gets the rest, and tool descriptions stay near empty because a model
 already knows what ls does, it just cannot know this is a DataModel.
 
-The gap is compaction. MAX_TURNS stops a runaway loop at 40, it does not
-summarise, so a long session grows until you /clear.
+The gap is compaction. Old tool output is blanked once it is stale, but nothing
+summarises, so a long session grows until you /clear. The tool loop itself is
+uncapped, the same as Claude Code: it runs while the model keeps asking for
+tools, and Stop or Escape ends it.
 
 ## Self-tests
 

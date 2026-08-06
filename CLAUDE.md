@@ -1,3 +1,14 @@
+we are working with roblox... so language is luau
+
 ### for GUIs
 - for roblox font text icons refer to https://github.com/VoxLenox/RobloxBuilderIconList/blob/main/index.html
 - refer to roblox docs when dealing with complex UI classes
+
+### references
+- Claude Code's own source, leaked with the v2.1.88 sourcemap — read it before
+  copying or claiming its behaviour: https://github.com/davccavalcante/claude-code-leaked
+  (loop in `src/query.ts`, pacing in `src/query/tokenBudget.ts`). `curl` the raw
+  files.
+- Fine-grained tool streaming, incl. tool JSON truncated by `max_tokens`:
+  https://docs.claude.com/en/docs/agents-and-tools/tool-use/fine-grained-tool-streaming
+- Messages API: https://platform.claude.com/docs/en/api/messages

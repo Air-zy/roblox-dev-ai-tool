@@ -869,19 +869,35 @@ end
 -- results exist, or the user watches a silent console while a search runs.
 -- `isError` only recolours the header; the body is the same expandable detail,
 -- which is the point — a failed call is exactly the one you want to open.
+--
+-- `input` may likewise be empty at first and filled in later through setInput.
+-- A tool_use block announces its name and id the moment the model starts writing
+-- the call, but its arguments stream in afterwards — a whole file, for a `write`
+-- — so the header goes up argument-less rather than leaving the console silent
+-- for the seconds that takes.
 function Console.appendToolCall(toolName: string, input: { [string]: any }, result: string?, isError: boolean?)
-	local keys: { string } = {}
-	for k in pairs(input) do
-		table.insert(keys, tostring(k))
-	end
-	table.sort(keys)
-
-	local summary: { string } = {}
+	local label = ""
 	local detail: { string } = {}
-	for _, k in ipairs(keys) do
-		table.insert(summary, k .. "=" .. summarise(input[k]))
-		table.insert(detail, k .. ": " .. verbatim(input[k]))
+	-- Rebuilt rather than appended to: setInput replaces the arguments outright,
+	-- it never adds to them.
+	local function readInput(from: { [string]: any })
+		local keys: { string } = {}
+		for k in pairs(from) do
+			table.insert(keys, tostring(k))
+		end
+		table.sort(keys)
+
+		local summary: { string } = {}
+		detail = {}
+		for _, k in ipairs(keys) do
+			table.insert(summary, k .. "=" .. summarise(from[k]))
+			table.insert(detail, k .. ": " .. verbatim(from[k]))
+		end
+		label = if #summary > 0
+			then string.format("[%s: %s]", toolName, table.concat(summary, " "))
+			else string.format("[%s]", toolName)
 	end
+	readInput(input)
 
 	local order = #output:GetChildren() + 1
 	local container = make("Frame", {
@@ -894,9 +910,6 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 	})
 	make("UIListLayout", { Parent = container, SortOrder = Enum.SortOrder.LayoutOrder })
 
-	local label = if #summary > 0
-		then string.format("[%s: %s]", toolName, table.concat(summary, " "))
-		else string.format("[%s]", toolName)
 	local header = make("TextButton", {
 		Parent = container,
 		BackgroundTransparency = 1,
@@ -954,11 +967,25 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 		Console.scrollToBottom()
 	end)
 
+	local lastResult = result
 	Console.scrollToBottom()
 	return {
-		setResult = function(res: string)
+		-- The arguments, once the streamed input has finished and parsed. The
+		-- result is re-rendered with them because the detail body is one string
+		-- holding both.
+		setInput = function(from: { [string]: any })
+			readInput(from)
+			renderHeader()
+			renderDetail(lastResult)
+		end,
+		-- `failed` recolours the header the way the isError argument does at
+		-- creation, for a call that only turns out to be a failure once its
+		-- result exists.
+		setResult = function(res: string, failed: boolean?)
+			lastResult = res
 			pending = false
 			if stopSpin then stopSpin() end
+			if failed then header.TextColor3 = Theme.ERR_CLR end
 			renderHeader()
 			renderDetail(res)
 			if expanded then Console.scrollToBottom() end

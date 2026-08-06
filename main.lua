@@ -928,6 +928,10 @@ task.spawn(function()
 	if not agentOk then
 		warn("[Claude Code] Context trimming self-test FAILED: " .. tostring(agentErr))
 	end
+	local cacheOk, cacheErr = Claude.selfTest()
+	if not cacheOk then
+		warn("[Claude Code] Prompt cache self-test FAILED: " .. tostring(cacheErr))
+	end
 	local sessionsOk, sessionsErr = Sessions.selfTest()
 	if not sessionsOk then
 		warn("[Claude Code] Session storage self-test FAILED: " .. tostring(sessionsErr))

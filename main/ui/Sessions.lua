@@ -67,16 +67,40 @@ function Sessions.Initialize(p: Plugin)
 	currentId = HttpService:GenerateGUID(false)
 end
 
+-- What the reader typed, whichever shape it is stored in. A user message is
+-- normally a plain string, but sessions saved before Claude.withMessageCache
+-- stopped writing into the live conversation have theirs as a one-element text
+-- block array — those still have to restore and still have to be titled.
+-- Returns nil for the other block shape, a tool_result batch, which is drawn
+-- with the call that produced it rather than as a message of its own.
+local function userText(message: any): string?
+	local content = message.content
+	if type(content) == "string" then
+		return content ~= "" and content or nil
+	end
+	if type(content) ~= "table" then return nil end
+	local parts: { string } = {}
+	for _, block in ipairs(content) do
+		if type(block) == "table" and block.type == "text" and type(block.text) == "string" then
+			table.insert(parts, block.text)
+		end
+	end
+	return #parts > 0 and table.concat(parts, "\n") or nil
+end
+
 -- First user message, which is what the reader remembers the session by.
 -- Returns nil when there isn't one — a session resumed from a stop or an error
 -- can begin with a tool_result batch and nothing else, and "Untitled" tells you
 -- less than the clock does.
 local function titleOf(conversation: { any }): string?
 	for _, message in ipairs(conversation) do
-		if message.role == "user" and type(message.content) == "string" then
-			local text = (message.content :: string):gsub("%s+", " ")
-			if #text > 40 then return text:sub(1, 40) .. "…" end
-			if text ~= "" then return text end
+		if message.role == "user" then
+			local raw = userText(message)
+			if raw then
+				local text = raw:gsub("%s+", " ")
+				if #text > 40 then return text:sub(1, 40) .. "…" end
+				if text ~= "" then return text end
+			end
 		end
 	end
 	return nil
@@ -194,10 +218,9 @@ local function replay(conversation: { any })
 	for _, message in ipairs(conversation) do
 		local content = message.content
 		if message.role == "user" then
-			-- The other shape is a tool_result batch, which is drawn with the call
-			-- that produced it rather than as a message of its own.
-			if type(content) == "string" then
-				Console.appendLine(content, "user")
+			local typed = userText(message)
+			if typed then
+				Console.appendLine(typed, "user")
 			end
 		elseif type(content) == "string" then
 			Console.createBubble().setText(content)
@@ -598,6 +621,20 @@ function Sessions.selfTest(): (boolean, string?)
 
 	if titleOf({ { role = "user", content = "hello  world" } }) ~= "hello world" then
 		return false, "titleOf did not normalise whitespace"
+	end
+
+	-- The older on-disk shape, where the cache breakpoint had rewritten the user
+	-- message into blocks. Both the title and the replayed line come from
+	-- userText, so this one assertion covers a session that restores with the
+	-- reader's own messages missing.
+	local blockShaped = { role = "user", content = { { type = "text", text = "old  shape" } } }
+	if titleOf({ blockShaped }) ~= "old shape" then
+		return false, "userText did not read a block-shaped user message from an older session"
+	end
+	if userText({ role = "user", content = {
+		{ type = "tool_result", tool_use_id = "t1", content = "ls" },
+	} }) ~= nil then
+		return false, "userText mistook a tool_result batch for something the reader typed"
 	end
 
 	return true
