@@ -152,6 +152,11 @@ function Console.scrollToBottom(force: boolean?)
 	output.CanvasPosition = Vector2.new(0, math.huge)
 end
 
+function Console.scrollToTop()
+	stickToBottom = false
+	output.CanvasPosition = Vector2.new(0, 0)
+end
+
 function Console.clear()
 	stickToBottom = true  -- an empty console is at its bottom by definition
 	for _, child in ipairs(output:GetChildren()) do
@@ -257,6 +262,27 @@ function Console.appendLine(text: string, kind: string?): TextBox
 	setLine((KIND_PREFIX[kind or ""] or "") .. text)
 	Console.scrollToBottom(kind == "user")
 	return line
+end
+
+-- A clickable line. Only user is the "load earlier" control a replay puts at the
+-- top of a truncated session, so it is a bare TextButton rather than anything
+-- with a hit area of its own.
+function Console.appendLink(text: string, onClick: () -> ()): TextButton
+	local button = make("TextButton", {
+		Name = "Link",
+		Parent = output,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 20),
+		FontFace = Theme.MONO,
+		TextSize = Theme.TEXT_SIZE,
+		TextColor3 = Theme.ACCENT,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = text,
+		AutoButtonColor = false,
+		LayoutOrder = #output:GetChildren() + 1,
+	})
+	button.MouseButton1Click:Connect(onClick)
+	return button
 end
 
 -- =============================================================================

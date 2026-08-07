@@ -278,11 +278,14 @@ local inputBox = make("TextBox", {
 	FontFace = Theme.SANS,
 	TextSize = Theme.TEXT_SIZE,
 	TextColor3 = Theme.TEXT_HI,
-	-- MultiLine is what lets Shift+Enter add a line. It also means Enter no
-	-- longer fires FocusLost(enterPressed): the TextBox keeps the keypress and
-	-- inserts a newline instead. Sending is therefore detected from the text
-	-- changing, not from the key — see the Text handler further down.
-	MultiLine = true,
+	-- Off deliberately, and it is what makes Shift+Enter possible at all. With
+	-- MultiLine on, the box swallows Enter to insert its own newline and never
+	-- reports the key: FocusLost doesn't fire, no InputBegan anywhere in the
+	-- widget fires either (measured — see the FocusLost handler), so Enter and
+	-- Shift+Enter arrive byte-identical and there is nothing left to tell them
+	-- apart. Off, Enter comes back as an event carrying its modifiers, and the
+	-- newline is inserted by hand there instead.
+	MultiLine = false,
 	ClearTextOnFocus = false,
 	Text = "",
 	PlaceholderText = "Message Claude…  ( / for commands · shift+enter for a new line )",
@@ -813,56 +816,54 @@ end
 
 -- Enter sends, Shift+Enter adds a line.
 --
--- This watches the text rather than the keyboard, because a focused TextBox
--- swallows its keystrokes: UserInputService.InputBegan does NOT fire for keys
--- that go into a TextBox, so a Return handler there never runs and Enter only
--- ever inserted a newline. A MultiLine box also never reports Enter through
--- FocusLost, so the newline appearing in the text is the only signal there is.
+-- FocusLost is the only keyboard signal a plugin widget actually delivers, and
+-- it only delivers it because MultiLine is off. Everything else was measured
+-- dead while the box holds focus: UserInputService (which the Studio widget docs
+-- say outright expects the game window), GuiObject.InputBegan on the box, on
+-- `root`, and on a transparent catcher frame across the whole widget, and
+-- IsKeyDown along with them. Not one key event, ever — so Shift can only be read
+-- off the InputObject that FocusLost hands back, at the instant it hands it back.
 --
--- Growth of exactly one character is what separates a keystroke from a paste —
--- without that check, pasting a snippet containing newlines would fire a send.
-local previousText = ""
-inputBox:GetPropertyChangedSignal("Text"):Connect(function()
-	local text = inputBox.Text
-	local grew = #text == #previousText + 1
-	previousText = text
-	if not grew then return end
-
-	-- The caret sits just after the character that was inserted. Falling back to
-	-- a trailing newline covers the case where CursorPosition has not caught up.
-	local caret = inputBox.CursorPosition
-	local atCaret = caret >= 2 and text:sub(caret - 1, caret - 1) == "\n"
-	local atEnd = text:sub(-1) == "\n"
-	if not (atCaret or atEnd) then return end
-
-	if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
-		or UserInputService:IsKeyDown(Enum.KeyCode.RightShift) then
-		return   -- Shift+Enter: the newline stays
-	end
-
-	-- Enter: cut out the newline it just inserted, send what is left.
-	local without = atCaret
-		and (text:sub(1, caret - 2) .. text:sub(caret))
-		or text:sub(1, -2)
-
-	-- Busy: the draft stays put and nothing is sent. Only the newline goes, so
-	-- holding Enter while waiting doesn't pad the message with blank lines.
-	-- Assigning .Text re-enters this handler, which is harmless — the text shrank,
-	-- so `grew` is false and it returns after resyncing previousText.
-	if Agent.isBusy() then
-		previousText = without
-		inputBox.Text = without
-		inputBox.CursorPosition = if atCaret then caret - 1 else #without + 1
-		return
-	end
-
-	previousText = ""
-	submit(without)
+-- CursorPosition reads -1 as soon as focus goes, and FocusLost is exactly that
+-- moment, so the last live caret is what the newline gets inserted at.
+local caretAt = 1
+inputBox:GetPropertyChangedSignal("CursorPosition"):Connect(function()
+	if inputBox.CursorPosition > 0 then caretAt = inputBox.CursorPosition end
 end)
 
--- Esc cancels: the input keeps focus while streaming, so the keyboard is the
--- closest control to hand. Escape is not text, so it does reach InputBegan.
-UserInputService.InputBegan:Connect(function(input: InputObject, processed: boolean)
+inputBox.FocusLost:Connect(function(enterPressed: boolean, cause: InputObject?)
+	-- Esc gives up focus and hands over the key that did it — the only way a
+	-- cancel from the keyboard reaches this plugin while you are typing.
+	if cause and cause.KeyCode == Enum.KeyCode.Escape then
+		if Agent.isBusy() then Agent.stop() end
+		return
+	end
+	if not enterPressed then return end
+
+	if cause ~= nil and cause:IsModifierKeyDown(Enum.ModifierKey.Shift) then
+		local text = inputBox.Text
+		local index = math.clamp(caretAt, 1, #text + 1)
+		-- A single-line box has nowhere to put the Return, so it leaves a space at
+		-- the caret instead. Left alone it becomes the first character of the new
+		-- line — the space this used to prepend. The caret was read before that
+		-- happened, so it is sitting right at `index`.
+		local tail = text:sub(index)
+		if tail:sub(1, 1) == " " then tail = tail:sub(2) end
+		inputBox.Text = text:sub(1, index - 1) .. "\n" .. tail
+		inputBox:CaptureFocus()
+		-- After CaptureFocus, not before: focusing moves the caret itself.
+		task.defer(function() inputBox.CursorPosition = index + 1 end)
+	elseif Agent.isBusy() then
+		-- The draft stays put and nothing is sent; typing carries on.
+		inputBox:CaptureFocus()
+	else
+		-- Same space, at the end this time.
+		submit((inputBox.Text:gsub("%s+$", "")))
+	end
+end)
+
+-- Esc from the viewport too, the one place UserInputService does report input.
+UserInputService.InputBegan:Connect(function(input: InputObject)
 	if input.KeyCode == Enum.KeyCode.Escape and Agent.isBusy() then
 		Agent.stop()
 	end

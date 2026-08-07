@@ -60,11 +60,22 @@ local function persistIndex()
 	pluginRef:SetSetting(KEY_INDEX, HttpService:JSONEncode(index))
 end
 
+-- The active row is drawn differently, so every change of session has to redraw
+-- the list or the highlight stays on the one you just left. Going through a
+-- setter is what keeps that true for all three ways currentId moves — switch,
+-- new, delete — rather than only the one that remembered to refresh. Defined up
+-- here because Initialize is the first caller and a `local function` is not in
+-- scope above its own definition.
+local function setCurrent(id: string)
+	currentId = id
+	if refreshList then refreshList() end
+end
+
 function Sessions.Initialize(p: Plugin)
 	pluginRef = p
 	local saved = decode(p:GetSetting(KEY_INDEX))
 	if type(saved) == "table" then index = saved end
-	currentId = HttpService:GenerateGUID(false)
+	setCurrent(HttpService:GenerateGUID(false))
 end
 
 -- What the reader typed, whichever shape it is stored in. A user message is
@@ -203,9 +214,35 @@ end
 -- but nothing here matches their type, so a replay still shows prose and tool
 -- calls only. Rendering a restored session's reasoning would mean a drawer per
 -- block; the live view is where reasoning is worth reading.
--- ponytail: renders the whole session in one go, so a very long one is a visible
--- hitch on open. Paginate from the tail if that ever bites.
+-- Only the tail is drawn. Every message is a handful of Instances and a Markdown
+-- parse, so rendering a long session in full froze Studio for about a second on
+-- every switch. The conversation Agent restored is still the WHOLE thing — this
+-- caps what is on screen, not what Claude can see.
+--
+-- The rest is a page away, not gone: the top line is a button that widens the
+-- window and redraws. `shown` is reset by load(), so every session opens at one
+-- page again.
+--
+-- ponytail: paging redraws the whole window rather than prepending to it, so
+-- clicking back through a very long session pays the freeze it was avoiding —
+-- but only on a click the reader asked for. Prepending needs LayoutOrder below
+-- what is already on screen, which every appender computes for itself; do that
+-- if the redraw ever gets annoying.
+local REPLAY_MESSAGES = 25
+local shown = REPLAY_MESSAGES
+
+-- Switching, clearing or paging mid-turn would leave the running turn appending
+-- its results into a view nobody is looking at any more.
+local function blockedByTurn(): boolean
+	if not Agent.isBusy() then return false end
+	Console.appendLine("Finish or stop the current turn first.", "error")
+	return true
+end
+
 local function replay(conversation: { any })
+	-- Built from the FULL conversation: a tool_use in the tail can be paired with
+	-- a tool_result whose message was cut, and a call that renders without its
+	-- result is a call that looks like it never finished.
 	local results: { [string]: string } = {}
 	for _, message in ipairs(conversation) do
 		if type(message.content) == "table" then
@@ -217,7 +254,26 @@ local function replay(conversation: { any })
 		end
 	end
 
-	for _, message in ipairs(conversation) do
+	local first = math.max(1, #conversation - shown + 1)
+	if first > 1 then
+		Console.appendLink(
+			string.format("↑ Load %d earlier messages (%d older)",
+				math.min(REPLAY_MESSAGES, first - 1), first - 1),
+			function()
+				-- Same guard as switching sessions: redrawing would destroy the
+				-- bubble a running turn is streaming into.
+				if blockedByTurn() then return end
+				shown += REPLAY_MESSAGES
+				Console.clear()
+				replay(conversation)
+				-- The reader clicked the thing at the top, so leave them at the top —
+				-- looking at the messages they just pulled up, not back at the newest.
+				Console.scrollToTop()
+			end)
+	end
+
+	for index = first, #conversation do
+		local message = conversation[index]
 		local content = message.content
 		if message.role == "user" then
 			local typed = userText(message)
@@ -268,14 +324,6 @@ local function repairInputs(conversation: { any })
 	end
 end
 
--- Switching or clearing mid-turn would leave the running turn appending its
--- results into a conversation nobody is looking at any more.
-local function blockedByTurn(): boolean
-	if not Agent.isBusy() then return false end
-	Console.appendLine("Finish or stop the current turn first.", "error")
-	return true
-end
-
 function Sessions.load(id: string)
 	if blockedByTurn() then return end
 	local conversation = decode(pluginRef:GetSetting(KEY_PREFIX .. id))
@@ -285,9 +333,10 @@ function Sessions.load(id: string)
 	end
 	repairInputs(conversation)
 
-	currentId = id
+	setCurrent(id)
 	Console.clear()
 	Agent.restore(conversation)
+	shown = REPLAY_MESSAGES
 	replay(conversation)
 	Console.appendLine(string.format("Restored session — %d messages.", #conversation), "system")
 end
@@ -296,7 +345,7 @@ function Sessions.new()
 	if blockedByTurn() then return end
 	-- The current session is already on disk: save() runs at the end of every
 	-- turn, so there is nothing to flush before letting go of it.
-	currentId = HttpService:GenerateGUID(false)
+	setCurrent(HttpService:GenerateGUID(false))
 	Console.clear()
 	Agent.reset()
 end
