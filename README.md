@@ -53,6 +53,32 @@ at the root ignore case but everything below it does not. Scripts are listed
 with a .luau suffix, -type f means a script and -type d means anything else.
 Changes go through ChangeHistoryService, so Ctrl+Z works.
 
+Patterns are real regular expressions, from a real engine in `fs/Regex.luau` —
+not Lua patterns in a costume. Plain `grep` and `sed` are POSIX **BRE**, `-E`
+`egrep` and `find -regex` are **ERE**, `-F` and `fgrep` are fixed strings, and
+`-P` adds lazy quantifiers, `(?:)`, backreferences and lookahead. Groups,
+alternation, `{n,m}`, bracket classes with POSIX names, anchors and the GNU
+`\d \w \s \b` escapes all work. sed's replacement side is sed's: `\1`-`\9` and
+`&`. The only thing deliberately refused is lookbehind, because a variable-length
+one needs a different engine and guessing would return wrong matches quietly.
+
+Two consequences worth knowing. Backtracking has catastrophic cases, and Luau
+cannot preempt a running chunk, so the matcher has a step budget — a pattern like
+`(a+)+$` comes back as an error instead of freezing Studio. And because plain
+grep is BRE, `.` is a metacharacter there exactly as it is everywhere else:
+`grep game.Workspace` also matches `gameXWorkspace`, and `\.` or `-F` is how you
+ask for the literal.
+
+Each command declares the flags it takes, in SPECS. A flag that has no meaning
+against a DataModel is refused with the reason rather than a list of what is
+allowed: ls -o says an Instance has no owner, tail -f says these handlers run
+inside the response stream. Three of them do map onto something real and are
+implemented rather than refused — an inode is GetDebugId, the mode bits are
+Disabled, Archivable and Locked, and a size is source bytes or a descendant
+count. Modification time has no property behind it at all, so it is observed:
+edits this plugin makes, edits you make in the Script Editor, and anything
+parented after we loaded. Everything else reads "-" under ls -t and sorts last.
+
 It is not a real shell. No variables, control flow or command substitution. When
 something needs real composition it should use run instead of growing a language
 inside Shell.

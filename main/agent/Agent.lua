@@ -12,6 +12,9 @@ local Claude = require(script.Parent:WaitForChild("Claude"))
 local Tools = require(script.Parent:WaitForChild("Tools"))
 local Console = require(ui:WaitForChild("Console"))
 local Settings = require(ui:WaitForChild("Settings"))
+-- Only for the editor-context line on each user message: which scripts are open
+-- and where the cursor is.
+local Fs = require(script.Parent.Parent:WaitForChild("fs"):WaitForChild("Fs"))
 
 local Agent = {}
 
@@ -849,6 +852,56 @@ end
 -- =============================================================================
 -- Entry point
 -- =============================================================================
+-- What the user currently has open, and where their cursor is. "fix this
+-- function" is unanswerable without it and costs a grep to guess at; with it,
+-- it is a `sed -n` away.
+--
+-- Attached to EVERY user message rather than only the first. A cursor captured
+-- once at session start is asserting a position the user left ten turns ago,
+-- and nothing in the text says it is stale — a wrong cursor is worse than no
+-- cursor. This costs nothing to keep current: the newest message sits after the
+-- conversation cache breakpoint (see withMessageCache in Claude), so re-sending
+-- a changed line here never invalidates the cached prefix.
+--
+-- There is no focus API — ScriptDocument cannot say which tab is in front — so
+-- every open document is listed with its own cursor rather than one being
+-- guessed at and labelled "the" file.
+local MAX_OPEN_DOCS = 6
+
+local function editorContext(): string
+	local docs = Fs.openDocuments()
+	if #docs == 0 then
+		return ""
+	end
+	local parts: { string } = {}
+	for index, entry in ipairs(docs) do
+		if index > MAX_OPEN_DOCS then
+			parts[#parts + 1] = string.format("… %d more", #docs - MAX_OPEN_DOCS)
+			break
+		end
+		-- instancePath, not GetFullName: this is a path the model can hand
+		-- straight back to cat/sed/grep. GetFullName's dotted form resolves to
+		-- nothing here, which would make the hint cost a turn instead of saving one.
+		local label = Fs.instancePath(entry.inst)
+		-- GetSelection returns (line, char); the extra parens take the line.
+		local ok, line = pcall(function()
+			return (entry.doc:GetSelection())
+		end)
+		if ok and type(line) == "number" then
+			-- Where they are scrolled to is a different question from where the
+			-- caret is, and it is the one that answers "this function".
+			local viewOk, first, last = pcall(function()
+				return entry.doc:GetViewport()
+			end)
+			label = (viewOk and type(first) == "number" and type(last) == "number")
+				and string.format("%s (cursor line %d, showing %d-%d)", label, line, first, last)
+				or string.format("%s (cursor line %d)", label, line)
+		end
+		parts[#parts + 1] = label
+	end
+	return "\n\n[open in the editor: " .. table.concat(parts, ", ") .. "]"
+end
+
 function Agent.send(text: string, isLoggedIn: () -> boolean)
 	if busy then return end
 	if not isLoggedIn() then
@@ -856,8 +909,9 @@ function Agent.send(text: string, isLoggedIn: () -> boolean)
 		return
 	end
 
+	-- Shown to the model, not to the user: the console echoes what was typed.
 	Console.appendLine(text, "user")
-	table.insert(conversation, { role = "user", content = text })
+	table.insert(conversation, { role = "user", content = text .. editorContext() })
 	setBusy(true)
 	runTurn(1)
 end

@@ -1,5 +1,9 @@
 we are working with roblox... so language is luau
 
+for this harness.. THE AGENT SHOULD NOT NEED TO KNOW that its working on roblox.. for good quality or tool use... but it can...
+this harness should be general/good like that yk? to not confuse the agent with unnecessary clobbering of its context window and rules...
+anything that goes against this should be adressed.
+
 ### for GUIs
 - for roblox font text icons refer to https://github.com/VoxLenox/RobloxBuilderIconList/blob/main/index.html
 - refer to roblox docs when dealing with complex UI classes

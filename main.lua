@@ -22,6 +22,7 @@ local Sha256   = require(auth:WaitForChild("Sha256"))   :: any
 local OAuth    = require(auth:WaitForChild("OAuth"))    :: any
 local Claude   = require(agent:WaitForChild("Claude"))  :: any
 local Props    = require(fs:WaitForChild("Props"))      :: any
+local Fs       = require(fs:WaitForChild("Fs"))         :: any
 local Terminal = require(fs:WaitForChild("Terminal"))   :: any
 local Theme    = require(ui:WaitForChild("Theme"))
 local Markdown = require(ui:WaitForChild("Markdown"))
@@ -916,6 +917,10 @@ task.spawn(function()
 	-- why it can't happen lazily: the first cat runs inside a stream callback,
 	-- and yielding there would stall SSE parsing mid-buffer.
 	Props.preload()
+
+	-- Start observing modification times. Nothing before this point has one, so
+	-- the earlier this runs the more of the session `ls -t` can answer for.
+	Fs.watch()
 
 	local shellOk, shellErr = Terminal.selfTest()
 	if not shellOk then
