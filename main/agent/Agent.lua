@@ -501,18 +501,62 @@ local function runTurn(turn: number)
 	-- nothing, or worse, referenced a local that had not been assigned yet.
 	local stream: any = nil
 	local cancelRequested = false
+	-- The tool-call block currently executing. It is claimed OUT of pendingCalls
+	-- before dispatch, so setBusy's sweep cannot reach it — without this handle
+	-- its spinner turns forever after a Stop.
+	local runningCall: any = nil
+	-- The tool_use blocks onComplete has already committed to the history and
+	-- that nothing has answered yet. Stop has to answer them: Anthropic rejects
+	-- a tool_use with no matching tool_result, so abandoning a turn here would
+	-- poison every later request in the session rather than just this one.
+	local unanswered: { any }? = nil
 
 	stopCurrent = function()
-		if finish() then return end
+		if cancelRequested then return end
 		cancelRequested = true
+		-- Deliberately NOT gated on finish(). That latch means "the stream has
+		-- been finalised", and onComplete sets it on its very first line — before
+		-- any tool runs. Sharing it made Stop a silent no-op for the whole
+		-- tool-execution phase: no "Stopped.", no spinner reset, nothing. That is
+		-- precisely the phase worth stopping, because `run` has no timeout and
+		-- Luau cannot preempt a chunk that is looping.
+		finished = true
 		if stream then stream.cancel() end
 		bubble.finishThinking()
 
-		-- Leave the history in a shape the next request can build on. Partial
-		-- text becomes a normal assistant message so roles still alternate; a
-		-- partial tool_use is dropped, since it has no tool_result to pair with
-		-- and Anthropic would reject the pair on the next turn.
-		if text ~= "" then
+		if runningCall then
+			-- Honest about what Stop can and cannot do: the turn is abandoned, but
+			-- a chunk already executing keeps going until it returns on its own.
+			runningCall.setResult(
+				"stopped — the turn was abandoned, but this call is still running " ..
+					"and cannot be interrupted", true)
+			runningCall = nil
+		end
+
+		-- Leave the history in a shape the next request can build on.
+		if unanswered then
+			-- Stopped DURING the tools, so the assistant message is already in the
+			-- history with its tool_use blocks. They have to be answered rather
+			-- than left dangling, and a second assistant message must NOT be added
+			-- on top — that would break role alternation as well as the pairing.
+			local answers: { any } = {}
+			for _, block in ipairs(unanswered) do
+				if block.id then
+					answers[#answers + 1] = {
+						type = "tool_result",
+						tool_use_id = block.id,
+						content = "stopped by the user",
+					}
+				end
+			end
+			if #answers > 0 then
+				table.insert(conversation, { role = "user", content = answers })
+			end
+			unanswered = nil
+		elseif text ~= "" then
+			-- Stopped mid-stream. Partial text becomes a normal assistant message
+			-- so roles still alternate; a partial tool_use is dropped, since it has
+			-- no tool_result to pair with.
 			bubble.setText(bubbleText)
 			table.insert(conversation, { role = "assistant", content = text })
 		elseif turn == 1 and #conversation > 0 then
@@ -711,8 +755,17 @@ local function runTurn(turn: number)
 			-- Run the tools. Every tool_use needs a matching tool_result, including
 			-- ones whose input failed to parse — an unanswered tool_use is a
 			-- protocol error, so failures go back as error text.
+			--
+			-- Published before the loop so a Stop landing mid-dispatch knows which
+			-- tool_use blocks it has to answer on the way out.
+			unanswered = toolUses
 			local toolResults: { any } = {}
 			for _, block in ipairs(toolUses) do
+				-- Checked per tool, not just once: a turn can ask for several, and a
+				-- Stop pressed during the first should not be followed by the rest.
+				if cancelRequested then
+					break
+				end
 				local toolResult: string
 				-- The block onToolUseStart put up while the input was streaming.
 				-- Claimed here so the cleanup in setBusy cannot finish a block this
@@ -731,7 +784,12 @@ local function runTurn(turn: number)
 					else
 						call = Console.appendToolCall(block.name, block.inputParsed)
 					end
+					-- Published so Stop can finish this block's spinner while the
+					-- call is still running, and cleared after so a later Stop does
+					-- not write a result over a block that already has one.
+					runningCall = call
 					toolResult = Tools.dispatch(term, block.name, block.inputParsed)
+					runningCall = nil
 					-- A tool_result whose content is "" is rejected outright, and on
 					-- turn > 1 it cannot be rolled back: the tool_use is already in
 					-- the history above, so every retry resends the same poisoned
@@ -783,6 +841,15 @@ local function runTurn(turn: number)
 			capTurn(toolResults)
 
 			-- pause_turn: a long-running server tool was interrupted mid-turn.
+			-- A yielding tool outlasts the Stop pressed while it ran — with `run`
+			-- that is the ordinary case, not an edge one, since a chunk that loops
+			-- cannot be interrupted at all. Whatever it eventually returned is
+			-- dropped here rather than quietly starting another turn on behalf of
+			-- someone who asked for the opposite.
+			if cancelRequested then
+				return
+			end
+
 			-- Anthropic expects the paused assistant content sent straight back so
 			-- it can carry on; there are no tool results to attach.
 			if result.stopReason == "pause_turn" and #toolResults == 0 then
@@ -797,6 +864,8 @@ local function runTurn(turn: number)
 				-- All results in ONE user message. Anthropic requires every
 				-- tool_result for a turn to arrive together.
 				table.insert(conversation, { role = "user", content = toolResults })
+				-- Answered, so a later Stop must not answer them a second time.
+				unanswered = nil
 				task.spawn(function()
 					task.wait(0.1)  -- let the UI paint before the next request
 					runTurn(turn + 1)
