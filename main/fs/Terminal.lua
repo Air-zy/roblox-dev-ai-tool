@@ -745,8 +745,8 @@ local Catalog = require(script.Parent.Parent:WaitForChild("studio"):WaitForChild
 
 Terminal.setRunGuard = Exec.setRunGuard
 
-function Terminal:run(code: string?, path: string?): (string?, string?)
-	return Exec.run(self, code, path)
+function Terminal:run(path: string?): (string?, string?)
+	return Exec.run(self, path)
 end
 
 function Terminal:catalogSearch(query: string?): (string?, string?)
@@ -774,7 +774,8 @@ function Terminal.selfTest(): (boolean, string?)
 		return false, "regex engine: " .. tostring(regexErr)
 	end
 
-	local execOk, execErr = Exec.selfTest()
+	-- run and catalog test themselves; this only chains them.
+	local execOk, execErr = Exec.selfTest(Terminal.new(game))
 	if not execOk then return false, execErr end
 
 	local catOk, catErr = Catalog.selfTest()
@@ -790,64 +791,6 @@ function Terminal.selfTest(): (boolean, string?)
 	-- here: that switch exists because `run` executes arbitrary Luau at plugin
 	-- permission level, and a self-test that flips it on is a hole in the one
 	-- guard the user actually opted into. Skipped when it is off.
-	if runGuard and runGuard() then
-		local probe = Instance.new("ModuleScript")
-		probe.Name = "ClaudeReloadProbe"
-		probe.Source = "return 1"
-		probe.Parent = ServerStorage
-		local out, runErr = Terminal.new(game):run(string.format([[
-local m = game:GetService("ServerStorage"):FindFirstChild(%q)
-local a = require(m)
-m.Source = "return 2"
-local b = require(m)
-local c = reload(m)
-return tostring(a) .. "/" .. tostring(b) .. "/" .. tostring(c)
-]], probe.Name))
-		probe:Destroy()
-		if not out then
-			return false, "reload probe failed to run: " .. tostring(runErr)
-		end
-		if not out:find("1/1/2", 1, true) then
-			return false, "reload did not defeat the require cache — wanted 1/1/2 in:\n" .. out
-		end
-
-		-- run BY PATH, and the property that makes it worth having: the file's
-		-- source is inlined where `code` would go, so an error on file line 2
-		-- must still report line 2. If the PROLOGUE offset ever stops matching,
-		-- this is where it shows up as a number rather than as the agent
-		-- editing the wrong line.
-		local byPath = Instance.new("ModuleScript")
-		byPath.Name = "ClaudeRunPathProbe"
-		-- Not a bare number: "ran in 0.07 ms" heads every result, so `find("7")`
-		-- would pass whether or not the print ever landed.
-		byPath.Source = "print(\"probe-printed\")\nerror(\"boom\")"
-		byPath.Parent = ServerStorage
-		local term = Terminal.new(game)
-		local pathOut, pathErr = term:run(nil, "/ServerStorage/" .. byPath.Name)
-		local bothOut = term:run("return 1", "/ServerStorage/" .. byPath.Name)
-		byPath:Destroy()
-		if not pathOut then
-			return false, "run by path failed: " .. tostring(pathErr)
-		end
-		if not pathOut:find("probe-printed", 1, true) then
-			return false, "run by path did not capture the file's own print:\n" .. pathOut
-		end
-		if not pathOut:find(":2: boom", 1, true) then
-			return false, "run by path mis-mapped the error line — wanted :2: in:\n" .. pathOut
-		end
-		if bothOut then
-			return false, "run accepted code and path together"
-		end
-
-		-- Every value, not just the first. The nil in the middle is the point:
-		-- `return nil, "why"` is the commonest shape in Luau and used to come
-		-- back as nothing at all.
-		local multi = term:run("return 1, nil, \"three\"")
-		if not multi or not multi:find("1, nil, three", 1, true) then
-			return false, "run dropped values past the first:\n" .. tostring(multi)
-		end
-	end
-
 	return Shell.selfTest(Terminal.new(game))
 end
 

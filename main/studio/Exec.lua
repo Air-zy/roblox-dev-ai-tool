@@ -115,29 +115,12 @@ end
 
 -- `code` is one-shot; `path` reads the code out of a script instead, so a probe
 -- can be written once and re-run after an edit rather than resent whole. Exactly
--- one of the two.
---
--- The source is inlined after the PROLOGUE just as `code` is, and that is the
--- point rather than an accident: the file's own print/warn land in __out, an
--- error on file line N reports line N, and the require cache is never touched so
--- there is no clone and nothing to go stale. What it costs is `script`, which
--- refers to the generated module and not to the file, unavoidable either way,
--- since edit-mode require cannot run a module twice without cloning it and the
--- clone is not the file either.
-function Exec.run(self: any, code: string?, path: string?): (string?, string?)
-	if path and path ~= "" then
-		if code and code ~= "" then
-			return nil, "run takes code or path, not both"
-		end
-		local target, resolveErr = self:resolve(path)
-		if not target then return nil, resolveErr end
-		if not isScript(target) then
-			return nil, "not a script: " .. instancePath(target)
-		end
-		code = getSource(target)
-	end
+-- Runs a string. INTERNAL: the tool only reaches Exec.run below, which reads the
+-- source out of a file first. Kept separate so the self-tests can drive the
+-- executor without writing a fixture to the DataModel for every case.
+local function runSource(self: any, code: string?): (string?, string?)
 	if not code or code:match("^%s*$") then
-		return nil, "run requires code, or a path to a script holding it"
+		return nil, "nothing to run"
 	end
 	if not runGuard or not runGuard() then
 		return nil, "code execution is disabled — enable it in Settings > Run code"
@@ -329,7 +312,38 @@ function Exec.run(self: any, code: string?, path: string?): (string?, string?)
 end
 
 
-function Exec.selfTest(): (boolean, string?)
+-- Run a script by path. The ONLY way in from the tool.
+--
+-- There used to be a `code` parameter beside this one, and it was removed
+-- because the model would not stop rebuilding this function inside it: read
+-- `.Source`, loadstring it, pcall it, print the result. That hand-rolled version
+-- is not merely wasteful, it is wrong. `.Source` is not the editor buffer, so a
+-- file with unsaved edits gets tested in its old form and reports a pass. The
+-- fix is not a better description, it is not offering the worse mechanism.
+--
+-- The source is inlined after the PROLOGUE, which is the point rather than an
+-- accident: the file's own print/warn land in __out, an error on file line N
+-- reports line N, and the require cache is never touched so there is no clone
+-- and nothing to go stale. What it costs is `script`, which refers to the
+-- generated module and not to the file, unavoidable either way since edit-mode
+-- require cannot run a module twice without cloning it.
+function Exec.run(self: any, path: string?): (string?, string?)
+	if not path or path == "" then
+		return nil, "run needs a path to a script. Write one to /ServerStorage/tmp first"
+	end
+	local target, resolveErr = self:resolve(path)
+	if not target then return nil, resolveErr end
+	if not isScript(target) then
+		return nil, "not a script: " .. instancePath(target)
+	end
+	local source = getSource(target)
+	if not source or source:match("^%s*$") then
+		return nil, "empty script: " .. instancePath(target)
+	end
+	return runSource(self, source)
+end
+
+function Exec.selfTest(probeTerm: any): (boolean, string?)
 	-- The line-offset invariant, and the cheapest check in this file. Every
 	-- PROLOGUE entry is one physical line because PROLOGUE_LINES is #PROLOGUE and
 	-- nothing else, a two-line entry shifts every error line number `run` ever
@@ -345,6 +359,65 @@ function Exec.selfTest(): (boolean, string?)
 	if PROLOGUE_LINES ~= #PROLOGUE then
 		return false, "PROLOGUE_LINES no longer matches #PROLOGUE"
 	end
+
+	if runGuard and runGuard() then
+		local probe = Instance.new("ModuleScript")
+		probe.Name = "ClaudeReloadProbe"
+		probe.Source = "return 1"
+		probe.Parent = ServerStorage
+		local out, runErr = runSource(probeTerm, string.format([[
+local m = game:GetService("ServerStorage"):FindFirstChild(%q)
+local a = require(m)
+m.Source = "return 2"
+local b = require(m)
+local c = reload(m)
+return tostring(a) .. "/" .. tostring(b) .. "/" .. tostring(c)
+]], probe.Name))
+		probe:Destroy()
+		if not out then
+			return false, "reload probe failed to run: " .. tostring(runErr)
+		end
+		if not out:find("1/1/2", 1, true) then
+			return false, "reload did not defeat the require cache — wanted 1/1/2 in:\n" .. out
+		end
+
+		-- run BY PATH, and the property that makes it worth having: the file's
+		-- source is inlined where `code` would go, so an error on file line 2
+		-- must still report line 2. If the PROLOGUE offset ever stops matching,
+		-- this is where it shows up as a number rather than as the agent
+		-- editing the wrong line.
+		local byPath = Instance.new("ModuleScript")
+		byPath.Name = "ClaudeRunPathProbe"
+		-- Not a bare number: "ran in 0.07 ms" heads every result, so `find("7")`
+		-- would pass whether or not the print ever landed.
+		byPath.Source = "print(\"probe-printed\")\nerror(\"boom\")"
+		byPath.Parent = ServerStorage
+		local term = probeTerm
+		local pathOut, pathErr = Exec.run(term, "/ServerStorage/" .. byPath.Name)
+		local noPath = Exec.run(term, nil)
+		byPath:Destroy()
+		if not pathOut then
+			return false, "run by path failed: " .. tostring(pathErr)
+		end
+		if not pathOut:find("probe-printed", 1, true) then
+			return false, "run by path did not capture the file's own print:\n" .. pathOut
+		end
+		if not pathOut:find(":2: boom", 1, true) then
+			return false, "run by path mis-mapped the error line — wanted :2: in:\n" .. pathOut
+		end
+		if noPath then
+			return false, "run accepted a missing path"
+		end
+
+		-- Every value, not just the first. The nil in the middle is the point:
+		-- `return nil, "why"` is the commonest shape in Luau and used to come
+		-- back as nothing at all.
+		local multi = runSource(term, "return 1, nil, \"three\"")
+		if not multi or not multi:find("1, nil, three", 1, true) then
+			return false, "run dropped values past the first:\n" .. tostring(multi)
+		end
+	end
+
 	return true
 end
 
