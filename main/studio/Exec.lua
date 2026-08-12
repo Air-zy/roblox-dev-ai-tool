@@ -93,9 +93,16 @@ local requiredAt: { [Instance]: number } = (setmetatable({}, { __mode = "k" }) :
 
 -- Shallow, bounded rendering: a returned table is usually the interesting part,
 -- but a deep dump of the DataModel would flood the context.
+local MAX_VALUE_CHARS = 500
+
 local function describe(value: any, depth: number?): string
 	if typeof(value) ~= "table" then
-		return formatValue(value)
+		local s = formatValue(value)
+		if #s > MAX_VALUE_CHARS then
+			return s:sub(1, MAX_VALUE_CHARS)
+				.. string.format(" ... [%d more]", #s - MAX_VALUE_CHARS)
+		end
+		return s
 	end
 	if (depth or 0) > 0 then
 		return "<table>"
