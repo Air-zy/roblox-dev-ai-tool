@@ -14,7 +14,7 @@
 -- Public API:
 --   Initialize(auth)
 --   streamMessage({ model, system, messages, maxTokens, tools }, callbacks) -> handle
---   webSearchTool(maxUses, model)
+--   webSearchTool(maxUses)
 --   MODELS, DEFAULT_MODEL
 --
 -- The old non-streaming sendMessage/sendWithTools pair is gone. Agent drives the
@@ -57,21 +57,14 @@ local CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for 
 --   thinking = "budget": legacy extended thinking. budget_tokens is the only
 --     control; output_config.effort is NOT supported and must be omitted.
 -- Unknown models default to adaptive, matching every current Claude release.
---   search: which web_search tool version the model accepts. The 2026 one
---     filters results with code before they reach the context window, which is
---     both better answers and fewer tokens, but it does not exist on the older
---     models: asking for it there is a request-shaping error, not a downgrade.
-local MODEL_CAPS: { [string]: { thinking: string, effort: boolean, search: string } } = {
-	["claude-opus-5"]             = { thinking = "adaptive", effort = true,  search = "web_search_20260209" },
-	["claude-sonnet-5"]           = { thinking = "adaptive", effort = true,  search = "web_search_20260209" },
-	["claude-haiku-4-5"]          = { thinking = "budget",   effort = false, search = "web_search_20250305" },
+local MODEL_CAPS: { [string]: { thinking: string, effort: boolean } } = {
+	["claude-opus-5"]             = { thinking = "adaptive", effort = true },
+	["claude-sonnet-5"]           = { thinking = "adaptive", effort = true },
+	["claude-haiku-4-5"]          = { thinking = "budget",   effort = false },
 }
--- An unknown model is assumed to be NEWER than the ones listed, except for
--- search, where the basic tool is the one every model has ever accepted. Guess
--- forward on capabilities, backward on compatibility.
-local DEFAULT_CAPS = { thinking = "adaptive", effort = true, search = "web_search_20250305" }
+local DEFAULT_CAPS = { thinking = "adaptive", effort = true }
 
-local function capsFor(model: string): { thinking: string, effort: boolean, search: string }
+local function capsFor(model: string): { thinking: string, effort: boolean }
 	return MODEL_CAPS[model] or DEFAULT_CAPS
 end
 
@@ -85,13 +78,13 @@ local DEFAULT_MODEL = "claude-sonnet-5"
 -- Anthropic-executed ("server") tool: the API runs the searches itself and
 -- feeds Claude the results, so there is nothing for our dispatcher to do. Note
 -- it is billed per search on top of tokens.
--- The 2026 version runs code to filter results before they land in the context
--- window. That code runs under the search tool itself, so `code_execution` must
--- NOT also be declared, two execution environments confuse the model, and this
--- harness has never declared one.
-local function webSearchTool(maxUses: number, model: string?): any
+-- Deliberately the 20250305 version and not web_search_20260209. The newer one
+-- filters results by running code under the hood, which surfaces code_execution
+-- blocks the model then tries to call web_search from, hits a limit inside, and
+-- narrates its way out of. Better search was not worth a confused agent.
+local function webSearchTool(maxUses: number): any
 	return {
-		type = capsFor(model or DEFAULT_MODEL).search,
+		type = "web_search_20250305",
 		name = "web_search",
 		max_uses = maxUses,
 	}

@@ -220,9 +220,7 @@ local function buildTools(): { any }
 	local tools = Tools.definitions()
 	local searches = Settings.webSearchMaxUses()
 	if searches > 0 then
-		-- Model-dependent: the newer search tool does not exist on every model,
-		-- so the same Settings.model() that shapes the request picks the version.
-		table.insert(tools, Wire.webSearchTool(searches, Settings.model()))
+		table.insert(tools, Wire.webSearchTool(searches))
 	end
 	return tools
 end
