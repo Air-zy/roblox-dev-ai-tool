@@ -1,4 +1,4 @@
--- Commands.luau — slash commands.
+-- Commands.luau: slash commands.
 --
 -- SLASH_COMMANDS is the single source of truth: it drives the autocomplete
 -- dropdown, /help, and the dispatch table below, so adding a command in one
@@ -10,11 +10,13 @@
 local agent = script.Parent:WaitForChild("agent")
 local ui = script.Parent:WaitForChild("ui")
 
-local OAuth = require(script.Parent:WaitForChild("auth"):WaitForChild("OAuth"))
+
 local Console = require(ui:WaitForChild("Console"))
 local Settings = require(ui:WaitForChild("Settings"))
 local Sessions = require(ui:WaitForChild("Sessions"))
-local Claude = require(agent:WaitForChild("Claude"))
+local Provider = require(agent:WaitForChild("Provider"))
+local Auth = Provider.auth
+local Wire = Provider.wire
 local Agent = require(agent:WaitForChild("Agent"))
 local Terminal = require(script.Parent:WaitForChild("fs"):WaitForChild("Terminal"))
 local Tools = require(agent:WaitForChild("Tools"))
@@ -29,9 +31,7 @@ function Commands.Initialize(terminal: any, settingsToggle: ((boolean?) -> ())?)
 	openSettings = settingsToggle
 end
 
--- =============================================================================
 -- Handlers
--- =============================================================================
 local handlers: { [string]: (string?, string) -> () } = {}
 
 handlers["/help"] = function()
@@ -41,7 +41,7 @@ handlers["/help"] = function()
 	end
 	Console.appendLine("", "info")
 	Console.appendLine("Claude's tools:", "info")
-	-- Both lines are derived, not hand-written — which is how the old list ended
+	-- Both lines are derived, not hand-written, which is how the old list ended
 	-- up advertising eleven shell commands out of twenty-six, and why the tool
 	-- line now comes from the registry rather than a literal that goes stale the
 	-- moment someone drops a file into tools/.
@@ -57,13 +57,13 @@ handlers["/help"] = function()
 end
 
 handlers["/login"] = function()
-	if OAuth.isLoggedIn() then
+	if Auth.isLoggedIn() then
 		Console.appendLine("Already logged in. Use /logout first.", "info")
 		return
 	end
 	Console.appendLine("Starting OAuth login…", "info")
 	task.spawn(function()
-		local ok, result = pcall(OAuth.startLogin)
+		local ok, result = pcall(Auth.startLogin)
 		if not ok then
 			Console.appendLine("Failed: " .. tostring(result), "error")
 			return
@@ -84,7 +84,7 @@ handlers["/code"] = function(_, raw)
 	end
 	Console.appendLine("Exchanging code…", "info")
 	task.spawn(function()
-		local ok, err = OAuth.completeLogin(code)
+		local ok, err = Auth.completeLogin(code)
 		if ok then
 			Console.appendLine("Login successful!", "assistant")
 		else
@@ -94,14 +94,14 @@ handlers["/code"] = function(_, raw)
 end
 
 handlers["/logout"] = function()
-	OAuth.logout()
+	Auth.logout()
 	Agent.reset()
 	Console.appendLine("Logged out.", "info")
 end
 
 handlers["/status"] = function()
-	if OAuth.isLoggedIn() then
-		local expiry = OAuth.tokenExpiry()
+	if Auth.isLoggedIn() then
+		local expiry = Auth.tokenExpiry()
 		local expiryText = "unknown"
 		if expiry then
 			expiryText = string.format("~%d min left", math.max(0, math.floor((expiry - os.time()) / 60)))
@@ -117,13 +117,13 @@ end
 
 handlers["/model"] = function(arg)
 	if not arg or arg == "" then
-		for _, entry in ipairs(Claude.MODELS) do
+		for _, entry in ipairs(Wire.MODELS) do
 			local marker = (entry.id == Settings.model()) and " *" or ""
 			Console.appendLine(string.format("  %-30s %s%s", entry.id, entry.label, marker), "info")
 		end
 		return
 	end
-	for _, entry in ipairs(Claude.MODELS) do
+	for _, entry in ipairs(Wire.MODELS) do
 		if entry.id == arg or entry.id:find(arg, 1, true) then
 			Settings.setModel(entry.id)
 			Console.appendLine("Model: " .. entry.id, "info")
@@ -146,7 +146,7 @@ end
 
 -- Read-only passthrough to the terminal Claude uses. The whole line goes through
 -- Terminal:shell, so quoting, flags, globs and `;` all behave exactly as they do
--- for Claude — there is no second parser here to drift from the first.
+-- for Claude, there is no second parser here to drift from the first.
 --
 -- The read-only check lives in Terminal, next to the handler table that knows
 -- which commands mutate, and it is applied per command rather than per line, so
@@ -167,9 +167,7 @@ handlers["/settings"] = function()
 	if openSettings then openSettings(true) end
 end
 
--- =============================================================================
 -- Registry + dispatch
--- =============================================================================
 Commands.SLASH_COMMANDS = {
 	{ cmd = "/login",    desc = "Start OAuth login flow" },
 	{ cmd = "/code",     desc = "Complete login with pasted code" },

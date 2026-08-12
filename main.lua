@@ -1,5 +1,5 @@
 --!strict
--- Claude Code for Roblox — plugin entry point.
+-- Claude Code for Roblox, plugin entry point.
 --
 -- This file does plugin setup and nothing else: widget, toolbar, the input row,
 -- and wiring the modules together. Rendering lives in Console, formatting in
@@ -14,14 +14,16 @@ local RunService = game:GetService("RunService")
 -- reaches for a folder it does not live in when it genuinely crosses layers,
 -- which is why this is the only file that names all four.
 local agent = script:WaitForChild("agent")
-local auth  = script:WaitForChild("auth")
-local fs    = script:WaitForChild("fs")
+local util  = script:WaitForChild("util")
+local fs     = script:WaitForChild("fs")
+local studio = script:WaitForChild("studio")
 local ui    = script:WaitForChild("ui")
 
-local Sha256   = require(auth:WaitForChild("Sha256"))   :: any
-local OAuth    = require(auth:WaitForChild("OAuth"))    :: any
-local Claude   = require(agent:WaitForChild("Claude"))  :: any
-local Props    = require(fs:WaitForChild("Props"))      :: any
+local Sha256   = require(util:WaitForChild("Sha256"))   :: any
+local Provider = require(agent:WaitForChild("Provider")) :: any
+local Auth     = Provider.auth
+local Wire     = Provider.wire
+local Props    = require(studio:WaitForChild("Props"))  :: any
 local Fs       = require(fs:WaitForChild("Fs"))         :: any
 local Terminal = require(fs:WaitForChild("Terminal"))   :: any
 local Theme    = require(ui:WaitForChild("Theme"))
@@ -34,8 +36,7 @@ local Commands = require(script:WaitForChild("Commands"))
 
 local make = Theme.make
 
-OAuth.Initialize(plugin)
-Claude.Initialize(OAuth)
+Provider.Initialize(plugin)
 Settings.Initialize(plugin)
 Sessions.Initialize(plugin)
 
@@ -44,11 +45,9 @@ local term = Terminal.new(game)
 -- itself; keeps the dependency pointing one way.
 Terminal.setRunGuard(Settings.allowRun)
 
--- =============================================================================
 -- Widget + toolbar
--- =============================================================================
--- Float, not Bottom: there is no dock state for the centre viewport — Studio
--- only docks to the four edges — so a floating window over the 3D view is as
+-- Float, not Bottom: there is no dock state for the centre viewport. Studio
+-- only docks to the four edges, so a floating window over the 3D view is as
 -- close as the API gets to "where the game world is".
 --
 -- initEnabled is FALSE. It is not just a first-run preference: a widget created
@@ -70,7 +69,7 @@ widget.Title = "Claude Code"
 -- DockWidgetPluginGui defaults to ZIndexBehavior.Global, where ZIndex is compared
 -- across the entire GUI rather than among siblings. Under Global, a child that
 -- doesn't set ZIndex sits at 1 and renders BEHIND any ancestor with a higher
--- value — which is why the settings card hid its own contents. Sibling makes
+-- value: which is why the settings card hid its own contents. Sibling makes
 -- layering follow the hierarchy, so a child always draws above its parent and no
 -- widget has to hand-pick a number.
 widget.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -86,8 +85,8 @@ widget:GetPropertyChangedSignal("Enabled"):Connect(function()
 end)
 toggleButton:SetActive(widget.Enabled)
 
--- Edit-mode only. The plugin keeps running through a playtest — that is why the
--- widget used to sit over the game — so the run state has to be watched, not
+-- Edit-mode only. The plugin keeps running through a playtest, that is why the
+-- widget used to sit over the game, so the run state has to be watched, not
 -- just read once at load. IsEdit() is the inverse of IsRunning() except while
 -- paused, when both are false; IsRunning() is the one that stays true through a
 -- pause, which is what "still playtesting" means here.
@@ -119,9 +118,7 @@ task.spawn(function()
 	end
 end)
 
--- =============================================================================
 -- Chrome
--- =============================================================================
 local root = make("Frame", {
 	Name = "Root",
 	Parent = widget,
@@ -155,7 +152,7 @@ local sessionsButton = make("TextButton", {
 -- and a second copy inside it only costs header width.
 -- Nothing else lives in this bar. The model/effort readout moved to a chip in
 -- the input row that also SETS the model, and the gear moved to the bottom of
--- the sessions drawer — a status line you cannot act on is not worth a corner.
+-- the sessions drawer, a status line you cannot act on is not worth a corner.
 -- No rule under the bar either: the header is empty enough that a divider only
 -- draws a line across nothing.
 
@@ -218,7 +215,7 @@ stopButton.MouseButton1Click:Connect(function()
 end)
 
 -- The model chip sits at the right of the input row; while streaming, Stop takes
--- that corner and the chip slides left of it rather than disappearing — which
+-- that corner and the chip slides left of it rather than disappearing, which
 -- model is answering is exactly what you want to read mid-turn. Replaces the old
 -- header status line, which spent a quarter of the header saying something
 -- nothing could act on.
@@ -282,7 +279,7 @@ local inputBox = make("TextBox", {
 	-- Off deliberately, and it is what makes Shift+Enter possible at all. With
 	-- MultiLine on, the box swallows Enter to insert its own newline and never
 	-- reports the key: FocusLost doesn't fire, no InputBegan anywhere in the
-	-- widget fires either (measured — see the FocusLost handler), so Enter and
+	-- widget fires either (measured, see the FocusLost handler), so Enter and
 	-- Shift+Enter arrive byte-identical and there is nothing left to tell them
 	-- apart. Off, Enter comes back as an event carrying its modifiers, and the
 	-- newline is inserted by hand there instead.
@@ -301,7 +298,7 @@ make("UIPadding", { Parent = inputBox, PaddingTop = UDim.new(0, 8), PaddingBotto
 --
 -- Guarded on the height actually changing. AbsoluteSize fires on width too, and
 -- on recomputes that land on the same value, so an unguarded version reassigned
--- the output frame's size on every keystroke — and because that frame is a
+-- the output frame's size on every keystroke, and because that frame is a
 -- ScrollingFrame with AutomaticCanvasSize, each assignment relaid out the entire
 -- console behind it. That was the stutter while typing, not a Roblox artefact.
 local lastInputHeight = -1
@@ -314,9 +311,7 @@ end
 inputRow:GetPropertyChangedSignal("AbsoluteSize"):Connect(fitOutput)
 fitOutput()
 
--- =============================================================================
 -- Settings popup
--- =============================================================================
 -- Settings shouldn't know about OAuth, the Terminal or the Agent, so the entry
 -- point supplies the status rows.
 
@@ -382,7 +377,7 @@ local function fraction(utilization: any): number?
 end
 
 local function usageRows(rows: { Settings.StatusRow })
-	if not OAuth.isLoggedIn() then return end
+	if not Auth.isLoggedIn() then return end
 	if not usageWindows then
 		table.insert(rows, { label = "Plan usage", value = usageError or "loading…" })
 		return
@@ -409,8 +404,8 @@ end
 local toggleSettings, refreshSettings = Settings.mountPanel(widget, function(): { Settings.StatusRow }
 	local rows: { Settings.StatusRow } = {}
 
-	if OAuth.isLoggedIn() then
-		local expiry = OAuth.tokenExpiry()
+	if Auth.isLoggedIn() then
+		local expiry = Auth.tokenExpiry()
 		local detail = "yes"
 		if expiry then
 			detail = string.format("yes · ~%d min", math.max(0, math.floor((expiry - os.time()) / 60)))
@@ -423,7 +418,7 @@ local toggleSettings, refreshSettings = Settings.mountPanel(widget, function(): 
 	usageRows(rows)
 	-- Model, effort, web search and run-code are NOT repeated here: each has a
 	-- dropdown a few rows down showing the same value, and the console header
-	-- already carries model · effort.
+	-- already carries model . effort.
 	table.insert(rows, { label = "Working dir", value = term:pwd() })
 	table.insert(rows, { label = "Messages", value = tostring(#Agent.conversation()) })
 	local usage = Agent.usage()
@@ -438,11 +433,11 @@ end)
 -- synchronous status provider above. Fetch on open, redraw when it lands.
 local USAGE_MAX_AGE = 60
 local function refreshUsage()
-	if usageInFlight or not OAuth.isLoggedIn() then return end
+	if usageInFlight or not Auth.isLoggedIn() then return end
 	if usageWindows and os.clock() - usageFetchedAt < USAGE_MAX_AGE then return end
 	usageInFlight = true
 	task.spawn(function()
-		local windows, err = OAuth.fetchUsage()
+		local windows, err = Auth.fetchUsage()
 		usageInFlight = false
 		if windows then
 			usageWindows = windows
@@ -456,9 +451,7 @@ local function refreshUsage()
 	end)
 end
 
--- =============================================================================
 -- Sessions drawer
--- =============================================================================
 -- A drawer, not a popup: it stays until the same button closes it, and the
 -- console is moved over rather than covered. Sessions owns the panel; the shift
 -- is the entry point's business, since it is the only thing that knows how the
@@ -478,16 +471,14 @@ sessionsButton.MouseButton1Click:Connect(function()
 	root.Size = UDim2.new(1, -sidebarOffset, 1, 0)
 end)
 
--- =============================================================================
 -- Model picker
--- =============================================================================
 -- The same list the settings panel offers, in a popup over the input row, so
 -- switching model is one click from where you type instead of three from a
 -- panel. Both write the same setting; neither is the source of truth.
 --
 -- The registry labels ("Claude Sonnet 5 (recommended)") are written for a
 -- settings row several times wider than anything here, and at this width they
--- truncate to "Claude Sonnet 5 (recomm…". Split them instead: the name loses the
+-- truncate to "Claude Sonnet 5 (recomm...". Split them instead: the name loses the
 -- "Claude " every entry shares, and the parenthetical becomes the dim value on
 -- the right, where the row already has a column for it.
 local function splitModel(label: string): (string, string?)
@@ -510,7 +501,7 @@ local function refreshModel()
 		'  <font color="#6B6862" size="12">%s</font>',
 		Settings.effortName():lower()
 	)
-	for _, entry in ipairs(Claude.MODELS) do
+	for _, entry in ipairs(Wire.MODELS) do
 		if entry.id == id then
 			modelButton.Text = shortModel(entry.label) .. effort
 			return
@@ -521,7 +512,7 @@ local function refreshModel()
 end
 
 -- Effort hangs off this menu rather than getting its own control, which is where
--- Claude Code puts it too — there it is a slider you nudge with left/right while
+-- Claude Code puts it too, there it is a slider you nudge with left/right while
 -- a model row is highlighted, plus a separate /effort command. A slider is a
 -- keyboard shape; with a mouse the same idea is a submenu, so the Effort row
 -- swaps this popup to a second page and back.
@@ -664,7 +655,7 @@ local function drawPopup()
 	end
 
 	local current = Settings.model()
-	for i, entry in ipairs(Claude.MODELS) do
+	for i, entry in ipairs(Wire.MODELS) do
 		-- The parenthetical rides in the trailing column rather than being dropped:
 		-- it is the only thing separating "Max only" from "fastest" at the moment
 		-- of choosing.
@@ -680,10 +671,10 @@ local function drawPopup()
 		BackgroundColor3 = Theme.BORDER,
 		BorderSizePixel = 0,
 		Size = UDim2.new(1, 0, 0, 1),
-		LayoutOrder = #Claude.MODELS + 1,
+		LayoutOrder = #Wire.MODELS + 1,
 		ZIndex = 46,
 	})
-	popupRow(#Claude.MODELS + 2, "Effort", nil, Settings.effortName():lower(), true, function()
+	popupRow(#Wire.MODELS + 2, "Effort", nil, Settings.effortName():lower(), true, function()
 		effortPage = true
 		drawPopup()
 	end)
@@ -703,9 +694,7 @@ modelButton.MouseButton1Click:Connect(function()
 end)
 refreshModel()
 
--- =============================================================================
 -- Autocomplete dropdown
--- =============================================================================
 local dropdown = make("Frame", {
 	Name = "AutocompleteDropdown",
 	Parent = widget,
@@ -762,7 +751,7 @@ local function updateDropdown(filter: string)
 
 	local height = #matches * 24 + 4
 	dropdown.Size = UDim2.new(0, 320, 0, height)
-	-- Sits above the input row, whatever height the row currently is — it grows
+	-- Sits above the input row, whatever height the row currently is, it grows
 	-- with the message, so the old hardcoded 32 would put the list on top of it.
 	-- The offset keeps it over the console instead of over an open drawer.
 	dropdown.Position = UDim2.new(0, 12 + sidebarOffset, 1, -inputRow.AbsoluteSize.Y - height - 4)
@@ -778,13 +767,11 @@ inputBox:GetPropertyChangedSignal("Text"):Connect(function()
 	end
 end)
 
--- =============================================================================
 -- Input handling
--- =============================================================================
 -- The spinner runs at the bottom of the console, not in the input. It used to
 -- take over the placeholder with TextEditable off, which meant a turn you were
 -- waiting on also cost you the ability to type the next one. The box stays
--- editable and keeps its own text; only SENDING is blocked while busy — see the
+-- editable and keeps its own text; only SENDING is blocked while busy, see the
 -- Enter handler.
 --
 -- The idle edge is also where the session is written to disk: it fires on a
@@ -808,7 +795,7 @@ local function submit(text: string)
 	inputBox.Text = ""
 	if text:gsub("%s+", "") == "" then return end
 	if not Commands.handle(text) then
-		Agent.send(text, OAuth.isLoggedIn)
+		Agent.send(text, Auth.isLoggedIn)
 	end
 	-- `/model` changes it from under the chip.
 	refreshModel()
@@ -822,7 +809,7 @@ end
 -- dead while the box holds focus: UserInputService (which the Studio widget docs
 -- say outright expects the game window), GuiObject.InputBegan on the box, on
 -- `root`, and on a transparent catcher frame across the whole widget, and
--- IsKeyDown along with them. Not one key event, ever — so Shift can only be read
+-- IsKeyDown along with them. Not one key event, ever, so Shift can only be read
 -- off the InputObject that FocusLost hands back, at the instant it hands it back.
 --
 -- CursorPosition reads -1 as soon as focus goes, and FocusLost is exactly that
@@ -833,7 +820,7 @@ inputBox:GetPropertyChangedSignal("CursorPosition"):Connect(function()
 end)
 
 inputBox.FocusLost:Connect(function(enterPressed: boolean, cause: InputObject?)
-	-- Esc gives up focus and hands over the key that did it — the only way a
+	-- Esc gives up focus and hands over the key that did it, the only way a
 	-- cancel from the keyboard reaches this plugin while you are typing.
 	if cause and cause.KeyCode == Enum.KeyCode.Escape then
 		if Agent.isBusy() then Agent.stop() end
@@ -846,7 +833,7 @@ inputBox.FocusLost:Connect(function(enterPressed: boolean, cause: InputObject?)
 		local index = math.clamp(caretAt, 1, #text + 1)
 		-- A single-line box has nowhere to put the Return, so it leaves a space at
 		-- the caret instead. Left alone it becomes the first character of the new
-		-- line — the space this used to prepend. The caret was read before that
+		-- line: the space this used to prepend. The caret was read before that
 		-- happened, so it is sitting right at `index`.
 		local tail = text:sub(index)
 		if tail:sub(1, 1) == " " then tail = tail:sub(2) end
@@ -880,9 +867,7 @@ inputBox.Focused:Connect(function()
 	modelPopup.Visible = false
 end)
 
--- =============================================================================
 -- Startup
--- =============================================================================
 task.spawn(function()
 	local SHA_VECTORS = {
 		{ input = "",    expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
@@ -901,7 +886,7 @@ task.spawn(function()
 	end
 
 	Console.appendLine("Claude Code for Roblox", "system")
-	if OAuth.isLoggedIn() then
+	if Auth.isLoggedIn() then
 		Console.appendLine("Logged in. Type /help for commands, or just start typing.", "info")
 	else
 		Console.appendLine("Not logged in. Type /login to start.", "info")
@@ -934,7 +919,7 @@ task.spawn(function()
 	if not agentOk then
 		warn("[Claude Code] Context trimming self-test FAILED: " .. tostring(agentErr))
 	end
-	local cacheOk, cacheErr = Claude.selfTest()
+	local cacheOk, cacheErr = Wire.selfTest()
 	if not cacheOk then
 		warn("[Claude Code] Prompt cache self-test FAILED: " .. tostring(cacheErr))
 	end

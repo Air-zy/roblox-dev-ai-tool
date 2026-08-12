@@ -1,9 +1,9 @@
 --!strict
--- Tools.luau — the tool registry.
+-- Tools.luau: the tool registry.
 --
 -- Every ModuleScript under `tools/` exports either one tool or an array of them:
 --   { name, description, input_schema, run(term, input) -> string }
--- Adding a tool is adding a file. Nothing else in the codebase has to change —
+-- Adding a tool is adding a file. Nothing else in the codebase has to change
 -- which is the entire reason this module exists, since the old shape needed an
 -- entry in a literal array plus a branch in an if/else chain, in the same 2500
 -- line file that also held the filesystem and the shell.
@@ -24,7 +24,7 @@ local byName: { [string]: Tool } = {}
 --
 -- The sort is NOT tidiness. Tool definitions render at the very front of the
 -- request, ahead of the system prompt and the conversation, and prompt caching
--- is a prefix match — reorder two tools and every cache_control breakpoint after
+-- is a prefix match, reorder two tools and every cache_control breakpoint after
 -- them misses, for the whole session. GetChildren() returns no guaranteed order,
 -- so without this the tool block could serialise differently between two Studio
 -- launches and quietly halve the cache hit rate.

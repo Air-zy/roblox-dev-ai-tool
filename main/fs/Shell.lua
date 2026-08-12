@@ -1,8 +1,8 @@
 --!optimize 2
--- Shell.luau — the command line: parsing, composition, and the command table.
+-- Shell.luau: the command line: parsing, composition, and the command table.
 --
 -- Split from Terminal on the seam that was already there. Terminal knows how to
--- do things to the DataModel — list a container, read a script's source, clone
+-- do things to the DataModel, list a container, read a script's source, clone
 -- an instance. This file knows how to read a line someone typed and work out
 -- which of those to call, in what order, with what plumbed into what: quoting,
 -- heredocs, `|` pipelines, `;` `&&` `||` chaining, `>` redirection.
@@ -18,12 +18,18 @@
 local Fs = require(script.Parent:WaitForChild("Fs"))
 -- Only for find's -type, which has to reject a name that is not a class BEFORE
 -- walking: IsA() returns false for an invented class rather than throwing, so an
--- unvalidated -type walks the whole subtree and reports a bare "no matches" —
+-- unvalidated -type walks the whole subtree and reports a bare "no matches"
 -- indistinguishable from a pattern that genuinely matched nothing.
-local Props = require(script.Parent:WaitForChild("Props"))
+local Props = require(script.Parent.Parent:WaitForChild("studio"):WaitForChild("Props"))
 -- The pattern engine. grep, sed and find all speak real BRE/ERE now rather than
 -- Lua patterns in a costume, and this is where that lives.
-local Regex = require(script.Parent:WaitForChild("Regex"))
+local Regex = require(script.Parent.Parent:WaitForChild("text"):WaitForChild("Regex"))
+-- The sed engine. Its handler stays here; what sed means lives in text/Sed.
+local Sed = require(script.Parent.Parent:WaitForChild("text"):WaitForChild("Sed"))
+local parseSedCommand = Sed.parseSedCommand
+local sedSelects = Sed.sedSelects
+local substitute = Sed.substitute
+local TR_ESCAPES = Sed.ESCAPES
 -- The only reach out of fs/: the shell has to know which words are tools rather
 -- than commands, so it can say so instead of reporting "unknown command".
 local Tools = require(script.Parent.Parent:WaitForChild("agent"):WaitForChild("Tools"))
@@ -36,11 +42,11 @@ local withUndo     = Fs.withUndo
 local splitPath    = Fs.splitPath
 local nameMatcher  = Fs.nameMatcher
 -- `ls` renders a script as Main.luau, so every name match has to be tried
--- against that form too — a model searching `*.luau` read it out of a listing.
+-- against that form too, a model searching `*.luau` read it out of a listing.
 -- Missing from these aliases is how `find -name` came to call a nil global.
 local displayName  = Fs.displayName
 
--- Not shell commands at all — they exist as tools, because "create an instance
+-- Not shell commands at all, they exist as tools, because "create an instance
 -- of class X" and "assign a typed property" have no bash equivalent to borrow a
 -- prior from. Naming them turns a wrong guess into one corrective turn. Asked of
 -- the registry rather than listed, so a tool added later is recognised the
@@ -56,24 +62,22 @@ local MAX_LIST = 100
 
 local Shell = {}
 
--- =============================================================================
 -- Command-line parsing
--- =============================================================================
 -- Inside double quotes bash only escapes these four; a backslash before anything
 -- else is an ordinary character. Getting that wrong is not cosmetic: `grep -nE
 -- "^\t###"` used to arrive as `^t###`, so the search ran against a pattern nobody
--- wrote and came back "no matches" — a still-broken command reading as a
+-- wrote and came back "no matches", a still-broken command reading as a
 -- verified-absent result, which is the one output there is no way to doubt.
 local DOUBLE_QUOTE_ESCAPES: { [string]: boolean } = {
 	['"'] = true, ["\\"] = true, ["$"] = true, ["`"] = true,
 }
 
 -- Split a shell-ish line into argv, honouring quotes so instance names with
--- spaces survive — `cd "My Model"` is the common case, and a plain split on
+-- spaces survive: `cd "My Model"` is the common case, and a plain split on
 -- whitespace gets it wrong on day one.
 --
 -- ponytail: not a shell. No variables, command substitution or control flow, and
--- no reason to add them — anything that needs those should use `run`. Ceiling:
+-- no reason to add them, anything that needs those should use `run`. Ceiling:
 -- the quote/escape rules are bash's, the composition is `| ; && ||` and nothing
 -- more, and a real grammar is the upgrade path if that ever stops being enough.
 --
@@ -124,7 +128,7 @@ local function tokenize(line: string): ({ string }?, string?, { [number]: boolea
 		elseif c == ";" then
 			-- Its own token even when glued to a word, so `echo foo;` is two
 			-- commands rather than one argument ending in a semicolon. A quoted
-			-- ";" never reaches here — the quote branch above claims it first.
+			-- ";" never reaches here, the quote branch above claims it first.
 			flush()
 			args[#args + 1] = ";"
 		elseif c == "|" or c == "&" then
@@ -142,7 +146,7 @@ local function tokenize(line: string): ({ string }?, string?, { [number]: boolea
 			-- an ARGUMENT separator, so a perfectly ordinary two-line tool call
 			--     ls /Workspace
 			--     cat Main.luau
-			-- ran as the single command `ls /Workspace cat Main.luau` — one
+			-- ran as the single command `ls /Workspace cat Main.luau`, one
 			-- listing, the second line silently swallowed as operands. Nothing
 			-- errored, which is what made it expensive: the model saw plausible
 			-- output and moved on. A quoted newline never reaches here, so
@@ -164,7 +168,7 @@ local function tokenize(line: string): ({ string }?, string?, { [number]: boolea
 	return args, nil, quoted
 end
 
--- What a command accepts, declared once and checked once — in runCommand,
+-- What a command accepts, declared once and checked once, in runCommand,
 -- before the handler runs, so an unknown flag fails on its own terms instead of
 -- surviving as an ignored flag and a stray positional argument.
 --
@@ -175,7 +179,7 @@ end
 --          carrying a value needed a bespoke lifter ahead of partition, so
 --          `-m N`, `-k N`, `-t SEP` and `-e PAT` each meant another one.
 --   long   a `--word` mapped to "bool", "value", or "optval" (an inline
---          `--color=auto` only — never consuming the next argument, which would
+--          `--color=auto` only, never consuming the next argument, which would
 --          eat the path)
 --   why    the reason a flag CANNOT exist against a DataModel. The refusal then
 --          names it instead of listing what IS allowed and leaving the caller to
@@ -220,7 +224,7 @@ local EMPTY_SPEC: FlagSpec = {}
 --
 -- Without a spec every flag is taken on faith, which is how an unimplemented
 -- flag became a silent wrong answer: `grep -A 3 pat f` put -A in the set nobody
--- read, left `3` as a positional, and reported `no child named "3"` — an error
+-- read, left `3` as a positional, and reported `no child named "3"`, an error
 -- naming the argument for the absence of the flag. See SPECS, where every
 -- command declares its own.
 local function partition(argv: { string }, spec: FlagSpec?):
@@ -229,7 +233,7 @@ local function partition(argv: { string }, spec: FlagSpec?):
 	local values: { [string]: { string } } = {}
 	local operands: { string } = {}
 	local cmd = argv[1] or "?"
-	-- No spec means "not checked here" — `find` parses its own GNU-style long
+	-- No spec means "not checked here": `find` parses its own GNU-style long
 	-- options and refuses unknown ones itself, so the gate must let them past.
 	local checked = spec ~= nil
 	local s = spec or EMPTY_SPEC
@@ -347,8 +351,8 @@ local function partition(argv: { string }, spec: FlagSpec?):
 	return flags, values, operands, nil
 end
 
--- The last value given for a flag. Repeating one is legal — `grep -e a -e b`
--- reads every occurrence out of `values` directly — and where repetition is
+-- The last value given for a flag. Repeating one is legal: `grep -e a -e b`
+-- reads every occurrence out of `values` directly, and where repetition is
 -- meaningless the last wins, as it does in bash.
 local function valueOf(values: { [string]: { string } }, flag: string): string?
 	local list = values[flag]
@@ -367,7 +371,7 @@ local function takeCount(operands: { string }): (string?, number?)
 	local count: number? = nil
 	for _, operand in ipairs(operands) do
 		-- `-20` means twenty lines, not minus twenty, so the flag form has to be
-		-- checked before tonumber — which would happily hand back a negative and
+		-- checked before tonumber, which would happily hand back a negative and
 		-- turn `head -20 x` into empty output.
 		local number = tonumber(operand:match("^%-(%d+)$") or "") or tonumber(operand)
 		if number and number > 0 then
@@ -398,7 +402,7 @@ end
 -- one apostrophe in a comment would otherwise blow up the quote tracker.
 --
 -- There is no parameter expansion here, so `<< EOF` and `<< 'EOF'` mean exactly
--- the same thing — the distinction that makes them differ in bash doesn't exist.
+-- the same thing, the distinction that makes them differ in bash doesn't exist.
 -- `<<-` strips leading tabs from the body and the terminator, as bash does.
 local function extractHeredoc(raw: string): (string, string?, string?)
 	local head, dash, quote, delim, tail =
@@ -455,8 +459,8 @@ local DEV_NULL = "/dev/null"
 
 -- Pull redirection out of argv: `> path`, `>> path`, glued or spaced.
 --
--- `2>` and `&>` aim at a stderr stream that does not exist here — errors come
--- back as ordinary output — so they are dropped. Without that, `2>/dev/null` is
+-- `2>` and `&>` aim at a stderr stream that does not exist here, errors come
+-- back as ordinary output, so they are dropped. Without that, `2>/dev/null` is
 -- not a redirect token at all (it starts with a digit) and falls through as a
 -- positional argument, which is how `find x 2>/dev/null` ends up searching for
 -- an instance named "2>/dev/null" and reporting no matches.
@@ -508,48 +512,12 @@ local UNSUPPORTED: { [string]: string } = {
 	xargs = "no xargs; pipe into grep/head/tail/wc/sort/uniq/sed/tr instead",
 }
 
--- Rojo's suffix convention, which is the one Roblox developers already have in
--- their fingers, and the only way `touch` and `> path` can pick between three
--- script classes without guessing. No suffix means ModuleScript, the safe
--- default: it does nothing until something requires it.
-local TOUCH_CLASSES = {
-	{ suffix = ".server.luau", class = "Script" },
-	{ suffix = ".client.luau", class = "LocalScript" },
-}
+-- Which script class a suffix asks for. Owned by Fs, because `write` creates
+-- scripts too and the two must not drift apart.
+local classFor = Fs.classFor
 
-local function classFor(leaf: string): (string, string)
-	for _, entry in ipairs(TOUCH_CLASSES) do
-		if #leaf > #entry.suffix and leaf:sub(-#entry.suffix) == entry.suffix then
-			return entry.class, leaf:sub(1, -#entry.suffix - 1)
-		end
-	end
-	if leaf:sub(-5) == ".luau" then
-		return "ModuleScript", leaf:sub(1, -6)
-	end
-	return "ModuleScript", leaf
-end
-
--- `> path` on a path that does not exist creates the script, the way a shell
--- creates the file. Without this the most common heredoc there is — writing a
--- new module — would fail on resolve, which is not what the model asked for.
-local function ensureScript(self: any, path: string): (Instance?, string?)
-	local existing = self:resolve(path)
-	if existing then
-		return existing, nil
-	end
-	local parentPath, leaf = splitPath(path)
-	local parent, parentErr = self:resolve(parentPath)
-	if not parent then
-		return nil, parentErr
-	end
-	local class, name = classFor(leaf)
-	return withUndo("Claude: create " .. name, function()
-		local inst = Instance.new(class)
-		inst.Name = name
-		inst.Parent = parent
-		return inst
-	end)
-end
+-- `> path` on a missing path creates the script; so does the `write` tool. One
+-- implementation, on Terminal, see Terminal:ensureScript.
 
 -- `&&` and `||` need to know which returned strings were failures. A flag set
 -- at the point of failure is honest about it; sniffing for a "cat: " prefix
@@ -561,7 +529,7 @@ local function fail(prefix: string, err: any): string
 end
 
 local function applyRedirect(self: any, path: string, content: string, append: boolean): string
-	local target, err = ensureScript(self, path)
+	local target, err = self:ensureScript(path)
 	if not target then
 		return fail("bash", err)
 	end
@@ -580,13 +548,13 @@ local function applyRedirect(self: any, path: string, content: string, append: b
 end
 
 -- The flag spec for each command. Declared here rather than beside runCommand so
--- it sits next to the handlers that read it — a letter declared and never read
+-- it sits next to the handlers that read it, a letter declared and never read
 -- is the `rm -rf` bug, where the flag parsed, was dropped on the floor, and the
 -- command did something other than what was asked with nothing in the output to
 -- say so. selfTest asserts every declared letter is reachable.
 --
 -- A command absent from this table is unchecked. An empty spec means "takes no
--- flags", which is a real answer and not the same as being absent — `cat -A`
+-- flags", which is a real answer and not the same as being absent: `cat -A`
 -- should say so rather than quietly ignore the flag.
 -- Reasons that come up on more than one command, so the wording cannot drift.
 local NO_OWNER = "and an Instance has no owner — nothing in the DataModel records who made it"
@@ -651,7 +619,7 @@ local SPECS: { [string]: FlagSpec } = {
 	grep = {
 		-- -r/-R and -F are accepted because they are already what this grep does:
 		-- it always walks descendants, and it always matches literal text unless
-		-- -E/-P is given. -a likewise — there is no binary file here to skip.
+		-- -E/-P is given. -a likewise, there is no binary file here to skip.
 		bool = "acEFhHiLlnoPqrRsvwx",
 		value = "ABCem",
 		long = { ["--include"] = "value", ["--exclude"] = "value", ["--color"] = "optval",
@@ -737,7 +705,7 @@ local SPECS: { [string]: FlagSpec } = {
 			-- The one refusal here that is about THIS program rather than about the
 			-- DataModel: a script's .Source really does change and
 			-- GetPropertyChangedSignal would see it. What rules it out is that
-			-- following never RETURNS — it would hold the turn and one of the six
+			-- following never RETURNS, it would hold the turn and one of the six
 			-- available WebStreamClients open until something else killed it.
 			-- Yielding itself is fine here; blocking forever is not.
 			["-f"] = "follows a file as it grows, and a command that never returns would " ..
@@ -778,8 +746,7 @@ local SPECS: { [string]: FlagSpec } = {
 	whoami = {},
 }
 -- Aliases share their target's spec rather than restating it, so a flag added to
--- one is available on the other by construction. `file` is `stat` under another
--- name, which is why it takes stat's -c and not file(1)'s own flags.
+-- one is available on the other by construction.
 SPECS.egrep = SPECS.grep
 SPECS.fgrep = SPECS.grep
 -- rmdir is NOT rm with another name: it takes -p (climb and remove emptied
@@ -788,10 +755,13 @@ SPECS.rmdir = {
 	bool = "pv",
 	long = { ["--parents"] = "bool:-p", ["--verbose"] = "bool:-v" },
 }
-SPECS.file = SPECS.stat
+-- `file` used to BE `stat`, which meant `file x` answered a one-line question
+-- with eight lines of metadata and accepted stat's -c. It now has its own
+-- handler and, like file(1), its own flags: -b drops the leading "path: ".
+SPECS.file = { bool = "b" }
 
 -- The parse every handler uses. runCommand has already run this exact call as a
--- pre-dispatch gate, so the error return cannot fire here — re-running it beats
+-- pre-dispatch gate, so the error return cannot fire here, re-running it beats
 -- threading four values through every handler signature.
 local function parse(argv: { string }): ({ [string]: boolean }, { [string]: { string } }, { string })
 	local flags, values, operands = partition(argv, SPECS[argv[1]])
@@ -814,12 +784,8 @@ local TR_CLASSES: { [string]: string } = {
 }
 
 -- Escape sequences tr accepts inside a set. Without these `tr -d '\n'` deleted a
--- backslash and the letter n — two characters that are almost never in the
--- input — so the command reported success and changed nothing.
-local TR_ESCAPES: { [string]: string } = {
-	n = "\n", t = "\t", r = "\r", f = "\f", v = "\v", a = "\a", b = "\b",
-	["\\"] = "\\", ["-"] = "-", ["["] = "[", ["]"] = "]",
-}
+-- backslash and the letter n, two characters that are almost never in the
+-- input: so the command reported success and changed nothing.
 
 local function expandTrSet(s: string): string
 	local expanded = {}
@@ -885,7 +851,7 @@ HANDLERS.pwd = function(self)
 	return self:pwd()
 end
 
--- whoami — who is running this, and where.
+-- whoami: who is running this, and where.
 --
 -- Marginal on its own, but it is a reflex command, it was answering "unknown
 -- command", and the place ids are genuinely worth having: an unpublished place
@@ -894,7 +860,7 @@ end
 -- its code.
 --
 -- Deliberately no username lookup. GetNameFromUserIdAsync is a network round
--- trip, and this command exists to be the cheap one — a name is not worth
+-- trip, and this command exists to be the cheap one, a name is not worth
 -- turning "who am I" into a request that can hang.
 --
 -- It is NOT unsafe to yield here, which an earlier note in this spot claimed.
@@ -942,7 +908,7 @@ HANDLERS.echo = function(_, argv)
 		end)
 	end
 	-- -n suppresses the trailing newline. There is no trailing newline on a
-	-- returned string here to suppress, so it is accepted and changes nothing —
+	-- returned string here to suppress, so it is accepted and changes nothing
 	-- which is the true answer, not a silently dropped flag.
 	return text
 end
@@ -972,7 +938,7 @@ local function lsSort(rows: { any }, flags: { [string]: boolean })
 		end
 	elseif flags["-t"] or flags["-c"] then
 		-- An unobserved instance sorts LAST rather than first. It is not "the
-		-- oldest" — it is unranked, and burying it under the ones we can actually
+		-- oldest", it is unranked, and burying it under the ones we can actually
 		-- date is the only placement that does not assert a time we do not have.
 		rank = function(row)
 			return -(Fs.mtime(row.inst) or -math.huge)
@@ -1009,7 +975,7 @@ local function lsRow(row: any, flags: { [string]: boolean }): string
 		name = string.format("%q", name)
 	end
 	-- -F classifies everything, -p only containers. A script is a FILE here, so
-	-- it never takes the "/" — it takes "*" when it will actually run.
+	-- it never takes the "/", it takes "*" when it will actually run.
 	if flags["-F"] or flags["-p"] then
 		if not isScript(inst) then
 			name ..= "/"
@@ -1056,7 +1022,7 @@ HANDLERS.ls = function(self, argv)
 	local target, glob = splitGlob(operands[1])
 	local matcher = glob and nameMatcher(glob) or nil
 
-	-- -d is about the container itself, not its contents — the only way to
+	-- -d is about the container itself, not its contents, the only way to
 	-- `ls -l` one instance without listing everything inside it. With a glob
 	-- there is nothing to descend into anyway, so the ordinary path covers it.
 	if flags["-d"] and not glob then
@@ -1069,12 +1035,12 @@ HANDLERS.ls = function(self, argv)
 
 	-- find and grep stop at a cap; ls did not, so `ls /Workspace` in a place with
 	-- a few thousand parts returned every one of them and only `forModel`'s
-	-- 100 000-char cut stopped it — by which point the listing is ~25 000 tokens
+	-- 100 000-char cut stopped it, by which point the listing is ~25 000 tokens
 	-- that every later turn re-sends. One budget across the whole walk, because
 	-- what costs is the size of the tool result, not of any single listing.
 	--
 	-- The ROOT is exempt. That cap is for a container holding thousands of parts;
-	-- the service list is a different animal — the engine bounds it, and every
+	-- the service list is a different animal, the engine bounds it, and every
 	-- entry is load-bearing, because a service you cannot see is a whole subtree
 	-- you cannot reach. Studio instantiates well over a hundred services, and
 	-- rows are sorted before the cut, so `ls /` was dropping the alphabetical
@@ -1102,8 +1068,8 @@ HANDLERS.ls = function(self, argv)
 		for _, row in ipairs(rows) do
 			if budget <= 0 then
 				skipped += 1
-				-- Remember WHICH entry the cut started at. A bare "… 23 more"
-				-- reads as "the boring tail" — naming the first casualty is what
+				-- Remember WHICH entry the cut started at. A bare "... 23 more"
+				-- reads as "the boring tail", naming the first casualty is what
 				-- turns it into "Workspace is missing", which is the difference
 				-- between a truncation you can reason about and one you cannot.
 				firstDropped = firstDropped or row.name
@@ -1338,7 +1304,7 @@ end
 --
 -- Declared up here rather than beside its first user: head, tail and wc reach
 -- for it too now, and a local defined further down the file is not in scope
--- above it — it would read as a nil global and throw at call time.
+-- above it, it would read as a nil global and throw at call time.
 local function textInput(self: any, operands: { string }, stdin: string?): (string?, string?)
 	local path = operands[1]
 	if path then
@@ -1354,7 +1320,7 @@ end
 
 -- The same thing for EVERY operand, not just the first. head, tail and wc all
 -- took one path and dropped the rest on the floor, so `head a.luau b.luau`
--- returned the first file's lines and said nothing about the second — a partial
+-- returned the first file's lines and said nothing about the second, a partial
 -- answer shaped exactly like a complete one.
 export type TextInput = { path: string?, text: string }
 
@@ -1381,7 +1347,7 @@ local function inputs(self: any, operands: { string }, stdin: string?): ({ TextI
 end
 
 -- Join per-file results with the `==> path <==` header bash prints whenever
--- there is more than one file — and never for a single file or a stream, where
+-- there is more than one file, and never for a single file or a stream, where
 -- it would be noise. -v forces it on, -q forces it off.
 local function joinFiles(parts: { { path: string?, body: string } },
 	force: boolean?, quiet: boolean?): string
@@ -1410,13 +1376,13 @@ local function lineSpec(text: string?): (number?, string)
 end
 
 -- `-c` counts BYTES, not lines. It used to land in the flag set that nobody
--- read, so `head -c 50 f` silently ran as `head f` and returned ten lines —
+-- read, so `head -c 50 f` silently ran as `head f` and returned ten lines
 -- roughly 1500 characters to someone probing a large file specifically to avoid
 -- flooding their context. A silent wrong answer on the one command whose whole
 -- purpose is to limit output.
 -- head and tail differ only in which end they cut from, so they are one function
--- with a flag. Both used to be implemented TWICE — once in Terminal for a file
--- operand and once here for piped input — which is how they came to disagree
+-- with a flag. Both used to be implemented TWICE, once in Terminal for a file
+-- operand and once here for piped input, which is how they came to disagree
 -- about -c and about multiple operands.
 local function headTail(self: any, cmd: string, argv: { string }, stdin: string?): string
 	local flags, values, operands = parse(argv)
@@ -1429,7 +1395,7 @@ local function headTail(self: any, cmd: string, argv: { string }, stdin: string?
 	for _, operand in ipairs(operands) do
 		-- Zero is a COUNT, not a path. `n > 0` here meant `head -0` fell through
 		-- to the path list and came back "no child named -0", while -1 and up
-		-- worked — the one number where asking for nothing is a real request.
+		-- worked: the one number where asking for nothing is a real request.
 		local flagForm = operand:match("^%-(%d+)$")
 		local n = tonumber(flagForm or operand)
 		if n and n >= 0 and not bare then
@@ -1485,7 +1451,7 @@ HANDLERS.tail = function(self, argv, stdin)
 	return headTail(self, "tail", argv, stdin)
 end
 
--- wc returned "238 lines" — prose, not a number, so it composed with nothing and
+-- wc returned "238 lines", prose, not a number, so it composed with nothing and
 -- `for f in ...; wc -l < $f` produced a column of sentences. The flags were
 -- ignored entirely on a file operand, which is the same shape of bug as head -c.
 --
@@ -1506,7 +1472,7 @@ HANDLERS.wc = function(self, argv, stdin)
 	end
 
 	-- One row per file plus a total, the way wc does it. Asked for one count you
-	-- get one number: it used to return "238 lines" — prose, which composes with
+	-- get one number: it used to return "238 lines", prose, which composes with
 	-- nothing, so `wc -l < f` produced a sentence where a number was expected.
 	local function row(text: string): (number, number, number, number, number)
 		local lines = #splitLines(text)
@@ -1579,7 +1545,7 @@ HANDLERS.du = function(self, argv)
 	end
 	local maxDepth = numberOf(values, "-d") or (flags["-s"] and 0 or 1)
 
-	-- Size is descendant count, or source bytes for a script — the same measure
+	-- Size is descendant count, or source bytes for a script, the same measure
 	-- `ls -l` and `find -size` use, so the three cannot disagree about one
 	-- instance. -h only scales the byte form: "1.2K descendants" is not a unit.
 	local function render(size: number, isBytes: boolean): string
@@ -1612,7 +1578,7 @@ HANDLERS.du = function(self, argv)
 		return size
 	end
 
-	-- Children first, deepest-last, then the target itself — du's own order, and
+	-- Children first, deepest-last, then the target itself, du's own order, and
 	-- the reason the total lands at the bottom where it is read.
 	for _, child in ipairs(target:GetChildren()) do
 		total += walk(child, 1)
@@ -1670,7 +1636,7 @@ local FIND_VALUE_TESTS: { [string]: boolean } = {
 
 -- Named rather than skipped. Silently ignoring -maxdepth meant returning the
 -- whole subtree to someone who asked for three levels, with nothing in the
--- output to say so — and the same is true of every filter below.
+-- output to say so, and the same is true of every filter below.
 local FIND_UNSUPPORTED: { [string]: string } = {
 	["-exec"] = "runs a command per result, and there is no process to run — " ..
 		"use the `run` tool, or pipe find's output into grep",
@@ -1728,7 +1694,7 @@ HANDLERS.find = function(self, argv)
 		if arg == "-name" or arg == "-iname" then
 			-- Matched against the DISPLAYED name as well as the real one. `ls`
 			-- prints scripts as `Main.luau`, so a model that read a listing will
-			-- reasonably search for `*.luau` — and no instance name has ever
+			-- reasonably search for `*.luau`, and no instance name has ever
 			-- contained that suffix, so matching only .Name meant the most natural
 			-- search in the whole harness silently returned nothing.
 			local matches = nameMatcher(value :: string)
@@ -1763,7 +1729,7 @@ HANDLERS.find = function(self, argv)
 			-- just as often, and every Instance can hold children, so `-type d`
 			-- matching Folder alone reported nothing at all in most real places.
 			-- In a filesystem metaphor the honest split is the one that already
-			-- exists — a script is a file, everything else you can descend into.
+			-- exists: a script is a file, everything else you can descend into.
 			local class = value :: string
 			local negate = false
 			if class == "f" then
@@ -1792,8 +1758,8 @@ HANDLERS.find = function(self, argv)
 			add(function(inst)
 				local size, isBytes = Fs.size(inst)
 				if unit then
-					-- A unit is a statement about bytes, so a container — whose
-					-- size is a count — cannot satisfy it.
+					-- A unit is a statement about bytes, so a container, whose
+					-- size is a count, cannot satisfy it.
 					return isBytes and compare(size / unit)
 				end
 				return compare(size)
@@ -1953,7 +1919,7 @@ HANDLERS.find = function(self, argv)
 
 	if deleting then
 		-- Deepest first, so removing a parent cannot invalidate a child still on
-		-- the list — Destroy() takes the subtree with it.
+		-- the list. Destroy() takes the subtree with it.
 		table.sort(found, function(a, b)
 			return #instancePath(a) > #instancePath(b)
 		end)
@@ -1990,7 +1956,7 @@ HANDLERS.which = function(self, argv)
 	-- `which` answers "what runs when I type this", so the command table is the
 	-- only correct place to look first. It used to go straight to find(), which
 	-- searched the DataModel for an INSTANCE named "grep" and reported whichever
-	-- unrelated thing it happened to hit — an answer that looked authoritative
+	-- unrelated thing it happened to hit, an answer that looked authoritative
 	-- and was never right for the question actually being asked.
 	if HANDLERS[name] then
 		return name .. ": shell builtin"
@@ -2003,7 +1969,7 @@ HANDLERS.which = function(self, argv)
 		return fail("which", name .. ": " .. why)
 	end
 	-- Not a command. Locating an instance by that name is the only other thing
-	-- the word could mean here, so keep it — just no longer as the first answer.
+	-- the word could mean here, so keep it, just no longer as the first answer.
 	local matches = nameMatcher(name)
 	local found, err = self:find(operands[2], function(inst)
 		return matches(inst.Name) or matches(displayName(inst))
@@ -2027,7 +1993,7 @@ HANDLERS.which = function(self, argv)
 end
 
 -- Render hits: the path once per file, then `N: text` for a match and `N- text`
--- for a context line, with `--` between non-adjacent runs — grep's own
+-- for a context line, with `--` between non-adjacent runs, grep's own
 -- separators. The path is printed once for the reason ripgrep does it: DataModel
 -- paths are deep, a 40-hit grep across 6 scripts spends ~430 characters on paths
 -- this way against ~1800 flat, and a tool result is re-sent every remaining turn.
@@ -2047,7 +2013,7 @@ local function formatHits(hits: { any }, showPath: boolean, showLines: boolean, 
 		end
 		-- Only when context was asked for. Without -A/-B/-C every emitted line is
 		-- a match, and a `--` between two of them says a group ended where none
-		-- began — grep prints the separator between CONTEXT groups, not hits.
+		-- began: grep prints the separator between CONTEXT groups, not hits.
 		if gapped and previousLine and hit.line > previousLine + 1 then
 			out[#out + 1] = indent .. "--"
 		end
@@ -2081,7 +2047,7 @@ HANDLERS.grep = function(self, argv, stdin)
 
 	-- -e names a pattern explicitly, which is the only way to search for one
 	-- that starts with a dash, and it repeats. It used to be read as a synonym
-	-- for -E, so `grep -e '-foo' f` was not merely unsupported — it turned the
+	-- for -E, so `grep -e '-foo' f` was not merely unsupported, it turned the
 	-- next operand into the pattern and searched for the wrong thing.
 	local patterns: { string } = values["-e"] or {}
 	local firstOperand = 1
@@ -2101,7 +2067,7 @@ HANDLERS.grep = function(self, argv, stdin)
 	--
 	-- egrep and fgrep are DEFINITIONS, not aliases that happen to share a handler.
 	-- Sharing the function meant `egrep '[0-9]'` searched for those six characters
-	-- literally and reported no matches — which reads as "there are no digits
+	-- literally and reported no matches, which reads as "there are no digits
 	-- here". The invoked name is the only thing that tells them apart.
 	local invoked = argv[1]
 	local literal = flags["-F"] or invoked == "fgrep"
@@ -2115,12 +2081,12 @@ HANDLERS.grep = function(self, argv, stdin)
 	-- One builder, used for the real search and for the case-insensitive retry
 	-- below. They were written out twice and the retry forgot -w/-x, so a failed
 	-- `grep -w Foo` could report "3 with grep -i" from matches that -w would have
-	-- rejected — a hint pointing at a search that also finds nothing.
+	-- rejected: a hint pointing at a search that also finds nothing.
 	local function compileAll(caseInsensitive: boolean): ({ any }?, string?)
 		local out: { any } = {}
 		for index, pattern in ipairs(patterns) do
 			-- -w and -x WRAP the pattern, so a fixed-string search becomes a
-			-- pattern and the literal has to be escaped first — otherwise
+			-- pattern and the literal has to be escaped first, otherwise
 			-- `-w game.Workspace` would start matching `gameXWorkspace`.
 			--
 			-- The wrapper is written in the SAME dialect as the body. Wrapping a
@@ -2158,7 +2124,7 @@ HANDLERS.grep = function(self, argv, stdin)
 		-- Case-SENSITIVE by default, which is what grep means everywhere else.
 		-- Both sides used to be lowercased unconditionally, so a search for
 		-- `Humanoid` also returned `humanoid` and there was no way to ask for the
-		-- strict form — a wrong answer that looks exactly like a right one.
+		-- strict form, a wrong answer that looks exactly like a right one.
 		invert = flags["-v"] or false,
 		only = flags["-o"] or false,
 		before = before,
@@ -2167,7 +2133,7 @@ HANDLERS.grep = function(self, argv, stdin)
 	}
 
 	-- Counting and listing run off the hits, so they are shared between the piped
-	-- and the walked path — which had drifted before, with -c working on one and
+	-- and the walked path, which had drifted before, with -c working on one and
 	-- not the other.
 	local function countMatches(hits: { any }): number
 		local matches = 0
@@ -2180,7 +2146,7 @@ HANDLERS.grep = function(self, argv, stdin)
 	end
 
 	-- Piped in: filter the stream. A path operand still wins, the way it does in
-	-- a shell — `grep x file` ignores stdin.
+	-- a shell: `grep x file` ignores stdin.
 	if stdin and not path then
 		-- One pcall for the whole stream: the only thing that throws is the
 		-- engine's step budget, and a pattern too expensive for one line is too
@@ -2233,7 +2199,7 @@ HANDLERS.grep = function(self, argv, stdin)
 		return ""
 	end
 	if flags["-L"] then
-		-- Files WITHOUT a match, which cannot be read off the hit list — it only
+		-- Files WITHOUT a match, which cannot be read off the hit list, it only
 		-- knows about files that had one. The scope has to be walked again to
 		-- know what was searched and came back empty.
 		local withMatch: { [string]: boolean } = {}
@@ -2382,7 +2348,7 @@ HANDLERS.sort = function(self, argv, stdin)
 		return fail("sort", inputErr)
 	end
 	-- sort concatenates its inputs and sorts the whole thing, which is what
-	-- `sort a b` means — not two sorted blocks one after the other.
+	-- `sort a b` means, not two sorted blocks one after the other.
 	local lines: { string } = {}
 	for _, file in ipairs(files) do
 		for _, line in ipairs(splitLines(file.text)) do
@@ -2455,10 +2421,10 @@ HANDLERS.sort = function(self, argv, stdin)
 
 	local result = table.concat(lines, "\n")
 	-- -o writes the result to a script instead of returning it, the same way `>`
-	-- does — and through self:write, so it carries an undo recording.
+	-- does: and through self:write, so it carries an undo recording.
 	local out = valueOf(values, "-o")
 	if out then
-		local target, ensureErr = ensureScript(self, out)
+		local target, ensureErr = self:ensureScript(out)
 		if not target then
 			return fail("sort", ensureErr)
 		end
@@ -2550,7 +2516,7 @@ HANDLERS.mkdir = function(self, argv)
 	for _, dir in ipairs(operands) do
 		if dir ~= "" then
 			if flags["-p"] then
-				-- Every missing segment, in order — and -p is also mkdir's "already
+				-- Every missing segment, in order, and -p is also mkdir's "already
 				-- there is fine", so an existing path is a success, not an error.
 				local walked = dir:sub(1, 1) == "/" and "" or self:pwd()
 				for segment in dir:gmatch("[^/]+") do
@@ -2661,7 +2627,7 @@ HANDLERS.rm = function(self, argv)
 		-- and reported success.
 		--
 		-- A script is a file here and needs no flag; everything else is a
-		-- directory — the same split `-type f` / `-type d` already uses.
+		-- directory: the same split `-type f` / `-type d` already uses.
 		local doomed = self:resolve(path)
 		if doomed and not isScript(doomed) and not (flags["-r"] or flags["-R"]) then
 			local children = #doomed:GetChildren()
@@ -2688,7 +2654,7 @@ HANDLERS.rm = function(self, argv)
 end
 
 -- mv and cp differ only in whether the original survives, so they share their
--- argument handling — which is where the interesting part is.
+-- argument handling, which is where the interesting part is.
 --
 -- bash operand semantics: the LAST operand is the destination and everything
 -- before it is a source. This used to read `mv a b c` as "move a into b, rename
@@ -2737,7 +2703,7 @@ local function moveOrCopy(self: any, cmd: string, argv: { string }): string
 		end
 		-- Written out rather than as `cmd == "mv" and move(...) or copy(...)`,
 		-- which was wrong twice over: `a and b or c` yields ONE value, so `err`
-		-- was always nil and every failure reported as "cp: nil" — and when a
+		-- was always nil and every failure reported as "cp: nil", and when a
 		-- move FAILED it returned nil, so the `or` fell through and performed a
 		-- COPY instead. A refused move silently left a duplicate behind.
 		local s, err
@@ -2835,11 +2801,11 @@ end
 HANDLERS.ln = function(self, argv)
 	-- An ObjectValue is the DataModel's reference-to-another-instance, which is
 	-- as close as this tree gets to a symlink. It does not behave like one for
-	-- cd or cat — nothing resolves through it — so the result says so.
+	-- cd or cat, nothing resolves through it, so the result says so.
 	local flags, _, operands = parse(argv)
 	if not flags["-s"] then
 		-- A hard link is a second directory entry for one inode. An Instance has
-		-- exactly one Parent, so there is no second entry to make — and quietly
+		-- exactly one Parent, so there is no second entry to make, and quietly
 		-- producing an ObjectValue instead would answer a question nobody asked.
 		return fail("ln", "a hard link needs a second name for one object, and an " ..
 			"Instance has exactly one Parent. `ln -s` makes an ObjectValue pointing " ..
@@ -2883,316 +2849,6 @@ HANDLERS.ln = function(self, argv)
 	end
 	return string.format("%s -> %s (ObjectValue; nothing resolves through it)",
 		instancePath(link :: Instance), instancePath(target))
-end
-
--- =============================================================================
--- sed
--- =============================================================================
--- As much of sed as has a meaning here: substitution, transliteration, delete,
--- explicit print, quit, line numbering and the three text commands — each with
--- an optional address that is a line number, `$`, a /pattern/, or a range of
--- either. Expressions come from -e (repeatable) or the first operand and run in
--- order against every line, which is what makes `sed -e '/^%-%-/d' -e 's/a/b/'`
--- mean what it does in sed.
---
--- Reading an arbitrary window of a script is the reason addresses exist here at
--- all: it was otherwise `head -N | tail -M` and a subtraction the caller had to
--- get right every time, and getting it wrong returns a plausible block from the
--- wrong part of the file.
-type SedAddress = number | string | { pattern: string }
-type SedCommand = { from: SedAddress?, to: SedAddress?, name: string, args: any }
-
--- One endpoint of an address, starting at `at`. Returns the endpoint and the
--- position after it, or nil when there is no address here at all.
-local function parseAddressPart(expr: string, at: number, ere: boolean): (SedAddress?, number)
-	local c = expr:sub(at, at)
-	if c == "$" then
-		return "$", at + 1
-	end
-	if c == "/" then
-		local i = at + 1
-		local buf: { string } = {}
-		while i <= #expr do
-			local ch = expr:sub(i, i)
-			if ch == "\\" and expr:sub(i + 1, i + 1) == "/" then
-				buf[#buf + 1] = "/"
-				i += 2
-			elseif ch == "/" then
-				-- Compiled here rather than matched as text later: an address is a
-				-- real pattern in sed, in the same dialect as the s/// it sits
-				-- beside, and compiling once beats compiling per line.
-				local program = Regex.compile(table.concat(buf), { ere = ere })
-				if not program then
-					return nil, at
-				end
-				return { program = program }, i + 1
-			else
-				buf[#buf + 1] = ch
-				i += 1
-			end
-		end
-		return nil, at
-	end
-	local digits = expr:match("^%d+", at)
-	if digits then
-		return tonumber(digits), at + #digits
-	end
-	return nil, at
-end
-
--- sed's replacement syntax, which is not Lua's: `\1`-`\9` are the groups, `&` is
--- the whole match, and `\&` is a literal ampersand. Lua's `%1` went with the Lua
--- patterns it belonged to.
-local function expandReplacement(replacement: string, whole: string, caps: { string }): string
-	local buf: { string } = {}
-	local i = 1
-	while i <= #replacement do
-		local c = replacement:sub(i, i)
-		if c == "\\" and i < #replacement then
-			local following = replacement:sub(i + 1, i + 1)
-			local group = tonumber(following)
-			if group and group >= 1 then
-				-- An unmatched group is the empty string, as it is in sed — not an
-				-- error, and not the literal text "\1".
-				buf[#buf + 1] = caps[group] or ""
-			else
-				buf[#buf + 1] = TR_ESCAPES[following] or following
-			end
-			i += 2
-		elseif c == "&" then
-			buf[#buf + 1] = whole
-			i += 1
-		else
-			buf[#buf + 1] = c
-			i += 1
-		end
-	end
-	return table.concat(buf)
-end
-
--- One s/// pass over a line. Written out rather than handed to gsub because the
--- engine is ours now: gsub only speaks Lua patterns.
--- Returns the new text and HOW MANY replacements happened — `p` needs the count,
--- since it prints only when the line actually changed.
-local function substitute(program: any, text: string, replacement: string,
-	global: boolean, occurrence: number): (string, number)
-	local out: { string } = {}
-	local at = 1
-	local seen, changed = 0, 0
-	while at <= #text + 1 do
-		local start, finish, caps = program:find(text, at)
-		if not start then
-			break
-		end
-		seen += 1
-		-- `s/x/y/2` replaces the second match and no other; `s/x/y/2g` replaces
-		-- from the second onwards. Everything before the Nth is copied through.
-		local replace = seen >= occurrence and (global or seen == occurrence)
-		out[#out + 1] = text:sub(at, start - 1)
-		if replace then
-			out[#out + 1] = expandReplacement(replacement, text:sub(start, finish), caps)
-			changed += 1
-		else
-			out[#out + 1] = text:sub(start, finish)
-		end
-		-- An empty match consumes nothing, so it has to be stepped past by hand or
-		-- `s/x*/-/g` never terminates.
-		if (finish :: number) < start then
-			out[#out + 1] = text:sub(start, start)
-			at = start + 1
-		else
-			at = (finish :: number) + 1
-		end
-		if replace and not global then
-			break
-		end
-	end
-	out[#out + 1] = text:sub(at)
-	return table.concat(out), changed
-end
-
--- Split `expr` into its address (if any) and the command that follows.
-local function parseAddress(expr: string, ere: boolean): (SedAddress?, SedAddress?, string)
-	local from, at = parseAddressPart(expr, 1, ere)
-	if not from then
-		return nil, nil, expr
-	end
-	if expr:sub(at, at) == "," then
-		local to, after = parseAddressPart(expr, at + 1, ere)
-		if to then
-			return from, to, expr:sub(after)
-		end
-	end
-	return from, from, expr:sub(at)
-end
-
--- Split `s/a/b/flags` (or y///) on its delimiter.
---
--- A backslash is only consumed when it escapes the DELIMITER. Every other one is
--- data and has to survive intact: `\d` and `\+` mean something to the regex,
--- `\1` and `\&` to the replacement. This used to strip them all — a leftover
--- from when the replacement was Lua's `%1` and a backslash could only ever be
--- protecting a slash — so `s/(al)(pha)/\2\1/` arrived as the literal text "21"
--- and substituted that.
-local function splitDelimited(rest: string, delim: string): { string }
-	local parts: { string } = {}
-	local current: { string } = {}
-	local i = 1
-	while i <= #rest do
-		local c = rest:sub(i, i)
-		if c == "\\" then
-			local following = rest:sub(i + 1, i + 1)
-			if following == delim then
-				current[#current + 1] = following
-			else
-				current[#current + 1] = c
-				current[#current + 1] = following
-			end
-			i += 2
-		elseif c == delim then
-			parts[#parts + 1] = table.concat(current)
-			current = {}
-			i += 1
-		else
-			current[#current + 1] = c
-			i += 1
-		end
-	end
-	parts[#parts + 1] = table.concat(current)
-	return parts
-end
-
-
--- Parse one expression into a command. `extended` is -E/-r, so sed is BRE by
--- default and ERE on request — the same two dialects grep has, chosen the same
--- way. Patterns and addresses are compiled HERE rather than matched as text
--- later, so a bad one is refused before a single line runs.
-local function parseSedCommand(expr: string, extended: boolean): (SedCommand?, string?)
-	local from, to, body = parseAddress((expr:gsub("^%s+", "")), extended)
-	body = body:gsub("^%s+", "")
-	-- A reversed numeric range selects nothing. sed would print nothing and call
-	-- it a success, which is indistinguishable from "those lines were empty" —
-	-- and `10,2p` is always a typo for `2,10p`.
-	if type(from) == "number" and type(to) == "number" and (from :: number) > (to :: number) then
-		return nil, string.format("empty range: line %d comes after line %d", from, to)
-	end
-	local name = body:sub(1, 1)
-	if name == "" then
-		if from then
-			-- `sed -n '10,40'` with no command: printing is what was meant, and
-			-- guessing beats an error nobody can act on.
-			return { from = from, to = to, name = "p", args = nil }, nil
-		end
-		return nil, "empty expression"
-	end
-
-	if name == "s" or name == "y" then
-		local delim = body:sub(2, 2)
-		if delim == "" or delim:match("%s") or delim:match("%w") then
-			return nil, string.format("invalid delimiter after %s", name)
-		end
-		local parts = splitDelimited(body:sub(3), delim)
-		if #parts < 3 then
-			return nil, string.format("malformed expression, expected %s/old/new/%s",
-				name, name == "s" and "[g]" or "")
-		end
-		local pattern = parts[1]
-		local mod = parts[3] or ""
-		local args: any = { replacement = parts[2], mod = mod }
-		if name == "s" then
-			-- Suffix flags are VALIDATED and then actually READ. `p` was parsed
-			-- and dropped, so `sed -n 's/x/y/p'` — the standard "print only the
-			-- changed lines" idiom — printed nothing at all, and `s/x/y/qqqzzz`
-			-- was accepted in silence. Both are the declared-but-never-read shape
-			-- this file keeps finding.
-			local occurrence = 1
-			local digits = mod:match("%d+")
-			if digits then
-				occurrence = tonumber(digits) :: number
-				if occurrence < 1 then
-					return nil, "the number after s/// is which occurrence to replace, counting from 1"
-				end
-			end
-			for char in mod:gmatch("%D") do
-				if not ("gpiI"):find(char, 1, true) then
-					return nil, string.format("unknown flag %q after s/// — g (every match), " ..
-						"p (print when changed), i (ignore case), or a number (which occurrence)",
-						char)
-				end
-			end
-			args.global = mod:find("g", 1, true) ~= nil
-			args.print = mod:find("p", 1, true) ~= nil
-			args.occurrence = occurrence
-			-- sed is BRE by default and ERE under -E/-r, exactly as grep is.
-			local program, compileErr = Regex.compile(pattern,
-				{ ere = extended, ignoreCase = mod:find("[iI]") ~= nil })
-			if not program then
-				return nil, compileErr
-			end
-			args.program = program
-		else
-			args.pattern = pattern
-		end
-		return { from = from, to = to, name = name, args = args }, nil
-	end
-
-	if name == "d" or name == "p" or name == "q" or name == "=" then
-		return { from = from, to = to, name = name, args = nil }, nil
-	end
-
-	if name == "a" or name == "i" or name == "c" then
-		-- `a text`, and also GNU's `a\text`. The rest of the expression is data.
-		local text = body:sub(2):gsub("^\\", ""):gsub("^%s+", "")
-		return { from = from, to = to, name = name, args = text }, nil
-	end
-
-	return nil, string.format("unsupported command %q — sed here does s/// and y/// " ..
-		"substitution, d (delete), p (print), q (quit), = (line number) and " ..
-		"a/i/c (append, insert, change), each with an optional address", name)
-end
-
--- Does this command's address select line `index`? `active` carries the state of
--- a /start/,/end/ range across lines, which is the only part of matching that
--- cannot be decided from one line alone.
-local function sedSelects(command: SedCommand, index: number, line: string,
-	total: number, active: { [number]: boolean }, slot: number): boolean
-	local function endpoint(address: SedAddress?): boolean?
-		if address == nil then
-			return nil
-		end
-		if address == "$" then
-			return index == total
-		end
-		if type(address) == "number" then
-			return index == address
-		end
-		return (address :: any).program:find(line) ~= nil
-	end
-
-	if command.from == nil then
-		return true
-	end
-	-- A single address, or a numeric range, both answer from this line alone.
-	if command.from == command.to then
-		return endpoint(command.from) == true
-	end
-	if type(command.from) == "number" and type(command.to) == "number" then
-		return index >= (command.from :: number) and index <= (command.to :: number)
-	end
-	-- A pattern range: on until the closing address matches.
-	if active[slot] then
-		if endpoint(command.to) == true then
-			active[slot] = false
-		end
-		return true
-	end
-	if endpoint(command.from) == true then
-		-- A one-line range is legal: /a/,/a/ ends where it starts only if the
-		-- closing address is checked from the NEXT line, which is what sed does.
-		active[slot] = true
-		return true
-	end
-	return false
 end
 
 HANDLERS.sed = function(self, argv, stdin)
@@ -3303,7 +2959,7 @@ HANDLERS.sed = function(self, argv, stdin)
 				deleted = true
 				break
 			elseif name == "p" then
-				-- Without -n every line prints anyway, so an explicit p doubles it —
+				-- Without -n every line prints anyway, so an explicit p doubles it
 				-- which is exactly what `sed p` does.
 				after[#after + 1] = text
 			elseif name == "=" then
@@ -3346,12 +3002,10 @@ HANDLERS.sed = function(self, argv, stdin)
 	return result
 end
 
--- =============================================================================
 -- diff
--- =============================================================================
 -- A real longest-common-subsequence diff. This used to walk both files by index
 -- and call every position where they disagreed a change, so inserting ONE line
--- at the top of a 400-line module reported all 400 as different — a result that
+-- at the top of a 400-line module reported all 400 as different, a result that
 -- is not merely noisy but wrong about which lines changed. None of -u, -b or -w
 -- can be built honestly on top of that, because none of them mean anything
 -- until the aligner knows which lines correspond to which.
@@ -3365,7 +3019,7 @@ end
 local MAX_DIFF_LINES = 1200
 
 -- What counts as "the same line". -w ignores whitespace entirely, -b collapses
--- runs of it, -i folds case. Comparison only — the ORIGINAL line is what gets
+-- runs of it, -i folds case. Comparison only, the ORIGINAL line is what gets
 -- printed, so a whitespace-only change is invisible under -w rather than
 -- silently rewritten.
 local function diffKey(line: string, flags: { [string]: boolean }): string
@@ -3388,7 +3042,7 @@ local function diffLines(a: { string }, b: { string },
 	local script: { DiffOp } = {}
 
 	-- Trim the common prefix, then the common suffix. For the usual shape of an
-	-- edit — a few lines changed in a large file — this leaves almost nothing
+	-- edit: a few lines changed in a large file, this leaves almost nothing
 	-- for the quadratic part below.
 	local head = 0
 	while head < #a and head < #b and key(a[head + 1]) == key(b[head + 1]) do
@@ -3578,7 +3232,7 @@ HANDLERS.diff = function(self, argv)
 	end
 
 	-- -r walks two containers together, pairing children by name. A name present
-	-- on one side only is reported as such rather than skipped — "only in" is
+	-- on one side only is reported as such rather than skipped: "only in" is
 	-- most of what a recursive diff is asked for.
 	local out: { string } = {}
 	local seen: { [string]: boolean } = {}
@@ -3631,7 +3285,7 @@ HANDLERS.tr = function(self, argv, stdin)
 		set1 = table.concat(complement)
 	end
 
-	-- Both sets are operands, so a file (if any) is the third — or the second
+	-- Both sets are operands, so a file (if any) is the third, or the second
 	-- when only one set was given.
 	local input, inputErr = textInput(self, { operands[oneSet and 2 or 3] }, stdin)
 	if not input then
@@ -3645,7 +3299,7 @@ HANDLERS.tr = function(self, argv, stdin)
 	end
 
 	-- The WHOLE input, not line by line. tr is a byte filter, and splitting into
-	-- lines first makes "\n" unreachable — `tr -d '\n'` would strip the newlines
+	-- lines first makes "\n" unreachable: `tr -d '\n'` would strip the newlines
 	-- out of each line (there are none) and then the join would put them back,
 	-- so the command reported success and changed nothing.
 	local mapped: { string } = {}
@@ -3709,10 +3363,38 @@ HANDLERS.dirname = function(_, argv)
 	return table.concat(out, "\n")
 end
 
--- Aliases: same behaviour, different muscle memory.
-HANDLERS.file = HANDLERS.stat
+-- file answers ONE question, what kind of thing is this, in one line, the way
+-- file(1) does. It shared stat's handler until that turned every `file x` into
+-- a full metadata block whose second line held the actual answer.
+--
+-- The class IS the answer here: there is no magic number to sniff, and an
+-- instance's type is a property rather than something inferred from content.
+-- Scripts get the extra word because that is the distinction the caller is
+-- usually making, and it is the one `ls` already draws with its .luau suffix.
+HANDLERS.file = function(self, argv)
+	local flags, _, operands = parse(argv)
+	if #operands == 0 then
+		return fail("file", "requires a path")
+	end
+	local out: { string } = {}
+	for _, path in ipairs(expandGlobs(self, operands)) do
+		local target, err = self:resolve(path)
+		if not target then
+			return fail("file", err)
+		end
+		local kind = target.ClassName
+		if isScript(target) then
+			kind ..= " (script)"
+		elseif #target:GetChildren() > 0 then
+			kind ..= string.format(" (%d children)", #target:GetChildren())
+		end
+		out[#out + 1] = flags["-b"] and kind
+			or string.format("%s: %s", instancePath(target), kind)
+	end
+	return table.concat(out, "\n")
+end
 -- rmdir removes an EMPTY container, and refusing a full one is its entire
--- purpose. It shared rm's handler, which quietly made it `rm -r` — the same
+-- purpose. It shared rm's handler, which quietly made it `rm -r`, the same
 -- alias-sharing defect as egrep sharing grep's function, except this one
 -- deletes. Given its own handler for exactly that reason.
 HANDLERS.rmdir = function(self, argv)
@@ -3774,7 +3456,7 @@ Shell.COMMANDS = COMMANDS
 
 -- Shell metacharacters that survive tokenizing as their own token. Folding them
 -- into an argument silently is worse than saying they don't work. A QUOTED one
--- is exempt — `grep "<" f` is a pattern, not a redirection — which is what the
+-- is exempt: `grep "<" f` is a pattern, not a redirection, which is what the
 -- quoted-position set from tokenize() is for.
 local METACHARACTERS: { [string]: boolean } = {
 	["<"] = true, ["&"] = true,
@@ -3831,7 +3513,7 @@ local function runCommand(self: any, argv: { string }, readOnly: boolean?, stdin
 	end
 	-- READ_ONLY is an allowlist of COMMANDS, and `sed` and `find` earned their
 	-- places there by only ever reading. One flag turns each into a mutating one,
-	-- so that flag has to be named explicitly — otherwise a single new option
+	-- so that flag has to be named explicitly, otherwise a single new option
 	-- quietly punches a hole in /sh, which exists so that every mutation arrives
 	-- through Claude with an undo recording attached.
 	local mutator = readOnly and MUTATING_FLAGS[cmd]
@@ -3839,7 +3521,7 @@ local function runCommand(self: any, argv: { string }, readOnly: boolean?, stdin
 		for _, arg in ipairs(args) do
 			-- Prefix, not equality: the flag can arrive bundled (`sed -in`) or with
 			-- its value glued on (`sort -oout.luau`), and this check must fail
-			-- CLOSED — refusing a read-only command that was not going to write is
+			-- CLOSED: refusing a read-only command that was not going to write is
 			-- a corrected turn, letting a write through is a hole in /sh.
 			--
 			-- Matched against the raw argument rather than the parsed flag set
@@ -3951,14 +3633,14 @@ end
 -- table can be tested without going through tool_use plumbing.
 --
 -- `readOnly` is for /sh, where the human types the line directly and mutations
--- should stay Claude's — every write it makes carries an undo recording.
+-- should stay Claude's, every write it makes carries an undo recording.
 function Shell.run(self: any, line: string?, readOnly: boolean?): string
 	local commandLine, stdin, heredocErr = extractHeredoc(line or "")
 	if heredocErr then
 		return "bash: " .. heredocErr
 	end
 
-	-- There is no stderr here — errors come back as ordinary output — so the
+	-- There is no stderr here, errors come back as ordinary output, so the
 	-- redirections that aim at it are noise rather than instructions, and the
 	-- right thing to do with noise is drop it. Without this, `2>&1` was not
 	-- merely inert: the tokenizer splits `&` into its own token, which the
@@ -4012,9 +3694,7 @@ function Shell.run(self: any, line: string?, readOnly: boolean?): string
 	return table.concat(outputs, "\n")
 end
 
--- =============================================================================
 -- Self-test
--- =============================================================================
 -- Fails loudly if the tokenizer loses track of a quote, a flag form stops
 -- parsing, a glob stops anchoring, or a handler throws on a bare invocation.
 -- The API-dump half of this now lives in Props.selfTest.
@@ -4082,7 +3762,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 
 	-- Script suffixes. `ls` renders every script class as `.luau`, but a model
 	-- writes whichever form it knows, and all of them have to land on the same
-	-- instance — the class is a property in the DataModel, never part of a name.
+	-- instance: the class is a property in the DataModel, never part of a name.
 	for _, case in ipairs({
 		{ name = "Main.luau", want = "Main" },
 		{ name = "Main.lua", want = "Main" },
@@ -4100,7 +3780,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 	end
 
 	-- `workspace` is a Luau global, not the service's Name, so FindFirstChild
-	-- misses it and every path a model writes lowercase used to fail — including
+	-- misses it and every path a model writes lowercase used to fail, including
 	-- `catalog parent workspace`, where the failure looked like a catalog bug.
 	-- It has to hold from a cwd other than the root too, since `workspace` is a
 	-- global everywhere in Luau and a model that cd'd somewhere still writes it.
@@ -4166,7 +3846,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		return false, "ls did not cap a listing of " .. tostring(MAX_LIST + 5)
 	end
 	-- The cut has to NAME where it started. Rows are sorted before the budget is
-	-- spent, so truncation always eats the alphabetical tail — which is how the
+	-- spent, so truncation always eats the alphabetical tail, which is how the
 	-- root listing quietly lost Workspace. A count alone reads as "the boring
 	-- rest"; the name is what makes a missing entry visible.
 	if not bigOut:match('from "N101" on') then
@@ -4196,7 +3876,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 	end
 
 	-- grep groups its hits under one header per script. The failure worth catching
-	-- is a header emitted per hit, which is silent — the output still reads fine,
+	-- is a header emitted per hit, which is silent, the output still reads fine,
 	-- it just costs what grouping was added to stop costing. -c and -l parse the
 	-- ungrouped form, so they are pinned in the same breath.
 	local grepFixture = Instance.new("Folder")
@@ -4281,8 +3961,8 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		  why = "grep -A trailing context" },
 		{ line = "grep -B1 delta Sample.luau", want = "/Sample\n  3- gamma\n  4: delta",
 		  why = "grep -B, count glued to the flag" },
-		-- Bundled with a bool flag ahead of it. This used to be REFUSED outright —
-		-- "give -A/-B/-C their own argument" — because the old partition returned a
+		-- Bundled with a bool flag ahead of it. This used to be REFUSED outright
+		-- "give -A/-B/-C their own argument", because the old partition returned a
 		-- flag set with nowhere to put the 3, so `-nA3` was indistinguishable from
 		-- the three flags -n -A -3. A value letter ending its bundle fixes the
 		-- whole class, which is what the rest of the flag coverage rests on.
@@ -4304,7 +3984,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		-- can express this, so it only passes with a real engine behind it.
 		{ line = "grep -cE '(.)\\1' Dupes.luau", want = "0", why = "-E backreference" },
 		-- Plain grep is BRE now, so a dot is a metacharacter here exactly as it is
-		-- in every other grep — and `\.` is how you ask for a literal one.
+		-- in every other grep, and `\.` is how you ask for a literal one.
 		{ line = "grep -c 'g.mma' Sample.luau", want = "1", why = "plain grep is BRE, . is any char" },
 		{ line = "grep -c 'g\\.mma' Sample.luau", want = "0", why = "BRE \\. is a literal dot" },
 		-- In BRE `+` is literal text and `\+` is the quantifier. Getting this
@@ -4365,7 +4045,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		{ line = "uniq -u Dupes.luau", want = "b", why = "uniq -u keeps only singles" },
 
 		-- tr: escapes, classes, and the one-set flags. `tr -d '\n'` failed three
-		-- ways over — the escape was not understood, two sets were required, and
+		-- ways over, the escape was not understood, two sets were required, and
 		-- the filter ran per line so "\n" was unreachable even once parsed. tr is
 		-- a byte filter, so unlike sed/head it keeps the trailing newline.
 		{ line = "tr -d '\\n' Cased.luau", want = "Humanoidhumanoid", why = "tr -d with an escape" },
@@ -4423,7 +4103,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		{ line = "echo -x", want = "-x", why = "echo only treats -n/-e/-E as flags" },
 		{ line = "echo -n -- -n", want = "-- -n", why = "the first non-flag stops flag parsing" },
 
-		-- find matching a name has to try the DISPLAYED name too — `ls` prints a
+		-- find matching a name has to try the DISPLAYED name too: `ls` prints a
 		-- script as Main.luau, so a model that read a listing searches *.luau, and
 		-- no instance name has ever contained that suffix. This calls displayName,
 		-- which was missing from the aliases at the top of this file and so was a
@@ -4437,7 +4117,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 
 		-- egrep is grep -E by definition, not an alias that shares a handler.
 		-- Sharing it meant a bracket class searched for its own six characters
-		-- and reported "no matches" — which reads as "there are no digits here".
+		-- and reported "no matches", which reads as "there are no digits here".
 		-- The three names, three dialects: egrep is ERE, plain grep is BRE (where
 		-- `[a-z]` is a class but `+` is literal text, so this finds nothing), and
 		-- fgrep is fixed strings.
@@ -4475,13 +4155,13 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			-- Refusals that must carry the DataModel reason rather than a list of
 			-- what is allowed. Each of these is a flag someone will reach for on
 			-- reflex, and "unsupported" alone does not say which part of the idea
-			-- was wrong — whether to rephrase it or to stop asking.
+			-- was wrong, whether to rephrase it or to stop asking.
 			{ line = "ls -o /", want = "no owner" },
 			{ line = "ls -u /", want = "records a read" },
 			{ line = "ls -L /", want = "ObjectValue" },
 			-- Matches the load-bearing half of the reason. The wording moved once
 			-- already: it used to claim yielding stalls SSE parsing, which is not
-			-- true — what rules -f out is that it never RETURNS.
+			-- true: what rules -f out is that it never RETURNS.
 			{ line = "tail -f Sample.luau", want = "never returns" },
 			{ line = "find / -exec ls", want = "`run` tool" },
 			{ line = "find / -user me", want = "no owner" },
@@ -4501,7 +4181,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			{ line = 'grep -E "[a-" Sample.luau', want = "unterminated" },
 			{ line = 'grep -P "(?<=x)y" Sample.luau', want = "lookbehind" },
 			-- Catastrophic backtracking has to come back as an error. Unbounded,
-			-- this would not be a slow grep — Luau cannot preempt, so it would
+			-- this would not be a slow grep. Luau cannot preempt, so it would
 			-- freeze Studio with no way out.
 			{ line = 'grep -E "(a+)+$" Runaway.luau', want = "too expensive" },
 			-- An unknown s/// suffix used to be swallowed whole: `s/x/y/qqqzzz`
@@ -4514,7 +4194,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			{ line = "rmdir .", want = "not empty" },
 			{ line = "sed -n '9,2p' Sample.luau", want = "empty range" },
 			-- A malformed pattern used to leave every line unmodified and report
-			-- success — invisible under -i, where the write lands and changes
+			-- success: invisible under -i, where the write lands and changes
 			-- nothing. The only silent failure on a path that writes.
 			{ line = "sed 's/[/x/' Sample.luau", want = "sed:" },
 			{ line = "grep zzz Cased.luau", want = "no matches" },
@@ -4537,8 +4217,8 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		return false, failure
 	end
 
-	-- Editor-aware source access. `.Source` is no longer the whole truth — Roblox
-	-- decoupled the script editor from it — so reads and writes now go through
+	-- Editor-aware source access. `.Source` is no longer the whole truth. Roblox
+	-- decoupled the script editor from it, so reads and writes now go through
 	-- the editor when a document is open. A DETACHED fixture is never open, so
 	-- everything here must take the plain .Source path, which is also what keeps
 	-- the entire checks table above meaningful.
@@ -4558,7 +4238,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		-- CRLF is folded at the write seam. UpdateSourceAsync is documented to do
 		-- nothing when ONLY the line endings changed, and to error outright on a
 		-- carriage return with Live Scripting on; normalising removes both, and a
-		-- regression here is silent — the write reports success and does nothing.
+		-- regression here is silent, the write reports success and does nothing.
 		local writeErr = Fs.writeSource(sourceFixture, "a\r\nb\r\n")
 		if writeErr then
 			sourceFailure = "writeSource failed: " .. writeErr
@@ -4613,8 +4293,8 @@ function Shell.selfTest(probe: any): (boolean, string?)
 	-- Every declared flag must be REACHABLE. This is the mechanical half of the
 	-- `rm -rf` bug: the letters were declared, `rm -r x` parsed cleanly, and the
 	-- -r was dropped on the floor with nothing in the output to say so. A spec
-	-- that contradicts itself — a letter both offered and refused, or a `why` for
-	-- a flag that is actually accepted — produces exactly that shape of silence,
+	-- that contradicts itself, a letter both offered and refused, or a `why` for
+	-- a flag that is actually accepted, produces exactly that shape of silence,
 	-- so it is checked here rather than trusted to review.
 	for name, spec in pairs(SPECS) do
 		local declared = (spec.bool or "") .. (spec.value or "")
@@ -4640,7 +4320,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			end
 		end
 		-- A long option pointing at a short flag the command does not declare
-		-- would set a flag no handler reads — the same silence in a new shape.
+		-- would set a flag no handler reads, the same silence in a new shape.
 		for long, declaredKind in pairs(spec.long or {}) do
 			local short = declaredKind:match(":(%-.+)$")
 			if short and not declared:find(short:sub(2), 1, true) then
@@ -4651,8 +4331,8 @@ function Shell.selfTest(probe: any): (boolean, string?)
 	end
 
 	-- Stderr redirections must be swallowed rather than rejected. `&` is a
-	-- metacharacter, so before these were stripped a trailing `2>&1` — about the
-	-- most reflexive thing there is to append to a command — failed the line.
+	-- metacharacter, so before these were stripped a trailing `2>&1`, about the
+	-- most reflexive thing there is to append to a command, failed the line.
 	for _, line in ipairs({ "pwd 2>&1", "pwd 2>/dev/null", "pwd &>/dev/null", "pwd 1>&2" }) do
 		local out = Shell.run(probe, line)
 		if out:match("not supported") or out:match("unknown command") then
@@ -4687,7 +4367,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 	end
 
 	-- The observed-mtime journal. There is no timestamp on an Instance, so this
-	-- is the only thing -t, -newer and -mmin have to sort on — and the case that
+	-- is the only thing -t, -newer and -mmin have to sort on, and the case that
 	-- must not regress is the UNOBSERVED one, which has to render as "-" and sort
 	-- last rather than being reported as the oldest.
 	--
@@ -4721,8 +4401,8 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		end
 	end
 
-	-- -type has to reject a name that is not a class. IsA() cannot do this — it
-	-- returns false rather than throwing — so a regression here shows up as a
+	-- -type has to reject a name that is not a class. IsA() cannot do this, it
+	-- returns false rather than throwing, so a regression here shows up as a
 	-- bare "no matches" and nothing else, which is indistinguishable from a
 	-- pattern that genuinely matched nothing.
 	local badType = Shell.run(probe, "find / -type file -name Anything")
@@ -4741,7 +4421,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 
 	-- diff has to ALIGN, not compare by position. The old version walked both
 	-- files by index, so inserting one line at the top reported every following
-	-- line as changed — 800 lines of "difference" for a one-line edit, and wrong
+	-- line as changed, 800 lines of "difference" for a one-line edit, and wrong
 	-- about which line it was. This is the case that distinguishes the two.
 	local diffFixture = Instance.new("Folder")
 	local before = Instance.new("ModuleScript")

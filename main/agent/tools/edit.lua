@@ -1,4 +1,4 @@
--- edit / multiedit — substring replacement in a script.
+-- edit / multiedit, substring replacement in a script.
 --
 -- Structured arguments rather than a shell line because the payload is Luau
 -- source: routing that through shell quoting would eventually corrupt someone's

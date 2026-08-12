@@ -1,10 +1,10 @@
 --!optimize 2
--- Regex.luau — a real regular expression engine.
+-- Regex.luau: a real regular expression engine.
 --
 -- This exists because there was a translation layer here instead: `grep -E` took
 -- the pattern, rewrote the escapes it could map onto Lua patterns, and refused
 -- the constructs it could not. That advertised POSIX and delivered something
--- else, and its failure mode was the worst available — a confident "no matches"
+-- else, and its failure mode was the worst available, a confident "no matches"
 -- against a pattern the engine never understood.
 --
 -- The rule it broke: the agent should never need to know this is Roblox. The
@@ -20,28 +20,24 @@
 
 local Regex = {}
 
--- =============================================================================
 -- Limits
--- =============================================================================
--- Backtracking has catastrophic cases — `(a+)+$` against a long non-match is the
--- classic — and Luau cannot preempt a running chunk, so an unbounded matcher
+-- Backtracking has catastrophic cases: `(a+)+$` against a long non-match is the
+-- classic: and Luau cannot preempt a running chunk, so an unbounded matcher
 -- does not run slowly, it freezes Studio outright. That is the same hazard the
 -- `run` tool documents against its missing timeout, except here it would fire on
 -- an ordinary grep. The budget is per find() call over one line.
 --
 -- ponytail: a step cap rather than a linear-time engine. Ceiling: a legitimate
 -- but very expensive pattern is refused rather than served slowly. The upgrade
--- path is a Thompson NFA simulation, which is linear and cannot blow up — but it
+-- path is a Thompson NFA simulation, which is linear and cannot blow up, but it
 -- cannot do backreferences either, which is why every real grep still ships a
 -- backtracker.
 local MAX_STEPS = 200000
 
--- =============================================================================
 -- Character classes
--- =============================================================================
 -- Sets are plain lookup tables keyed by the character. Built once at compile
 -- time, including both cases when the match is case-insensitive, so the matcher
--- itself never lowercases anything — that matters because captures are sliced
+-- itself never lowercases anything, that matters because captures are sliced
 -- out of the ORIGINAL subject and must keep their original case.
 local function addRange(set: { [string]: boolean }, from: string, to: string)
 	for code = string.byte(from), string.byte(to) do
@@ -143,9 +139,7 @@ local CONTROL_ESCAPES: { [string]: string } = {
 
 local WORD = wordSet()
 
--- =============================================================================
 -- Parser
--- =============================================================================
 -- BRE and ERE differ ONLY in whether these are metacharacters bare or escaped.
 -- In ERE `(a|b)+` means what it looks like; in BRE the same effect is
 -- `\(a\|b\)\+` and the bare forms are literal text. One table, one parser.
@@ -207,7 +201,7 @@ local function parse(source: string, ere: boolean, ignoreCase: boolean): (Node?,
 			end
 			first = false
 
-			-- [[:alpha:]] — the inner brackets are part of the name, not a nested
+			-- [[:alpha:]], the inner brackets are part of the name, not a nested
 			-- class, which is why this is checked before anything else.
 			local name = source:match("^%[:(%a+):%]", pos)
 			if name then
@@ -288,7 +282,7 @@ local function parse(source: string, ere: boolean, ignoreCase: boolean): (Node?,
 			takeMeta("(")
 			local capture = true
 			local look: string? = nil
-			-- (?: (?= (?! — ERE has no such syntax, so these are PCRE-only and
+			-- (?: (?= (?!. ERE has no such syntax, so these are PCRE-only and
 			-- only recognised there.
 			if ere and peek() == "?" then
 				local after = source:sub(pos + 1, pos + 1)
@@ -453,7 +447,7 @@ local function parse(source: string, ere: boolean, ignoreCase: boolean): (Node?,
 					break
 				end
 				local lazy = false
-				-- The lazy marker is a bare `?` even in BRE — it is a PCRE
+				-- The lazy marker is a bare `?` even in BRE, it is a PCRE
 				-- extension, not a BRE metacharacter, so it is never backslashed.
 				if peek() == "?" then
 					lazy = true
@@ -499,9 +493,7 @@ local function parse(source: string, ere: boolean, ignoreCase: boolean): (Node?,
 	return root, nil
 end
 
--- =============================================================================
 -- Matcher
--- =============================================================================
 -- Recursive backtracking with continuations: each node matches at `pos` and asks
 -- `cont` whether the rest of the pattern can match from where it ended. That is
 -- what makes alternation and greedy-with-backoff fall out for free.
@@ -526,7 +518,7 @@ local function matchRepeat(state: any, node: Node, pos: number, count: number, c
 		end
 		return matchNode(state, node.body, pos, function(next: number): number?
 			-- Zero-width guard. Without it `(a*)*` recurses forever on an empty
-			-- inner match, which is a hang rather than a wrong answer — and a hang
+			-- inner match, which is a hang rather than a wrong answer, and a hang
 			-- here freezes Studio, since Luau cannot preempt.
 			--
 			-- KNOWN, DELIBERATE DIVERGENCE: PCRE allows one empty iteration before
@@ -534,7 +526,7 @@ local function matchRepeat(state: any, node: Node, pos: number, count: number, c
 			-- where this reports "a" (the last iteration that consumed anything).
 			-- Differential testing against Python's `re` over ~1700 pattern/subject
 			-- pairs found this and nothing else, it only ever affects CAPTURES of a
-			-- degenerate pattern — the matched span always agrees — and grep/find
+			-- degenerate pattern, the matched span always agrees, and grep/find
 			-- read spans. Refusing the empty iteration is what keeps the guard
 			-- simple, and a simple guard is what keeps Studio responsive.
 			if next == pos then
@@ -681,9 +673,7 @@ function matchNode(state: any, node: Node, pos: number, cont: (number) -> number
 	return nil
 end
 
--- =============================================================================
 -- Compile
--- =============================================================================
 -- Two fast paths, because grep runs this over every line of every script and a
 -- Luau backtracker is far slower than string.find.
 --
@@ -724,7 +714,7 @@ local function prefilterOf(node: Node): string?
 		if item.kind == "char" then
 			current[#current + 1] = item.char
 		elseif item.kind == "repeat" and item.min >= 1 and item.body.kind == "char" then
-			-- `b+` guarantees one `b`, so it EXTENDS the run — and then ends it.
+			-- `b+` guarantees one `b`, so it EXTENDS the run, and then ends it.
 			-- Whatever follows is not adjacent to what came before: `ab+c` matches
 			-- "abbbc", which does not contain "abc". Carrying the run through a
 			-- repeat is a prefilter that rejects real matches, and a prefilter
@@ -820,9 +810,7 @@ end
 
 Regex.MAX_STEPS = MAX_STEPS
 
--- =============================================================================
 -- Self-test
--- =============================================================================
 -- The engine needs no DataModel, so correctness is pinned here as a plain table
 -- rather than through the shell. Every row is a construct the old translation
 -- layer either refused outright or silently mistranslated.
@@ -929,7 +917,7 @@ function Regex.selfTest(): (boolean, string?)
 	end
 
 	-- Catastrophic backtracking. Luau cannot preempt a running chunk, so without
-	-- the budget this is not a slow grep — it is a frozen Studio. The one test
+	-- the budget this is not a slow grep, it is a frozen Studio. The one test
 	-- here whose failure mode is "the plugin never finishes starting".
 	do
 		local program = Regex.compile("(a+)+$", { ere = true })

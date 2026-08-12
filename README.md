@@ -38,9 +38,19 @@ word would hand you the markup around it.
 ## Tools
 
 bash runs a command line with pipes, ; && ||, redirects, heredocs and globs.
-edit and multiedit swap unique substrings, write replaces a whole .Source, run
-executes Luau, and catalog searches and loads free models. run is off by default
-since it runs at plugin permission level with no timeout.
+edit and multiedit swap unique substrings, write replaces a whole .Source
+(creating the script if it is missing), run executes Luau, and catalog searches
+and loads free models. run is off by default since it runs at plugin permission
+level with no timeout.
+
+run takes code, or a path to a script holding it. The path form exists so a
+probe can be written once and iterated with edit instead of resent whole; the
+source is inlined where code would go, so the file's own print is captured and
+its error lines are its own. What it costs is `script`, which points at the
+generated runner and not at the file — for running a real module in place,
+`reload(m)` inside a chunk is still the answer. Scratch scripts belong in
+/ServerStorage/tmp, which nothing creates for you. A chunk may return several
+values — `return nil, "why"` shows both, not just the nil.
 
 catalog loads through game:GetObjects, which does not sandbox anything, so
 scripts inside a model arrive live and able to run. LoadAssetAsync would strip

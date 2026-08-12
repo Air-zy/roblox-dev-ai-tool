@@ -1,4 +1,4 @@
--- bash — the whole shell, as one tool.
+-- bash: the whole shell, as one tool.
 --
 -- The description carries the MAPPING and stops. `ls`, `grep` and `cp` describe
 -- themselves; what a model cannot guess is that this filesystem is a DataModel.

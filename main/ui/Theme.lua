@@ -1,14 +1,12 @@
 --!strict
--- Theme.luau — palette, fonts, and the `make` helper.
+-- Theme.luau: palette, fonts, and the `make` helper.
 --
 -- Split out of the main script so Console, Settings and the plugin entry point
 -- all read the same values instead of each keeping their own copy.
 
 local Theme = {}
 
--- =============================================================================
 -- Claude.ai dark mode palette
--- =============================================================================
 Theme.BG_DARK     = Color3.fromRGB(26, 25, 24)    -- #1A1918 warm dark
 Theme.BG_SURFACE  = Color3.fromRGB(38, 37, 36)    -- #262524 slightly lighter
 Theme.BG_INPUT    = Color3.fromRGB(42, 41, 39)    -- #2A2927 input area
@@ -24,11 +22,9 @@ Theme.CODE_CLR    = Color3.fromRGB(226, 183, 148) -- #E2B794 sand, for code span
 Theme.ERR_CLR     = Color3.fromRGB(229, 120, 110) -- #E5786E lighter red
 Theme.BAR_CLR     = Color3.fromRGB(140, 178, 214) -- #8CB2D6 creamy blue, usage bars
 
--- =============================================================================
 -- Fonts
--- =============================================================================
 -- Enum.Font.Code (Source Code Pro) everywhere made prose hard to read at 13px.
--- Prose now uses BuilderSans — Roblox's current UI family, which has real
+-- Prose now uses BuilderSans. Roblox's current UI family, which has real
 -- weights, so RichText <b> renders as an actual bold face rather than a
 -- synthesized one. Code keeps a monospace family.
 Theme.SANS      = Font.fromName("BuilderSans", Enum.FontWeight.Regular)
@@ -39,15 +35,15 @@ Theme.MONO      = Font.fromName("RobotoMono", Enum.FontWeight.Regular)
 -- the markdown renderer needs this string form to switch into monospace mid-line.
 Theme.MONO_FACE = "RobotoMono"
 
--- Builder Icons — the icon set Studio's own UI is drawn with. It is a LIGATURE
+-- Builder Icons, the icon set Studio's own UI is drawn with. It is a LIGATURE
 -- font, not a spritesheet: the icon's name IS the text, so a TextLabel with this
 -- face and Text = "gear" draws the gear. Names are the kebab-case ones from the
--- BuilderIcons package: three-bars-horizontal, x, plus-large, trash-can, clock…
+-- BuilderIcons package: three-bars-horizontal, x, plus-large, trash-can, clock...
 --
 -- The family is an rbxasset path into Studio's own LuaPackages rather than an
 -- upload, so it costs nothing, needs no asset id, and always matches the Studio
 -- it is running in. If a future Studio moves the path the buttons fall back to
--- showing the literal name — visibly wrong, but harmless.
+-- showing the literal name, visibly wrong, but harmless.
 --
 -- Being a font, it cannot be used for the TOOLBAR button: CreateButton takes an
 -- image, so that one still needs an uploaded decal.
@@ -58,12 +54,10 @@ Theme.ICON = Font.new(
 Theme.TEXT_SIZE = 16
 Theme.SMALL_SIZE = 14
 
--- =============================================================================
--- make — build an Instance from a property table
--- =============================================================================
+-- make: build an Instance from a property table
 -- Properties that change how a LATER property is interpreted must be assigned
 -- first. `pairs` order is undefined, so without this a TextLabel can receive
--- Text before RichText and never parse its markup — nondeterministically, which
+-- Text before RichText and never parse its markup, nondeterministically, which
 -- is why markup rendered on some labels and not others.
 local FIRST = { "RichText", "FontFace", "Font", "TextSize", "TextScaled" }
 local IS_FIRST: { [string]: boolean } = {}

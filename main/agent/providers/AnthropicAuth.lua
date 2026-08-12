@@ -1,6 +1,6 @@
 --!strict
 --!optimize 2
--- OAuth.luau — Anthropic Claude subscription OAuth flow, plugin-only (no relay server)
+-- AnthropicAuth.luau: Anthropic subscription OAuth flow, plugin-only (no relay server)
 --
 -- Implements Authorization Code + PKCE flow using claude.ai/oauth/authorize
 -- in "copy/paste mode" (code=true). The user opens the auth URL in their own
@@ -23,7 +23,8 @@
 -- Storage: Plugin:SetSetting keys cannot contain `.` or `\` (per devforum),
 -- so we use plain underscore-separated keys.
 
-local Sha256 = require(script.Parent.Sha256) :: any
+local Sha256 = require(script.Parent.Parent.Parent
+	:WaitForChild("util"):WaitForChild("Sha256")) :: any
 
 local HttpService = game:GetService("HttpService")
 local warn = warn
@@ -36,9 +37,7 @@ local warn = warn
 -- function that touches settings storage.
 local plugin: any = nil
 
--- =============================================================================
 -- Constants (verified against the gist and the LinkedIn writeup)
--- =============================================================================
 local CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 local AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 local TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
@@ -51,16 +50,14 @@ local SCOPES = "org:create_api_key user:profile user:inference"
 -- claude.ai/api/oauth/usage is fronted by a bot check and 403s.
 local USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
--- Setting keys (no dots, no backslashes — Plugin:SetSetting silently fails otherwise)
+-- Setting keys (no dots, no backslashes. Plugin:SetSetting silently fails otherwise)
 local KEY_ACCESS_TOKEN = "claude_access_token"
 local KEY_REFRESH_TOKEN = "claude_refresh_token"
 local KEY_EXPIRES_AT = "claude_expires_at"
 local KEY_PKCE_VERIFIER = "claude_pkce_verifier"  -- ephemeral, only during login
 local KEY_PKCE_STATE    = "claude_pkce_state"     -- ephemeral, only during login
 
--- =============================================================================
 -- PKCE primitives
--- =============================================================================
 -- Generate a high-entropy code_verifier (43-128 chars, base64url of random bytes).
 -- Roblox has no crypto RNG; HttpService:GenerateGUID(false) returns a 32-hex-char
 -- GUID without braces. We concatenate two GUIDs (64 hex chars = 256 bits entropy)
@@ -77,7 +74,7 @@ local function generateVerifier(): string
 		table.insert(bytes, string.char(byte))
 	end
 	local raw = table.concat(bytes)
-	-- base64url (no padding) — reuse Sha256's helper logic
+	-- base64url (no padding), reuse Sha256's helper logic
 	local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 	local out = {}
 	local i = 1
@@ -130,9 +127,7 @@ local function generateState(): string
 	return HttpService:GenerateGUID(false):gsub("-", "")
 end
 
--- =============================================================================
 -- HTTP helper
--- =============================================================================
 -- HttpService:RequestAsync is synchronous and blocks the calling thread.
 -- Always call from a coroutine/task.spawn. Returns the response dictionary
 -- or throws on transport error.
@@ -160,9 +155,7 @@ local function httpPostJson(url: string, bodyTable: { [string]: any }): { [strin
 	return response :: any
 end
 
--- =============================================================================
 -- Storage helpers
--- =============================================================================
 -- All storage helpers guard against `plugin` being nil (i.e. Initialize not called yet).
 -- They fail soft rather than crashing: a nil plugin means we treat state as empty
 -- and refuse to write.
@@ -192,13 +185,11 @@ local function getSetting(key: string): any
 	return plugin:GetSetting(key)
 end
 
--- =============================================================================
 -- Public API
--- =============================================================================
 
 -- MUST be called once from the root plugin script before any storage-touching API.
 --   OAuth:Initialize(plugin)
--- Idempotent — safe to call multiple times.
+-- Idempotent: safe to call multiple times.
 local function Initialize(pluginRef: any)
 	plugin = pluginRef
 end
@@ -217,7 +208,7 @@ local function startLogin(): { authorizeUrl: string, state: string }
 	plugin:SetSetting(KEY_PKCE_STATE, state)
 
 	-- Build URL with proper URL-encoding of each parameter.
-	-- `code=true` enables copy/paste mode — Anthropic's redirect page will display
+	-- `code=true` enables copy/paste mode. Anthropic's redirect page will display
 	-- the auth code prominently instead of trying to hit a localhost callback.
 	local params = {
 		{ "code",                  "true" },
@@ -392,7 +383,7 @@ local function getAccessToken(): (string?, string?)
 		return nil, "Not logged in."
 	end
 	if not at or at == "" then
-		-- Access token missing but refresh token present — try refresh.
+		-- Access token missing but refresh token present, try refresh.
 		warn("[Claude Code] getAccessToken: at missing, refreshing…")
 		local ok, err = refresh()
 		if not ok then
@@ -420,7 +411,7 @@ end
 -- Current plan usage: one entry per limit window, each carrying a utilization
 -- and the time it resets. Claude Code reads five_hour and seven_day out of this
 -- for its two bars (a seven_day_overage_included window rides along when the
--- account has usage credits). Blocking, like every other call here — run it from
+-- account has usage credits). Blocking, like every other call here, run it from
 -- a task.spawn. Returns (windows, nil) or (nil, errorMessage).
 local function fetchUsage(): ({ [string]: any }?, string?)
 	local token, tokenErr = getAccessToken()

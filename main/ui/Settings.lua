@@ -1,23 +1,24 @@
 --!strict
--- Settings.luau — persisted preferences, shown in a floating popup.
+-- Settings.luau: persisted preferences, shown in a floating popup.
 --
 -- State lives in plugin:SetSetting, so it survives Studio restarts.
 --
 -- EFFORT is a real, first-class Anthropic parameter: output_config.effort, with
 -- levels low | medium | high | xhigh | max. It governs total token spend for the
--- whole response — prose, tool calls, and thinking alike — and needs no beta
+-- whole response, prose, tool calls, and thinking alike, and needs no beta
 -- header on current models. "high" is the API default.
 --
 -- thinkingBudget below exists only for models that predate adaptive thinking
 -- (Haiku 4.5 here). On those, effort is unsupported and budget_tokens is the
--- only lever; on Claude 5 models budget_tokens is rejected outright. Claude.luau
+-- only lever; on Claude 5 models budget_tokens is rejected outright. Wire.luau
 -- picks the right one per model.
 
 local Theme = require(script.Parent:WaitForChild("Theme"))
 -- Reaches into agent/ for the model list only. Settings is the one module that
 -- is genuinely half UI and half configuration; if it ever splits, the prefs half
 -- is what belongs next to the agent.
-local Claude = require(script.Parent.Parent:WaitForChild("agent"):WaitForChild("Claude"))
+local Provider = require(script.Parent.Parent:WaitForChild("agent"):WaitForChild("Provider"))
+local Wire = Provider.wire
 
 local make = Theme.make
 
@@ -46,7 +47,7 @@ Settings.EFFORT_LEVELS = EFFORT_LEVELS
 
 local pluginRef: Plugin = nil :: any
 local state = {
-	model = Claude.DEFAULT_MODEL,
+	model = Wire.DEFAULT_MODEL,
 	effort = 3,  -- High, matching the API default
 	system = DEFAULT_SYSTEM,
 	-- Off by default and deliberately not remembered as "on" by accident:
@@ -125,9 +126,7 @@ function Settings.setSystem(text: string)
 	pluginRef:SetSetting(KEY_SYSTEM, text)
 end
 
--- =============================================================================
 -- Widgets
--- =============================================================================
 local function sectionLabel(parent: Instance, text: string, order: number)
 	make("TextLabel", {
 		Parent = parent,
@@ -274,9 +273,7 @@ local function dropdown(
 	refresh()
 end
 
--- =============================================================================
 -- Panel
--- =============================================================================
 -- `bar` is a 0..1 fraction; rows that carry one get a progress track drawn under
 -- the label/value line.
 export type StatusRow = { label: string, value: string, bar: number? }
@@ -458,7 +455,7 @@ function Settings.mountPanel(
 	end
 
 	-- Neither MODEL nor EFFORT is here. Both live on the chip at the right of the
-	-- input row — the model on its first page, effort behind it — one click from
+	-- input row, the model on its first page, effort behind it, one click from
 	-- where you type. A second copy of either is just another place for the two to
 	-- disagree.
 

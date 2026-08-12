@@ -1,5 +1,5 @@
 --!strict
--- Markdown.luau — Markdown to a list of renderable blocks.
+-- Markdown.luau: Markdown to a list of renderable blocks.
 --
 -- WHY THIS IS A PARSER AND NOT A STRING FORMATTER:
 -- The first version turned a whole reply into one RichText string. Roblox's
@@ -12,7 +12,7 @@
 -- So block structure (headings, code blocks, quotes, lists, rules) is real GUI
 -- objects, built by Console. RichText is used only for inline runs inside a
 -- single paragraph, where it is the only way to mix weights in one wrapped
--- label — and where a failure degrades that one paragraph instead of the reply.
+-- label: and where a failure degrades that one paragraph instead of the reply.
 
 local Theme = require(script.Parent:WaitForChild("Theme"))
 
@@ -30,9 +30,7 @@ export type Block = {
 	align: { string }?,     -- per-column: left | center | right
 }
 
--- =============================================================================
 -- Inline formatting
--- =============================================================================
 -- Only ever applied to a single paragraph's worth of text.
 local function escape(s: string): string
 	s = s:gsub("&", "&amp;")
@@ -57,7 +55,7 @@ function Markdown.inline(text: string): string
 
 	-- Backslash-escaped backtick first, so \` doesn't open a code span. Every
 	-- other escape waits until after code spans are extracted, because a
-	-- backslash inside `code` is literal — paths and patterns are full of them.
+	-- backslash inside `code` is literal, paths and patterns are full of them.
 	text = text:gsub("\\`", function() return keep("`") end)
 
 	text = text:gsub("`([^`]+)`", function(body)
@@ -65,13 +63,13 @@ function Markdown.inline(text: string): string
 			Theme.MONO_FACE, CODE_HEX, body))
 	end)
 
-	-- \* \_ \# \| … — the character survives as content, invisible to the
+	-- \* \_ \# \| ..., the character survives as content, invisible to the
 	-- emphasis and table rules below. escape() already ran, so & < > are
 	-- entities by now and get stashed in that form.
 	text = text:gsub("\\(&%a+;)", function(entity) return keep(entity) end)
 	text = text:gsub("\\(%p)", function(char) return keep(char) end)
 
-	-- [label](url) — keep the label, drop the URL. RichText has no links.
+	-- [label](url), keep the label, drop the URL. RichText has no links.
 	text = text:gsub("%[([^%]]*)%]%b()", "%1")
 
 	text = text:gsub("%*%*%*(.-)%*%*%*", "<b><i>%1</i></b>")
@@ -91,9 +89,7 @@ function Markdown.inline(text: string): string
 	return text
 end
 
--- =============================================================================
 -- Block parsing
--- =============================================================================
 -- A table row is any line containing a pipe; what makes it a TABLE is the
 -- delimiter line under the header (|---|:--:|), so detection always needs to
 -- look one line ahead.
@@ -241,9 +237,7 @@ function Markdown.parse(md: string): { Block }
 	return blocks
 end
 
--- =============================================================================
 -- Self-test
--- =============================================================================
 function Markdown.selfTest(): (boolean, string?)
 	local function kinds(md: string): string
 		local names: { string } = {}

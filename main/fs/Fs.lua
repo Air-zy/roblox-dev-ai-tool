@@ -1,9 +1,9 @@
 --!optimize 2
--- Fs.luau — the DataModel-as-filesystem primitives.
+-- Fs.luau: the DataModel-as-filesystem primitives.
 --
 -- Everything here answers one of two questions: "which Instance does this path
 -- mean?" and "how do I read or change it safely?". No commands, no shell, no
--- tool definitions — those sit on top of this. Split out of Terminal because
+-- tool definitions, those sit on top of this. Split out of Terminal because
 -- every layer above needs `resolve`, and a file that owns the path model plus
 -- the shell plus the tool registry has no seam to test or extend at.
 --
@@ -30,9 +30,7 @@ end
 
 local Fs = {}
 
--- =============================================================================
 -- Scripts and source
--- =============================================================================
 -- True for anything with a readable .Source.
 local function isScript(inst: Instance): boolean
 	return inst:IsA("Script") or inst:IsA("LocalScript") or inst:IsA("ModuleScript")
@@ -54,8 +52,8 @@ Fs.openDocument = openDocument
 -- Read a script's text. nil when the instance has none.
 --
 -- `.Source` is no longer the whole truth. Roblox decoupled the script editor
--- from that property — their words: "the source property will not always
--- reflect the script editor's content" — so a script open in the editor with
+-- from that property, their words: "the source property will not always
+-- reflect the script editor's content", so a script open in the editor with
 -- unsaved edits has TWO texts, and .Source is the one the user is not looking
 -- at. Reading it means `cat` shows the agent something that is not on screen
 -- and `edit` matches old_string against text the user has already replaced.
@@ -64,14 +62,14 @@ Fs.openDocument = openDocument
 --
 -- ponytail: FindScriptDocument on every read, rather than a set of open
 -- documents kept live by TextDocumentDidOpen/DidClose. The set would be O(1),
--- but it can DRIFT — one missed signal and reads fall silently back to stale
+-- but it can DRIFT, one missed signal and reads fall silently back to stale
 -- text, which is the exact failure this branch exists to remove, and a stateless
 -- lookup cannot be wrong. Ceiling: one engine call per script per grep; the
 -- cached set is the upgrade path if a place big enough to feel it turns up.
 local function getSource(inst: Instance): string?
 	if not isScript(inst) then return nil end
 	-- Its own pcall, so a failure anywhere in the editor path falls back to
-	-- .Source rather than returning nil — nil here reads as "not a script" and
+	-- .Source rather than returning nil, nil here reads as "not a script" and
 	-- would drop the file out of a grep entirely.
 	if ScriptEditorService then
 		local ok, text = pcall(function()
@@ -137,8 +135,8 @@ function Fs.writeSource(inst: Instance, text: string): string?
 	return (not ok) and tostring(err) or nil
 end
 
--- Splitting with gmatch("[^\n]*") — which is what head, tail, grep and wc all
--- used — yields an extra empty match after every newline. That silently doubled
+-- Splitting with gmatch("[^\n]*"), which is what head, tail, grep and wc all
+-- used: yields an extra empty match after every newline. That silently doubled
 -- every line number grep reported and padded head/tail with blank lines. One
 -- helper, so the fix can't be half-applied.
 local function splitLines(source: string): { string }
@@ -155,9 +153,7 @@ local function splitLines(source: string): { string }
 end
 Fs.splitLines = splitLines
 
--- =============================================================================
 -- Searching a buffer
--- =============================================================================
 export type GrepHit = { line: number, text: string, match: boolean }
 export type GrepOpts = {
 	invert: boolean?,
@@ -175,7 +171,7 @@ export type GrepOpts = {
 -- string.find on every line of every script; compiling once per command and
 -- matching per line is both faster and the only way a real engine can sit here at
 -- all. Case-insensitivity lives inside the program, so nothing is lowercased on
--- the way past — captures have to come out of the original text.
+-- the way past, captures have to come out of the original text.
 local function matchSpans(subject: string, programs: { any }): { { number } }?
 	local spans: { { number } }? = nil
 	for _, program in ipairs(programs) do
@@ -202,8 +198,8 @@ end
 -- One buffer's worth of grep: which lines matched, plus the -A/-B/-C context
 -- window around them, in line order and deduplicated where windows overlap.
 --
--- Shared because grep runs over two different things — a script's Source and a
--- piped stream — and those two paths had already drifted once. A windowing loop
+-- Shared because grep runs over two different things, a script's Source and a
+-- piped stream, and those two paths had already drifted once. A windowing loop
 -- written twice is two places for an off-by-one to live, and an off-by-one here
 -- is a context line reported under the wrong line number.
 --
@@ -265,9 +261,7 @@ function Fs.grepLines(lines: { string }, programs: { any }, opts: GrepOpts?): ({
 	return hits, taken, skipped
 end
 
--- =============================================================================
 -- Paths
--- =============================================================================
 local function instancePath(inst: Instance): string
 	if inst == game then
 		return "/"
@@ -319,7 +313,7 @@ function Fs.resolve(base: Instance, path: string?): (Instance?, string?)
 			-- once. Exact name wins: an instance may genuinely be named "foo.luau".
 			--
 			-- Every suffix a Roblox developer might write is accepted, not just
-			-- `.luau` — `.lua`, and the `.server`/`.client` forms that name the
+			-- `.luau`: `.lua`, and the `.server`/`.client` forms that name the
 			-- script class. All of them resolve to the same instance, because in
 			-- the DataModel the class is a property, not part of the name.
 			local child = current:FindFirstChild(seg)
@@ -331,7 +325,7 @@ function Fs.resolve(base: Instance, path: string?): (Instance?, string?)
 				end
 			end
 			-- `workspace` is a real Luau global for game.Workspace, so a model
-			-- writes it lowercase and is not wrong to — the engine accepts it
+			-- writes it lowercase and is not wrong to, the engine accepts it
 			-- everywhere else. Services generally: their names are fixed and
 			-- unique, so a case-insensitive match at the root cannot be
 			-- ambiguous. It stops at the root deliberately; two ordinary
@@ -350,7 +344,7 @@ function Fs.resolve(base: Instance, path: string?): (Instance?, string?)
 			-- a Luau global: it means game.Workspace from any scope, so `ls
 			-- workspace` from anywhere is the model writing Luau, not naming a
 			-- child. Only the leading segment, and only when no real child has
-			-- that name — a genuine sibling always wins. Workspace alone,
+			-- that name, a genuine sibling always wins. Workspace alone,
 			-- because it is the one service that is also a global; the others
 			-- need GetService in Luau too.
 			if not child and i == 1 and seg:lower() == "workspace" then
@@ -369,18 +363,41 @@ end
 -- Rojo's suffix convention, longest first so `.server.luau` is not mistaken for
 -- `.luau` with a `.server` name. `.lua` is accepted alongside `.luau` because
 -- half the ecosystem still writes it and a model will too.
+--
+-- ONE table, read two ways: resolving a path only wants the suffix off, and
+-- creating a leaf also wants the class it names. Two tables would be two lists
+-- to keep in sync, and the first one to gain a suffix would be the one that
+-- silently disagreed.
 local SCRIPT_SUFFIXES = {
-	".server.luau", ".client.luau", ".server.lua", ".client.lua", ".luau", ".lua",
+	{ ".server.luau", "Script" },
+	{ ".client.luau", "LocalScript" },
+	{ ".server.lua", "Script" },
+	{ ".client.lua", "LocalScript" },
+	{ ".luau" },
+	{ ".lua" },
 }
+
+local function stripSuffix(name: string): (string?, string?)
+	for _, entry in ipairs(SCRIPT_SUFFIXES) do
+		local suffix = entry[1]
+		if #name > #suffix and name:sub(-#suffix) == suffix then
+			return name:sub(1, -#suffix - 1), entry[2]
+		end
+	end
+	return nil, nil
+end
 
 -- Strip a script suffix, or nil when there is none to strip.
 function Fs.stripScriptSuffix(name: string): string?
-	for _, suffix in ipairs(SCRIPT_SUFFIXES) do
-		if #name > #suffix and name:sub(-#suffix) == suffix then
-			return name:sub(1, -#suffix - 1)
-		end
-	end
-	return nil
+	return (stripSuffix(name))
+end
+
+-- Which class a NEW leaf should be, and the name to give it once the suffix is
+-- off. No suffix, or a bare `.luau`, means ModuleScript, the safe default,
+-- since it does nothing until something requires it.
+function Fs.classFor(leaf: string): (string, string)
+	local bare, class = stripSuffix(leaf)
+	return class or "ModuleScript", bare or leaf
 end
 
 -- What `ls` shows for an instance. Scripts get a `.luau` so a model reads them
@@ -398,11 +415,9 @@ function Fs.splitPath(path: string): (string?, string)
 	return (parent == "" and "/" or parent), leaf
 end
 
--- =============================================================================
 -- Observed modification times
--- =============================================================================
 -- Instances carry no timestamp. Not Created, not Modified, nothing in the API
--- dump and nothing behind a security level a plugin can reach — so `ls -t`,
+-- dump and nothing behind a security level a plugin can reach, so `ls -t`,
 -- `find -newer` and `touch -d` have no stored value to read, and the honest
 -- alternatives were to refuse them or to observe the times ourselves.
 --
@@ -419,12 +434,12 @@ end
 -- point: nothing that happened before we loaded is in here, and neither is a
 -- property changed through the Properties panel. Those read back nil, render as
 -- "-", and sort last. Callers must SHOW that rather than imply a time they do
--- not have — an unlabelled partial answer is worse than none, because there is
+-- not have, an unlabelled partial answer is worse than none, because there is
 -- no way to tell it from a complete one.
 --
 -- ponytail: weak-keyed, so a Destroy()d instance drops out with no bookkeeping.
 -- Ceiling: session-local, and blind to the Properties panel. Upgrade path is a
--- Changed connection per instance — thousands of connections to fill in one
+-- Changed connection per instance, thousands of connections to fill in one
 -- column of `ls`, not worth it until something else needs live change tracking.
 local mtimes: { [Instance]: number } = (setmetatable({}, { __mode = "k" }) :: any)
 
@@ -480,19 +495,17 @@ function Fs.openDocuments(): { { inst: Instance, doc: any } }
 	return out
 end
 
--- =============================================================================
 -- Mode bits
--- =============================================================================
 -- There is no permission system here, but there are three booleans that mean
--- what three of the mode bits mean — and they are the three `ls -l`, `chmod` and
+-- what three of the mode bits mean, and they are the three `ls -l`, `chmod` and
 -- `find -perm` are actually reached for:
 --
 --   x   BaseScript.Disabled, inverted   will this run?
 --   a   Instance.Archivable             will Clone() and the place save take it?
 --   l   BasePart.Locked                 is it pinned against selection in Studio?
 --
--- Not every class has every bit. A ModuleScript has no Disabled — it runs when
--- something requires it, so there is nothing to disable — and only a BasePart
+-- Not every class has every bit. A ModuleScript has no Disabled, it runs when
+-- something requires it, so there is nothing to disable, and only a BasePart
 -- has Locked. Those slots read "-", and setMode REFUSES them rather than
 -- accepting the request and changing nothing.
 --
@@ -503,7 +516,7 @@ local MODE_LETTERS = "xal"
 
 -- The bit a letter names, or nil when this class has no such bit. Written out
 -- rather than as `cond and value or nil`, which collapses to nil for a bit that
--- exists and is false — the exact case that has to be told from "no such bit".
+-- exists and is false, the exact case that has to be told from "no such bit".
 local function modeBit(inst: Instance, letter: string): boolean?
 	if letter == "x" then
 		if not inst:IsA("BaseScript") then return nil end
@@ -556,10 +569,8 @@ function Fs.setMode(inst: Instance, letter: string, on: boolean): string?
 	return nil
 end
 
--- =============================================================================
 -- Size and identity
--- =============================================================================
--- A script's size is its source in bytes — a real byte count, and the one `wc
+-- A script's size is its source in bytes, a real byte count, and the one `wc
 -- -c` already reports. Nothing else here has bytes to count, so its size is its
 -- descendant count, which is the measure `du` and `ls -l` were already using.
 -- Kept identical so those three commands cannot disagree about one instance.
@@ -595,7 +606,7 @@ end
 
 -- The closest thing here to an inode. GetDebugId is PluginSecurity, which is
 -- the level this runs at. It identifies an instance within ONE Studio session
--- and is not stable across restarts — which is exactly the job `ls -i` is used
+-- and is not stable across restarts, which is exactly the job `ls -i` is used
 -- for, telling two identically-named instances apart.
 function Fs.debugId(inst: Instance): string
 	local ok, id = pcall(function()
@@ -604,11 +615,9 @@ function Fs.debugId(inst: Instance): string
 	return (ok and type(id) == "string") and id or "?"
 end
 
--- =============================================================================
 -- Mutation
--- =============================================================================
 -- Every mutation goes through withUndo. Without a ChangeHistoryService recording
--- the user's Ctrl+Z does nothing and a bad edit is unrecoverable — that is data
+-- the user's Ctrl+Z does nothing and a bad edit is unrecoverable, that is data
 -- loss, not a rough edge, so it is not optional.
 function Fs.withUndo<T>(label: string, action: () -> T): (T?, string?)
 	-- TryBeginRecording returns nil if a recording is already open (another
@@ -631,7 +640,7 @@ end
 -- game and the services directly under it are not ours to move or delete.
 function Fs.guardProtected(inst: Instance): string?
 	if inst == game then
-		return "refusing to modify the DataModel root"
+		return "refusing to modify /"
 	end
 	if inst.Parent == game then
 		return string.format("refusing to modify the service %q", inst.Name)
@@ -639,9 +648,7 @@ function Fs.guardProtected(inst: Instance): string?
 	return nil
 end
 
--- =============================================================================
 -- Name matching
--- =============================================================================
 -- Glob -> Lua pattern. Anchored, because a wildcard is the user saying where the
 -- loose ends are; leaving it unanchored would make `Part*` and `*Part*` the same
 -- query and the star meaningless.
@@ -666,16 +673,14 @@ function Fs.nameMatcher(pattern: string): (string) -> boolean
 		end
 	end
 	-- Globs are their own syntax, not regex, and they compile to a Lua pattern
-	-- purely as an implementation detail — nothing about it reaches the caller.
+	-- purely as an implementation detail, nothing about it reaches the caller.
 	local compiled = globToPattern(needle)
 	return function(name)
 		return name:lower():match(compiled) ~= nil
 	end
 end
 
--- =============================================================================
 -- Values
--- =============================================================================
 function Fs.formatValue(value: any): string
 	local kind = typeof(value)
 	if kind == "Instance" then

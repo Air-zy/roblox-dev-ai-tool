@@ -1,7 +1,7 @@
--- write — replace a script's entire source.
+-- write: replace a script's entire source.
 return {
 	name = "write",
-	description = "set entire source",
+	description = "set entire source, creates the script if missing",
 	input_schema = {
 		type = "object",
 		properties = {

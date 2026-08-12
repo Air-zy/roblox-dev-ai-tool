@@ -1,11 +1,11 @@
--- Sessions.luau — saved conversations, and the sidebar that switches between them.
+-- Sessions.luau: saved conversations, and the sidebar that switches between them.
 --
 -- The conversation IS the session: everything else on screen is derived from it,
 -- so persisting `Agent.conversation()` and replaying it through the Console's
 -- normal appenders is the whole feature. Nothing new renders here.
 --
 -- Storage is plugin:SetSetting, same as Settings, so it survives a Studio crash
--- — which is the point. Two kinds of key:
+--, which is the point. Two kinds of key:
 --
 --   cc_sessions        the index: id, title, place, updated. Small, rewritten
 --                      on every save.
@@ -15,7 +15,7 @@
 --
 -- Sessions are tagged with PlaceId and the list is filtered to the current place.
 -- Plugin settings are global across places, so without that filter opening the
--- plugin in another game would offer — and auto-restore — a conversation about a
+-- plugin in another game would offer, and auto-restore, a conversation about a
 -- different DataModel entirely.
 
 local HttpService = game:GetService("HttpService")
@@ -35,7 +35,7 @@ local MAX_SESSIONS = 20
 -- SetSetting writes to a local JSON file with no documented ceiling, but a
 -- session carrying a few `cat`s of large ModuleScripts is megabytes, and that
 -- cost is paid on every turn. Past this the old tool results are stubbed before
--- writing — the same trade Agent makes to keep the context window bounded.
+-- writing: the same trade Agent makes to keep the context window bounded.
 local MAX_BYTES = 400000
 local KEEP_RESULTS = 5
 local CLEARED = "[old tool result cleared — re-run the command if needed]"
@@ -47,9 +47,7 @@ local index: { Entry } = {}
 local currentId = ""
 local refreshList: (() -> ())? = nil
 
--- =============================================================================
 -- Storage
--- =============================================================================
 local function decode(json: any): any?
 	if type(json) ~= "string" or json == "" then return nil end
 	local ok, value = pcall(function() return HttpService:JSONDecode(json) end)
@@ -62,8 +60,8 @@ end
 
 -- The active row is drawn differently, so every change of session has to redraw
 -- the list or the highlight stays on the one you just left. Going through a
--- setter is what keeps that true for all three ways currentId moves — switch,
--- new, delete — rather than only the one that remembered to refresh. Defined up
+-- setter is what keeps that true for all three ways currentId moves, switch,
+-- new, delete, rather than only the one that remembered to refresh. Defined up
 -- here because Initialize is the first caller and a `local function` is not in
 -- scope above its own definition.
 local function setCurrent(id: string)
@@ -81,7 +79,7 @@ end
 -- What the reader typed, whichever shape it is stored in. A user message is
 -- normally a plain string, but sessions saved before Claude.withMessageCache
 -- stopped writing into the live conversation have theirs as a one-element text
--- block array — those still have to restore and still have to be titled.
+-- block array, those still have to restore and still have to be titled.
 -- Returns nil for the other block shape, a tool_result batch, which is drawn
 -- with the call that produced it rather than as a message of its own.
 local function userText(message: any): string?
@@ -100,7 +98,7 @@ local function userText(message: any): string?
 end
 
 -- First user message, which is what the reader remembers the session by.
--- Returns nil when there isn't one — a session resumed from a stop or an error
+-- Returns nil when there isn't one, a session resumed from a stop or an error
 -- can begin with a tool_result batch and nothing else, and "Untitled" tells you
 -- less than the clock does.
 local function titleOf(conversation: { any }): string?
@@ -121,7 +119,7 @@ end
 -- live conversation is never touched: mutating it here would invalidate the
 -- prompt cache from that index onward for a saving the model never asked for.
 --
--- Stubbed, not removed — every tool_result pairs with a tool_use that stays, and
+-- Stubbed, not removed, every tool_result pairs with a tool_use that stays, and
 -- a restored session with a broken pairing is rejected on its next request.
 local function stubOldResults(conversation: { any }): { any }
 	local total = 0
@@ -169,7 +167,7 @@ local function entryFor(id: string): Entry?
 	return nil
 end
 
--- Called on every busy → idle transition, so a crash costs at most the turn that
+-- Called on every busy -> idle transition, so a crash costs at most the turn that
 -- was in flight.
 function Sessions.save()
 	local conversation = Agent.conversation()
@@ -207,16 +205,14 @@ function Sessions.save()
 	if refreshList then refreshList() end
 end
 
--- =============================================================================
 -- Replay
--- =============================================================================
--- Thinking blocks ARE in the history now — the tool-use protocol requires them —
+-- Thinking blocks ARE in the history now, the tool-use protocol requires them
 -- but nothing here matches their type, so a replay still shows prose and tool
 -- calls only. Rendering a restored session's reasoning would mean a drawer per
 -- block; the live view is where reasoning is worth reading.
 -- Only the tail is drawn. Every message is a handful of Instances and a Markdown
 -- parse, so rendering a long session in full froze Studio for about a second on
--- every switch. The conversation Agent restored is still the WHOLE thing — this
+-- every switch. The conversation Agent restored is still the WHOLE thing, this
 -- caps what is on screen, not what Claude can see.
 --
 -- The rest is a page away, not gone: the top line is a button that widens the
@@ -224,7 +220,7 @@ end
 -- page again.
 --
 -- ponytail: paging redraws the whole window rather than prepending to it, so
--- clicking back through a very long session pays the freeze it was avoiding —
+-- clicking back through a very long session pays the freeze it was avoiding
 -- but only on a click the reader asked for. Prepending needs LayoutOrder below
 -- what is already on screen, which every appender computes for itself; do that
 -- if the redraw ever gets annoying.
@@ -266,7 +262,7 @@ local function replay(conversation: { any })
 				shown += REPLAY_MESSAGES
 				Console.clear()
 				replay(conversation)
-				-- The reader clicked the thing at the top, so leave them at the top —
+				-- The reader clicked the thing at the top, so leave them at the top
 				-- looking at the messages they just pulled up, not back at the newest.
 				Console.scrollToTop()
 			end)
@@ -309,7 +305,7 @@ end
 
 -- JSON has no empty-object form that survives the round trip: an argument-less
 -- tool_use saved as `{}` comes back as an empty Lua table, which Roblox re-encodes
--- as `[]`, and Anthropic rejects `tool_use.input: []` on every later request —
+-- as `[]`, and Anthropic rejects `tool_use.input: []` on every later request
 -- the same failure Agent.toolInput guards at stream time. Refill it here.
 local function repairInputs(conversation: { any })
 	for _, message in ipairs(conversation) do
@@ -368,7 +364,7 @@ function Sessions.delete(id: string)
 	if refreshList then refreshList() end
 end
 
--- /clear: the current session is wiped, not archived — its stored copy goes too,
+-- /clear: the current session is wiped, not archived, its stored copy goes too,
 -- or the next open would restore the thing that was just cleared.
 function Sessions.clear()
 	Sessions.delete(currentId)
@@ -385,9 +381,7 @@ function Sessions.restoreLast()
 	end
 end
 
--- =============================================================================
 -- Sidebar
--- =============================================================================
 local function ago(when: number): string
 	local seconds = os.time() - when
 	if seconds < 60 then return "just now" end
@@ -398,7 +392,7 @@ end
 
 -- Deliberately NOT a scrim-and-card like the settings popup. This one is a
 -- drawer: it stays until it is closed from the same button that opened it, and
--- the caller shifts the console over by WIDTH rather than having it covered — so
+-- the caller shifts the console over by WIDTH rather than having it covered, so
 -- you can read a session and keep working. Nothing here is modal, which is why
 -- there is no full-bleed catcher to swallow clicks meant for the console.
 --
@@ -491,7 +485,7 @@ function Sessions.mountSidebar(parent: Instance, openSettings: () -> ()): (boole
 		Parent = panel,
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
-		-- 32 of header above, 32 of settings row below — both the same height as
+		-- 32 of header above, 32 of settings row below, both the same height as
 		-- the console's header and input row.
 		Size = UDim2.new(1, -1, 1, -64),
 		Position = UDim2.new(0, 0, 0, 32),
@@ -602,7 +596,7 @@ function Sessions.mountSidebar(parent: Instance, openSettings: () -> ()): (boole
 			})
 		end
 	end
-	-- Only worth drawing while it is on screen — it stays open now, so save() can
+	-- Only worth drawing while it is on screen, it stays open now, so save() can
 	-- call this on every turn without rebuilding rows nobody is looking at.
 	refreshList = function()
 		if panel.Visible then draw() end
@@ -617,9 +611,7 @@ function Sessions.mountSidebar(parent: Instance, openSettings: () -> ()): (boole
 	end
 end
 
--- =============================================================================
 -- Self-test
--- =============================================================================
 -- Both halves fail as a session that loads and then dies on its next request:
 -- a stub that drops a tool_result breaks the tool_use pairing, and an empty
 -- tool_use input re-encodes as `[]` and is rejected outright.

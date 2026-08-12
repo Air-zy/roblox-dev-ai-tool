@@ -1,4 +1,4 @@
--- catalog — search Roblox Free Models, load one by id.
+-- catalog: search Roblox Free Models, load one by id.
 --
 -- Search touches nothing and returns TEXT only; load inserts exactly ONE Model
 -- under a parent the caller names. Nothing is loaded on search because the
@@ -7,7 +7,7 @@
 --
 -- No pageNum: the underlying API returns nothing past page 2, so the parameter
 -- only ever bought the model a wasted turn. Results are filtered to public-domain
--- Models and sorted by take count — see the catalog section of Terminal.
+-- Models and sorted by take count, see the catalog section of Terminal.
 return {
 	name = "catalog",
 	description = "search Roblox Free Models; load one by id",

@@ -15,4 +15,8 @@ anything that goes against this should be adressed.
   files.
 - Fine-grained tool streaming, incl. tool JSON truncated by `max_tokens`:
   https://docs.claude.com/en/docs/agents-and-tools/tool-use/fine-grained-tool-streaming
+  NOT a beta any more — the `fine-grained-tool-streaming-2025-05-14` header does
+  nothing and has been removed. The switch is `eager_input_streaming` on the
+  tool definition, and it is deliberately not set: see the note on
+  `ANTHROPIC_BETA` in `Claude.lua` for what would have to change first.
 - Messages API: https://platform.claude.com/docs/en/api/messages

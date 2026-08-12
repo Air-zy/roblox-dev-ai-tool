@@ -1,12 +1,12 @@
 --!strict
--- Console.luau — the scrolling output area.
+-- Console.luau: the scrolling output area.
 --
 -- Assistant replies are rendered as real GUI objects, one per Markdown block,
 -- rather than as one big RichText string. That buys three things the string
 -- approach could not have:
 --   * a malformed inline run breaks one paragraph, not the whole reply
 --   * code blocks get a background, padding and a language tag
---   * code is verbatim — no escaping, so no way to mangle it
+--   * code is verbatim, no escaping, so no way to mangle it
 -- RichText survives only inside single paragraphs, where mixing weights in one
 -- wrapped label needs it.
 
@@ -20,11 +20,11 @@ local make = Theme.make
 
 local Console = {}
 local output: ScrollingFrame = nil :: any
--- The "Working…" row — see Console.setWorking.
+-- The "Working..." row, see Console.setWorking.
 local workingRow: TextLabel = nil :: any
 
--- Sticky bottom. ScrollingFrame has no bottom-pin and no scroll method — the
--- whole API is CanvasPosition and two read-only measurements — so following the
+-- Sticky bottom. ScrollingFrame has no bottom-pin and no scroll method, the
+-- whole API is CanvasPosition and two read-only measurements, so following the
 -- bottom is bookkeeping, and the only question is where to do it from.
 --
 -- Not from property signals, which is what the two earlier attempts here got
@@ -33,7 +33,7 @@ local workingRow: TextLabel = nil :: any
 -- LATER and the write was clamped against the old, shorter one. Writing it from
 -- the AbsoluteCanvasSize signal instead had the same disease one layer down: the
 -- signal says the size CHANGED, not that layout has settled, and the docs do not
--- say when the clamp bound is recomputed relative to it — so the view still
+-- say when the clamp bound is recomputed relative to it, so the view still
 -- crept further behind the longer a reply ran.
 --
 -- Everything therefore runs once per frame on Heartbeat, where the numbers are
@@ -41,8 +41,8 @@ local workingRow: TextLabel = nil :: any
 --
 -- The other half is telling the reader's scroll apart from the engine's own
 -- clamp, so that reading back through a reply is not fought while a canvas
--- shrink — the Working row hiding at the end of a turn, a thinking block
--- collapsing, a re-render dropping trailing blocks — is not mistaken for one.
+-- shrink: the Working row hiding at the end of a turn, a thinking block
+-- collapsing, a re-render dropping trailing blocks, is not mistaken for one.
 -- That needs no input events, which is good, because a ScrollingFrame handles
 -- the wheel and its own scrollbar internally and is not obliged to surface
 -- either as an InputObject. The engine only ever moves the position UP, and only
@@ -62,9 +62,7 @@ local KIND_COLOR: { [string]: Color3 } = {
 -- reads as a left-margin marker.
 local KIND_PREFIX: { [string]: string } = { cmd = "$ " }
 
--- =============================================================================
 -- Mount
--- =============================================================================
 function Console.mount(parent: Instance, layoutOrder: number): ScrollingFrame
 	output = make("ScrollingFrame", {
 		Name = "Output",
@@ -116,7 +114,7 @@ function Console.mount(parent: Instance, layoutOrder: number): ScrollingFrame
 	})
 
 	-- One connection does the whole thing: decide, then pin, once per frame with
-	-- settled numbers. maxY is the bottom of the scroll range — the only fact the
+	-- settled numbers. maxY is the bottom of the scroll range, the only fact the
 	-- engine gives us to work with.
 	local lastPos = 0
 	RunService.Heartbeat:Connect(function()
@@ -129,7 +127,7 @@ function Console.mount(parent: Instance, layoutOrder: number): ScrollingFrame
 			-- Higher than a clamp can account for, so the reader put it there.
 			stickToBottom = false
 		elseif pos >= maxY - STICK_SLOP then
-			-- At the bottom, however it got there — scrolled back down, or the canvas
+			-- At the bottom, however it got there, scrolled back down, or the canvas
 			-- shrank out from under a position that is now the bottom.
 			stickToBottom = true
 		end
@@ -142,7 +140,7 @@ function Console.mount(parent: Instance, layoutOrder: number): ScrollingFrame
 	return output
 end
 
--- `force` re-arms following even if the reader had scrolled up — for things they
+-- `force` re-arms following even if the reader had scrolled up, for things they
 -- just did themselves, like sending a message.
 function Console.scrollToBottom(force: boolean?)
 	if force then stickToBottom = true end
@@ -169,8 +167,8 @@ end
 -- TextEditable stays TRUE. Setting it false is the obvious way to make a
 -- read-only box and it does not work: the box stops taking focus at all, and
 -- with no focus there is no caret, no selection and nothing for Ctrl+C to copy.
--- So the box is a completely ordinary editable TextBox — which is what makes it
--- reliably selectable — and read-only is enforced by reverting any edit.
+-- So the box is a completely ordinary editable TextBox, which is what makes it
+-- reliably selectable, and read-only is enforced by reverting any edit.
 --
 -- Returns the box and a setter. Content has to go through the setter so the
 -- guard knows what the text is supposed to be; assigning .Text directly would
@@ -222,14 +220,12 @@ local function selectAll(box: TextBox)
 	box.SelectionStart = 1
 end
 
--- =============================================================================
 -- Plain lines
--- =============================================================================
 -- Commands, status and errors are never Markdown, so RichText stays off and the
 -- text goes in raw. Nothing to escape means nothing to escape wrongly.
 --
 -- Selectable, for the same reason code blocks are: this is where tool output
--- lands — grep hits, file listings, error text — and it is exactly the sort of
+-- lands: grep hits, file listings, error text, and it is exactly the sort of
 -- thing you want to pull out of the widget. RichText being off here is what
 -- makes that safe; a selection copies the characters you can see, with no markup
 -- to leak into it.
@@ -252,7 +248,7 @@ function Console.appendLine(text: string, kind: string?): TextBox
 	-- The console is one long column of monospace and a user turn used to be
 	-- just another line in it; side is the cheapest signal there is for "this
 	-- one was me". The left inset keeps a long message from spanning the full
-	-- width and losing the effect, and the prompt arrow comes off — it reads as
+	-- width and losing the effect, and the prompt arrow comes off, it reads as
 	-- a left-margin marker and looks wrong leading a right-aligned line.
 	if kind == "user" then
 		line.TextXAlignment = Enum.TextXAlignment.Right
@@ -285,9 +281,7 @@ function Console.appendLink(text: string, onClick: () -> ()): TextButton
 	return button
 end
 
--- =============================================================================
 -- Block renderers
--- =============================================================================
 -- Each returns the root GuiObject plus a setter, so the reconciler can update a
 -- block in place instead of rebuilding it.
 type Rendered = { node: GuiObject, set: (Markdown.Block) -> () }
@@ -312,7 +306,7 @@ local function richLabel(parent: Instance, font: Font, size: number, color: Colo
 end
 
 -- richLabel is the RichText one, and it is deliberately NOT selectable. With
--- RichText on, selection indices map to the RAW string — tags included — so
+-- RichText on, selection indices map to the RAW string, tags included, so
 -- copying a bold word would hand you `<b>word</b>`. Blocks that are already
 -- verbatim (code, plain lines, tool detail) use readOnlyBox instead and
 -- are selectable; formatted prose stays a label.
@@ -444,7 +438,7 @@ renderers.code = function(parent: Instance): Rendered
 
 	copyButton.MouseButton1Click:Connect(function()
 		selectAll(body)
-		-- The button cannot copy — nothing in a plugin can. It selects, and then
+		-- The button cannot copy, nothing in a plugin can. It selects, and then
 		-- says what to press. Naming the key beats a "Copy" label that silently
 		-- does half of what it claims.
 		copyButton.Text = "press Ctrl+C"
@@ -583,9 +577,7 @@ renderers.blank = function(parent: Instance): Rendered
 	return { node = frame, set = function() end }
 end
 
--- =============================================================================
 -- Streaming assistant bubble
--- =============================================================================
 export type Thinking = {
 	append: (string) -> (),
 	finish: () -> (),
@@ -600,7 +592,7 @@ export type Bubble = {
 }
 
 -- ponytail: re-parses the accumulated reply on each render, so an n-character
--- reply does O(n²) parsing. Throttled to ~20 fps below, and reconciliation means
+-- reply does O(n^2) parsing. Throttled to ~20 fps below, and reconciliation means
 -- only changed blocks touch the DataModel. Ceiling is roughly a 10k-character
 -- reply; past that, parse only the tail after the last completed block.
 local RENDER_INTERVAL = 0.05
@@ -721,9 +713,7 @@ function Console.createBubble(): Bubble
 	}
 end
 
--- =============================================================================
 -- Spinner
--- =============================================================================
 local SPINNER = { "/", "-", "\\", "|" }
 local SPINNER_INTERVAL = 0.12
 
@@ -750,7 +740,7 @@ end
 
 -- Sits below everything in the console for as long as a turn is running, which
 -- is where the next block is about to appear. It covers the gap between sending
--- and the first token — thinking blocks and tool calls carry their own spinners
+-- and the first token, thinking blocks and tool calls carry their own spinners
 -- once they exist, but until then the console is silent.
 local stopWorking: (() -> ())? = nil
 function Console.setWorking(on: boolean)
@@ -767,9 +757,7 @@ function Console.setWorking(on: boolean)
 	end
 end
 
--- =============================================================================
 -- Collapsible thinking block
--- =============================================================================
 function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinking
 	local host = parent or output
 	local container = make("Frame", {
@@ -783,7 +771,7 @@ function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinki
 	make("UIListLayout", { Parent = container, SortOrder = Enum.SortOrder.LayoutOrder })
 
 	-- MONO, matching a tool call's header and detail box. The two are the same
-	-- affordance — a collapsed row you click to expand — and they were already the
+	-- affordance: a collapsed row you click to expand, and they were already the
 	-- same TextSize; the only thing making them look different was BuilderSans
 	-- next to RobotoMono at the same nominal size.
 	local header = make("TextButton", {
@@ -856,9 +844,7 @@ function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinki
 	}
 end
 
--- =============================================================================
 -- Tool calls
--- =============================================================================
 -- write/edit carry whole files in `content` and `old`/`new`. Printing those raw
 -- would bury the console under the very source Claude just wrote, so the header
 -- gets a one-line summary and the full text lives in the expandable body.
@@ -877,7 +863,7 @@ local function summarise(value: any): string
 	return truncated and (firstLine .. "…") or firstLine
 end
 
--- tostring on a table gives "table: 0x…", and multiedit's `edits` is a table.
+-- tostring on a table gives "table: 0x...", and multiedit's `edits` is a table.
 local function verbatim(value: any): string
 	if type(value) == "string" then return value end
 	local encoded
@@ -894,12 +880,12 @@ end
 -- arrive as two separate stream blocks and the header has to go up before the
 -- results exist, or the user watches a silent console while a search runs.
 -- `isError` only recolours the header; the body is the same expandable detail,
--- which is the point — a failed call is exactly the one you want to open.
+-- which is the point, a failed call is exactly the one you want to open.
 --
 -- `input` may likewise be empty at first and filled in later through setInput.
 -- A tool_use block announces its name and id the moment the model starts writing
--- the call, but its arguments stream in afterwards — a whole file, for a `write`
--- — so the header goes up argument-less rather than leaving the console silent
+-- the call, but its arguments stream in afterwards, a whole file, for a `write`
+--, so the header goes up argument-less rather than leaving the console silent
 -- for the seconds that takes.
 function Console.appendToolCall(toolName: string, input: { [string]: any }, result: string?, isError: boolean?)
 	local label = ""
