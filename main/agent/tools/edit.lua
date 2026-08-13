@@ -6,7 +6,7 @@
 return {
 	{
 		name = "edit",
-		description = "replace one unique occurrence of old_string in script.",
+		description = "replace one unique occurrence of old_string in script",
 		input_schema = {
 			type = "object",
 			properties = {

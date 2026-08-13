@@ -6,7 +6,7 @@
 -- costs nothing until a call actually needs it.
 return {
 	name = "bash",
-	description = "rely on this using bash commands to explore/modify the data model",
+	description = "default to bash for data model exploration/edits",
 	input_schema = {
 		type = "object",
 		properties = { command = { type = "string" } },
