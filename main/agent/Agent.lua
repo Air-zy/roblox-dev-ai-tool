@@ -954,6 +954,15 @@ end
 -- every open document is listed with its own cursor rather than one being
 -- guessed at and labelled "the" file.
 local MAX_OPEN_DOCS = 6
+-- The count cap alone does not bound this. instancePath walks to game joining
+-- .Name, and neither nesting depth nor a name's length has a limit, so six
+-- entries is six unbounded strings. Whole entries are dropped rather than
+-- individual paths cut: a truncated path is one the model cannot hand to
+-- cat/sed, which costs the turn this hint exists to save. The budget is checked
+-- before an entry is added, not after, so the true bound is this plus one entry
+-- — the remaining slack is a single path, which is as tight as it gets without
+-- cutting one. Sized so the ordinary six-document case never reaches it.
+local MAX_OPEN_CHARS = 600
 
 local function editorContext(): string
 	local docs = Fs.openDocuments()
@@ -961,9 +970,10 @@ local function editorContext(): string
 		return ""
 	end
 	local parts: { string } = {}
+	local used = 0
 	for index, entry in ipairs(docs) do
-		if index > MAX_OPEN_DOCS then
-			parts[#parts + 1] = string.format("… %d more", #docs - MAX_OPEN_DOCS)
+		if index > MAX_OPEN_DOCS or used > MAX_OPEN_CHARS then
+			parts[#parts + 1] = string.format("… %d more", #docs - (index - 1))
 			break
 		end
 		-- instancePath, not GetFullName: this is a path the model can hand
@@ -985,6 +995,7 @@ local function editorContext(): string
 				or string.format("%s (cursor line %d)", label, line)
 		end
 		parts[#parts + 1] = label
+		used += #label + 2   -- + the ", " that will join it
 	end
 	return "\n\n[open in the editor: " .. table.concat(parts, ", ") .. "]"
 end

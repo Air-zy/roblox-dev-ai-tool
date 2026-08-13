@@ -49,7 +49,7 @@ main.lua                        window, toolbar, popups, usage panel
 | beta headers | `providers/Anthropic.lua:66` — read the comment before adding one |
 | history trimming | `Agent.lua:396` `clearOldToolResults`, gated by `cacheIsCold:369` |
 | one result capped / a turn's batch capped | `Agent.lua:128` `forModel`, `:156` `capTurn` |
-| open-editor hint on each message | `Agent.lua:954` `editorContext` — `""` when nothing is open |
+| open-editor hint on each message | `Agent.lua:967` `editorContext` — `""` when nothing is open; capped by `MAX_OPEN_DOCS`/`MAX_OPEN_CHARS:956` |
 | login | `providers/AnthropicAuth.lua:208` `startLogin` -> `:244` `completeLogin`; refresh `:313`, used by `getAccessToken:381` |
 | a shell line runs | `Shell.lua:3641` `Shell.run` -> `runCommand:3501`; entered from `Terminal:shell:766` |
 | a line becomes tokens | `Shell.lua:88` `tokenize` |
