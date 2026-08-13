@@ -10,7 +10,7 @@
 -- Models and sorted by take count, see the catalog section of Terminal.
 return {
 	name = "catalog",
-	description = "search Roblox Free Models; load one by id",
+	description = "search assets. alot are trashy",
 	input_schema = {
 		type = "object",
 		properties = {

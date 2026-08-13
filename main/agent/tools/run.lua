@@ -8,8 +8,7 @@
 -- buffer, so it tested stale text and reported a pass. See Exec.run.
 return {
 	name = "run",
-	description = "only use if bash cant, executes a luau script, no timeout. " ..
-		"scratch scripts go in /ServerStorage/tmp",
+	description = "only use if bash cant, executes a luau script, no timeout. scratch scripts go in /ServerStorage/tmp",
 	input_schema = {
 		type = "object",
 		properties = {
