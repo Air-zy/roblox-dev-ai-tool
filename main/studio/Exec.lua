@@ -524,7 +524,12 @@ return tostring(a) .. "/" .. tostring(b) .. "/" .. tostring(c)
 		-- leave every later run on a fractional budget.
 		local saved = RUN_TIMEOUT
 		RUN_TIMEOUT = 0.5
-		local hung, hungErr = runSource(term, "game:GetService(\"ServerStorage\"):WaitForChild(\"AgentNeverArrives\")")
+		-- A plain long wait, not WaitForChild. Both park the chunk forever, which
+		-- is all this checks, but WaitForChild also makes the ENGINE print
+		-- "Infinite yield possible" into the output five seconds later, long
+		-- after the run was given up on: a warning about a probe, in the log the
+		-- agent reads, every time the self-check runs.
+		local hung, hungErr = runSource(term, "task.wait(1e9)")
 		RUN_TIMEOUT = saved
 		if hung then
 			return false, "a chunk waiting on a child that never arrives returned success:\n" .. hung

@@ -308,7 +308,8 @@ end
 export type GrepMatch = { path: string, line: number, text: string, match: boolean }
 
 -- `include`/`exclude` filter by the instance's DISPLAYED name, which is what
--- --include=*.luau is reaching for: the name `ls` printed.
+-- --include=*.luau is reaching for: the name `ls` printed. `.lua` matches the
+-- same scripts, via Fs.matchesName.
 export type GrepScope = { include: ((string) -> boolean)?, exclude: ((string) -> boolean)? }
 
 function Terminal:grep(programs: { any }?, path: string?, opts: Fs.GrepOpts?,
@@ -338,10 +339,10 @@ function Terminal:grep(programs: { any }?, path: string?, opts: Fs.GrepOpts?,
 	local walkOk, walkErr = pcall(function()
 		for _, inst in ipairs(scope) do
 			local source = getSource(inst)
-			if source and filter.include and not filter.include(displayName(inst)) then
+			if source and filter.include and not Fs.matchesName(inst, filter.include) then
 				source = nil
 			end
-			if source and filter.exclude and filter.exclude(displayName(inst)) then
+			if source and filter.exclude and Fs.matchesName(inst, filter.exclude) then
 				source = nil
 			end
 			if source then

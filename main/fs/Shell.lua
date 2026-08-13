@@ -1699,7 +1699,7 @@ HANDLERS.find = function(self, argv)
 			-- search in the whole harness silently returned nothing.
 			local matches = nameMatcher(value :: string)
 			add(function(inst)
-				return matches(inst.Name) or matches(displayName(inst))
+				return Fs.matchesName(inst, matches)
 			end)
 		elseif arg == "-path" or arg == "-ipath" then
 			local matches = nameMatcher(value :: string)
@@ -1972,7 +1972,7 @@ HANDLERS.which = function(self, argv)
 	-- the word could mean here, so keep it, just no longer as the first answer.
 	local matches = nameMatcher(name)
 	local found, err = self:find(operands[2], function(inst)
-		return matches(inst.Name) or matches(displayName(inst))
+		return Fs.matchesName(inst, matches)
 	end)
 	if not found then
 		return fail("which", err)
@@ -4112,6 +4112,14 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		-- the exact list would pin creation order rather than the match.
 		{ line = "find . -name '*.luau' | wc -l", want = "6",
 		  why = "find -name matches the .luau display name" },
+		-- `ls` only prints .luau, but resolve accepts `cat Main.lua`, so a filter
+		-- that refused .lua had the harness contradicting itself.
+		{ line = "find . -name '*.lua' | wc -l", want = "6",
+		  why = "find -name matches .lua for the same scripts" },
+		{ line = "grep -rl beta . --include=*.lua", want = "/Sample",
+		  why = "--include=*.lua filters the same scripts as *.luau" },
+		{ line = "grep -rl beta . --exclude=*.lua", want = "no matches",
+		  why = "--exclude=*.lua excludes them too" },
 		{ line = "find . -name Sample", want = "/Sample  [ModuleScript]",
 		  why = "find -name matches the real name" },
 

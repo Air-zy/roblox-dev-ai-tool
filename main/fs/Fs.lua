@@ -406,6 +406,16 @@ function Fs.displayName(inst: Instance): string
 	return isScript(inst) and (inst.Name .. ".luau") or inst.Name
 end
 
+-- Does a name filter accept this instance? Every spelling a model might write:
+-- the real name, and for scripts BOTH suffixes. `ls` only ever prints `.luau`,
+-- but `.lua` is what half the ecosystem writes and resolve already accepts it,
+-- so `--include=*.lua` returning nothing was the harness disagreeing with
+-- itself: `cat Main.lua` worked, `grep --include=*.lua` found no such file.
+function Fs.matchesName(inst: Instance, matches: (string) -> boolean): boolean
+	return matches(inst.Name)
+		or (isScript(inst) and (matches(inst.Name .. ".luau") or matches(inst.Name .. ".lua")))
+end
+
 -- Split a path into parent and leaf; nil parent means "relative to the base".
 function Fs.splitPath(path: string): (string?, string)
 	local parent, leaf = path:match("^(.*)/([^/]+)$")
