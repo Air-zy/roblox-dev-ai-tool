@@ -2776,7 +2776,7 @@ HANDLERS.chmod = function(self, argv)
 			local descendants = target:GetDescendants()
 			table.move(descendants, 1, #descendants, 2, targets)
 		end
-		local _, applyErr = withUndo("Claude: chmod " .. mode, function()
+		local _, applyErr = withUndo("agent: chmod " .. mode, function()
 			for _, inst in ipairs(targets) do
 				local modeErr = apply(inst)
 				-- Under -R most instances have no execute bit and that is not an
@@ -2837,7 +2837,7 @@ HANDLERS.ln = function(self, argv)
 		end
 	end
 
-	local link, linkErr = withUndo("Claude: ln " .. leaf, function()
+	local link, linkErr = withUndo("agent: ln " .. leaf, function()
 		local value = Instance.new("ObjectValue")
 		value.Name = leaf
 		value.Value = target

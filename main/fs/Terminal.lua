@@ -473,7 +473,7 @@ function Terminal:create(className: string, name: string?, parentPath: string?):
 		return string.format("%s already exists", instancePath(existing)), nil
 	end
 
-	local created, createErr = withUndo("Claude: create " .. name, function()
+	local created, createErr = withUndo("agent: create " .. name, function()
 		local inst = Instance.new(className)
 		inst.Name = name
 		inst.Parent = parent
@@ -502,7 +502,7 @@ function Terminal:ensureScript(path: string): (Instance?, string?)
 		return nil, parentErr
 	end
 	local class, name = Fs.classFor(leaf)
-	return withUndo("Claude: create " .. name, function()
+	return withUndo("agent: create " .. name, function()
 		local inst = Instance.new(class)
 		inst.Name = name
 		inst.Parent = parent
@@ -532,7 +532,7 @@ function Terminal:write(path: string?, content: string?): (string?, string?)
 	-- this adds nothing; if it does not, this recording is the only thing making
 	-- the edit reversible. Losing undo on a write is data loss, so the coarser
 	-- recording is the cheaper mistake.
-	local _, writeErr = withUndo("Claude: write " .. target.Name, function()
+	local _, writeErr = withUndo("agent: write " .. target.Name, function()
 		local sourceErr = Fs.writeSource(target, content :: string)
 		if sourceErr then
 			error(sourceErr, 0)
@@ -602,7 +602,7 @@ function Terminal:multiedit(path: string?, edits: { any }?): (string?, string?)
 	end
 
 	-- Same undo reasoning as :write above.
-	local _, writeErr = withUndo("Claude: edit " .. target.Name, function()
+	local _, writeErr = withUndo("agent: edit " .. target.Name, function()
 		local sourceErr = Fs.writeSource(target, updated)
 		if sourceErr then
 			error(sourceErr, 0)
@@ -658,7 +658,7 @@ function Terminal:remove(path: string?): (string?, string?)
 
 	local fullPath = instancePath(target)
 	local descendants = #target:GetDescendants()
-	local _, removeErr = withUndo("Claude: rm " .. target.Name, function()
+	local _, removeErr = withUndo("agent: rm " .. target.Name, function()
 		target:Destroy()
 	end)
 	if removeErr then return nil, removeErr end
@@ -682,7 +682,7 @@ function Terminal:move(path: string?, destination: string?, name: string?): (str
 		return nil, "refusing to move an instance into itself"
 	end
 
-	local _, moveErr = withUndo("Claude: mv " .. target.Name, function()
+	local _, moveErr = withUndo("agent: mv " .. target.Name, function()
 		target.Parent = parent
 		if name and name ~= "" then
 			target.Name = name
@@ -715,7 +715,7 @@ function Terminal:copy(path: string?, destination: string?, name: string?): (str
 		return nil, string.format("%s is not Archivable and cannot be cloned", instancePath(target))
 	end
 
-	local copied, copyErr = withUndo("Claude: cp " .. target.Name, function()
+	local copied, copyErr = withUndo("agent: cp " .. target.Name, function()
 		local clone = target:Clone()
 		if name and name ~= "" then
 			clone.Name = name

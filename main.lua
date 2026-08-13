@@ -1,5 +1,5 @@
 --!strict
--- Claude Code for Roblox, plugin entry point.
+-- Plugin entry point.
 --
 -- This file does plugin setup and nothing else: widget, toolbar, the input row,
 -- and wiring the modules together. Rendering lives in Console, formatting in
@@ -7,6 +7,17 @@
 -- in Commands, and the DataModel browser in Terminal.
 
 assert(plugin ~= nil, "This script must run as a Roblox Studio plugin (the `plugin` global is missing).")
+
+-- Every place the product names itself to the user: toolbar, button, window
+-- title, startup banner, input placeholder. One string so a rename is one edit
+-- rather than a sweep, and so nothing downstream has to know what it says.
+--
+-- Not the two identifiers below it. `CreateDockWidgetPluginGuiAsync` and
+-- `CreateButton` take an ID as their first argument, and Studio keys the saved
+-- dock state, size and position to it. Changing an ID does not migrate anything:
+-- it orphans the old entry and every existing user's panel reappears at the
+-- default floating position. They are invisible, so they buy nothing back.
+local NAME = "Agent"
 
 local RunService = game:GetService("RunService")
 
@@ -64,8 +75,8 @@ local widgetInfo = DockWidgetPluginGuiInfo.new(
 	900, 320,
 	400, 140
 )
-local widget = plugin:CreateDockWidgetPluginGuiAsync("ClaudeCodeTerminalFloat", widgetInfo)
-widget.Title = "Claude Code"
+local widget = plugin:CreateDockWidgetPluginGuiAsync(NAME .. "TerminalFloat", widgetInfo)
+widget.Title = NAME
 -- DockWidgetPluginGui defaults to ZIndexBehavior.Global, where ZIndex is compared
 -- across the entire GUI rather than among siblings. Under Global, a child that
 -- doesn't set ZIndex sits at 1 and renders BEHIND any ancestor with a higher
@@ -74,8 +85,8 @@ widget.Title = "Claude Code"
 -- widget has to hand-pick a number.
 widget.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
-local toolbar = plugin:CreateToolbar("Claude Code")
-local toggleButton = toolbar:CreateButton("ClaudeCodeToggle", "Claude Code", "")
+local toolbar = plugin:CreateToolbar(NAME)
+local toggleButton = toolbar:CreateButton("CodeToggle", NAME, "")
 toggleButton.Click:Connect(function()
 	if RunService:IsRunning() then return end
 	widget.Enabled = not widget.Enabled
@@ -148,8 +159,8 @@ local sessionsButton = make("TextButton", {
 	Text = "three-bars-horizontal",
 	AutoButtonColor = false,
 })
--- No title label here: the widget's own title bar already says "Claude Code",
--- and a second copy inside it only costs header width.
+-- No title label here: the widget's own title bar already carries NAME, and a
+-- second copy inside it only costs header width.
 -- Nothing else lives in this bar. The model/effort readout moved to a chip in
 -- the input row that also SETS the model, and the gear moved to the bottom of
 -- the sessions drawer, a status line you cannot act on is not worth a corner.
@@ -286,7 +297,7 @@ local inputBox = make("TextBox", {
 	MultiLine = false,
 	ClearTextOnFocus = false,
 	Text = "",
-	PlaceholderText = "Message Claude…  ( / for commands · shift+enter for a new line )",
+	PlaceholderText = "Message " .. NAME .. "…  ( / for commands · shift+enter for a new line )",
 	PlaceholderColor3 = Theme.TEXT_LO,
 	TextXAlignment = Enum.TextXAlignment.Left,
 	TextYAlignment = Enum.TextYAlignment.Top,
@@ -476,24 +487,12 @@ end)
 -- switching model is one click from where you type instead of three from a
 -- panel. Both write the same setting; neither is the source of truth.
 --
--- The registry labels ("Claude Sonnet 5 (recommended)") are written for a
--- settings row several times wider than anything here, and at this width they
--- truncate to "Claude Sonnet 5 (recomm...". Split them instead: the name loses the
--- "Claude " every entry shares, and the parenthetical becomes the dim value on
--- the right, where the row already has a column for it.
-local function splitModel(label: string): (string, string?)
-	local name = (label:gsub("^Claude ", ""))
-	local hint = name:match("%((.-)%)$")
-	if hint then
-		name = (name:gsub("%s*%b()$", ""))
-	end
-	return name, hint
-end
-
-local function shortModel(label: string): string
-	local name = splitModel(label)
-	return name
-end
+-- The registry's `label` is written for a settings row several times wider than
+-- anything here, and at this width it truncates mid-parenthetical. The compact
+-- rows read `name` and `hint` instead, which the registry carries as separate
+-- fields. This file used to recover them from the label with two regexes, one of
+-- which stripped the vendor word by name — a thing Provider.luau says nothing
+-- outside providers/ may do, and a guess that breaks on a two-word vendor.
 
 local function refreshModel()
 	local id = Settings.model()
@@ -503,7 +502,7 @@ local function refreshModel()
 	)
 	for _, entry in ipairs(Wire.MODELS) do
 		if entry.id == id then
-			modelButton.Text = shortModel(entry.label) .. effort
+			modelButton.Text = entry.name .. effort
 			return
 		end
 	end
@@ -659,8 +658,7 @@ local function drawPopup()
 		-- The parenthetical rides in the trailing column rather than being dropped:
 		-- it is the only thing separating "Max only" from "fastest" at the moment
 		-- of choosing.
-		local name, hint = splitModel(entry.label)
-		popupRow(i, name, entry.id == current and "check-small" or nil, hint, false, function()
+		popupRow(i, entry.name, entry.id == current and "check-small" or nil, entry.hint, false, function()
 			Settings.setModel(entry.id)
 			modelPopup.Visible = false
 			refreshModel()
@@ -875,17 +873,17 @@ task.spawn(function()
 	}
 	for _, vector in ipairs(SHA_VECTORS) do
 		if Sha256.hex(vector.input) ~= vector.expected then
-			warn("[Claude Code] SHA-256 self-test FAILED")
+			warn("[agent] SHA-256 self-test FAILED")
 			break
 		end
 	end
 
 	local markdownOk, markdownErr = Markdown.selfTest()
 	if not markdownOk then
-		warn("[Claude Code] Markdown self-test FAILED: " .. tostring(markdownErr))
+		warn("[agent] Markdown self-test FAILED: " .. tostring(markdownErr))
 	end
 
-	Console.appendLine("Claude Code for Roblox", "system")
+	Console.appendLine(NAME, "system")
 	if Auth.isLoggedIn() then
 		Console.appendLine("Logged in. Type /help for commands, or just start typing.", "info")
 	else
@@ -909,24 +907,24 @@ task.spawn(function()
 
 	local shellOk, shellErr = Terminal.selfTest()
 	if not shellOk then
-		warn("[Claude Code] Terminal self-test FAILED: " .. tostring(shellErr))
+		warn("[agent] Terminal self-test FAILED: " .. tostring(shellErr))
 	end
 	local propsOk, propsErr = Props.selfTest()
 	if not propsOk then
-		warn("[Claude Code] Property lookup self-test FAILED: " .. tostring(propsErr))
+		warn("[agent] Property lookup self-test FAILED: " .. tostring(propsErr))
 	end
 	local agentOk, agentErr = Agent.selfTest()
 	if not agentOk then
-		warn("[Claude Code] Context trimming self-test FAILED: " .. tostring(agentErr))
+		warn("[agent] Context trimming self-test FAILED: " .. tostring(agentErr))
 	end
 	local cacheOk, cacheErr = Wire.selfTest()
 	if not cacheOk then
-		warn("[Claude Code] Prompt cache self-test FAILED: " .. tostring(cacheErr))
+		warn("[agent] Prompt cache self-test FAILED: " .. tostring(cacheErr))
 	end
 	local sessionsOk, sessionsErr = Sessions.selfTest()
 	if not sessionsOk then
-		warn("[Claude Code] Session storage self-test FAILED: " .. tostring(sessionsErr))
+		warn("[agent] Session storage self-test FAILED: " .. tostring(sessionsErr))
 	end
 end)
 
-print("[Claude Code] Loaded.")
+print("[agent] Loaded.")

@@ -677,7 +677,7 @@ local function runTurn(turn: number)
 			bubble.finishThinking()
 
 			if not result.ok then
-				warn("[Claude Code] " .. tostring(result.error))
+				warn("[agent] " .. tostring(result.error))
 				bubble.setError(tostring(result.error))
 				-- Only drop the user's message on the FIRST turn. Later turns end
 				-- in tool_result blocks that pair with tool_use blocks already in
@@ -839,7 +839,7 @@ local function runTurn(turn: number)
 					-- summarised away. warn() as well: MAX_DETAIL_CHARS clips the
 					-- body, and a truncated multiedit is exactly the case that
 					-- overruns it, the Output window keeps the whole thing.
-					warn(string.format("[Claude Code] %s: unparsed tool input (stop_reason: %s): %s",
+					warn(string.format("[agent] %s: unparsed tool input (stop_reason: %s): %s",
 						tostring(block.name), tostring(result.stopReason), tostring(block.input)))
 					local raw = { raw_input = tostring(block.input) }
 					if call then
@@ -920,7 +920,7 @@ local function runTurn(turn: number)
 
 		onError = function(message: string)
 			if finish() then return end
-			warn("[Claude Code] " .. message)
+			warn("[agent] " .. message)
 			-- Without this the thinking header keeps spinning on a dead request.
 			bubble.finishThinking()
 			bubble.setError(message)

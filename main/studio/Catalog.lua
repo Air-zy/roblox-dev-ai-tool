@@ -263,7 +263,7 @@ function Catalog.load(self: any, assetId: number?, parentPath: string?): (string
 	local asset: Instance?
 	local scriptCount = 0
 	local partCount = 0
-	local _, loadErr = withUndo("Claude: load asset " .. tostring(assetId), function()
+	local _, loadErr = withUndo("agent: load asset " .. tostring(assetId), function()
 		-- GetObjects returns an ARRAY of roots, not one Instance: an asset is a
 		-- list of top-level objects, and a Model is merely the common case of a
 		-- list with one entry.

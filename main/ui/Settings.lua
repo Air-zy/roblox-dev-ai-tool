@@ -487,7 +487,7 @@ function Settings.mountPanel(
 	sectionLabel(scroll, "RUN CODE", 11)
 	dropdown(scroll, 12, {
 		{ id = false, label = "Disabled", hint = "recommended" },
-		{ id = true,  label = "Enabled",  hint = "Claude can execute Luau" },
+		{ id = true,  label = "Enabled",  hint = "the agent can execute Luau" },
 	}, Settings.allowRun, function(id)
 		Settings.setAllowRun(id :: boolean)
 	end)

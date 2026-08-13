@@ -82,6 +82,14 @@ local EPILOGUE = {
 local PROLOGUE_LINES = #PROLOGUE
 local MAX_OUTPUT_LINES = 40
 
+-- How long a chunk may stay suspended before the run is abandoned. This is a
+-- budget for YIELDING, not for work: a chunk that never yields never reaches the
+-- poll loop, so no amount of computation is cut short by it. Generous enough for
+-- a probe that legitimately waits on something, short enough that a wait which
+-- is never going to end does not cost the turn. Not a constant: selfTest drops
+-- it to prove the deadline fires without spending this long to do it.
+local RUN_TIMEOUT = 10
+
 -- When each module was FIRST required this session, which is when its cache
 -- entry was populated, and the only timestamp worth comparing an edit against.
 -- Deliberately never refreshed on a later require: refreshing it would move the
@@ -125,7 +133,7 @@ end
 -- Runs a string. INTERNAL: the tool only reaches Exec.run below, which reads the
 -- source out of a file first. Kept separate so the self-tests can drive the
 -- executor without writing a fixture to the DataModel for every case.
-local function runSource(self: any, code: string?): (string?, string?)
+local function runSource(self: any, code: string?, home: Instance?): (string?, string?)
 	if not code or code:match("^%s*$") then
 		return nil, "nothing to run"
 	end
@@ -136,9 +144,24 @@ local function runSource(self: any, code: string?): (string?, string?)
 	local source = table.concat(PROLOGUE, "\n") .. "\n" .. code .. "\n" .. table.concat(EPILOGUE, "\n")
 
 	local module = Instance.new("ModuleScript")
-	module.Name = "ClaudeRun_" .. tostring(os.clock()):gsub("%.", "")
+	module.Name = "AgentRun_" .. tostring(os.clock()):gsub("%.", "")
 	module.Source = source
-	module.Parent = ServerStorage
+	-- Parented BESIDE the file it came from, not in ServerStorage. The chunk's
+	-- `script` is this generated module, so `script.Parent` and every sibling
+	-- lookup hanging off it only mean what the file meant if this sits where the
+	-- file sits. Parked in ServerStorage, a Tool's LocalScript doing
+	-- `script.Parent:WaitForChild("ThrowBanana")` resolved script.Parent to
+	-- ServerStorage and waited on a child that could never arrive.
+	--
+	-- Falls back when there is nowhere to sit: a target at the DataModel root has
+	-- no parent, and Parent = nil puts the module outside the tree where require
+	-- cannot reach it at all.
+	local placed = home ~= nil and pcall(function()
+		module.Parent = home
+	end)
+	if not placed then
+		module.Parent = ServerStorage
+	end
 
 	-- Everything the chunk itself prints is captured by PROLOGUE, which shadows
 	-- print and warn as locals. That shadowing stops at the chunk's own scope
@@ -167,15 +190,46 @@ local function runSource(self: any, code: string?): (string?, string?)
 		end)
 	end)
 
-	-- ponytail: no timeout. Luau cannot preempt a running chunk, so
-	-- `while true do end` freezes Studio until its own script-exhaustion
-	-- timeout fires. The tool description tells Claude to bound its loops;
-	-- there is no in-process fix short of running the code in a separate
-	-- Actor with a watchdog, which is the upgrade path if this bites.
+	-- Two different hangs used to be treated as one, and only one of them is
+	-- actually unfixable here.
+	--
+	-- A chunk that YIELDS and is never resumed — `WaitForChild` on a child that
+	-- will not arrive, `:Wait()` on an event that will not fire — is not burning
+	-- CPU. It is suspended, Studio is responsive, and the scheduler simply has no
+	-- reason to come back to it. Requiring it on this thread propagated that
+	-- suspension straight up through Exec.run into tool dispatch, so the agent's
+	-- turn hung forever on a script that was merely waiting. Running it on its own
+	-- thread means the wait is the chunk's problem and not ours: we poll for
+	-- completion and give up on a deadline.
+	--
+	-- A chunk that spins — `while true do end` — never yields, so the loop below
+	-- never gets a turn and this cannot help. That one still freezes Studio until
+	-- script exhaustion, and still needs an Actor with a watchdog to fix.
+	--
+	-- ponytail: a timed-out thread is cancelled below on a best effort. task.cancel
+	-- takes a thread suspended on a wait, which is the case this exists for, but it
+	-- refuses one that cannot be cancelled and there is no second lever. The Actor
+	-- upgrade above is the only thing that collects a chunk unconditionally.
 	local result
-	local ranOk, requireErr = pcall(function()
-		result = require(module)
+	local ranOk: boolean, requireErr: any = false, nil
+	local finished = false
+	local thread = coroutine.create(function()
+		ranOk, requireErr = pcall(function()
+			result = require(module)
+		end)
+		finished = true
 	end)
+	-- Errors on this thread are already inside the pcall above; a failure to
+	-- resume at all is not, and would otherwise be swallowed into a timeout.
+	local resumed, resumeErr = coroutine.resume(thread)
+	if not resumed then
+		ranOk, requireErr, finished = false, resumeErr, true
+	end
+	local deadline = os.clock() + RUN_TIMEOUT
+	while not finished and os.clock() < deadline do
+		task.wait()
+	end
+	local timedOut = not finished
 
 	-- One frame before disconnecting, and it is not politeness, without it this
 	-- whole listener captures NOTHING in the common case.
@@ -206,9 +260,23 @@ local function runSource(self: any, code: string?): (string?, string?)
 	end
 
 	-- Destroy in every path, including a syntax error inside require.
+	--
+	-- Destroying the module does NOT stop a chunk that is still going: a required
+	-- module's body runs on the requiring thread, so once the closure is running
+	-- the instance is a dead handle and freeing it changes nothing. Killing the
+	-- thread is a separate act, below.
 	pcall(function()
 		module:Destroy()
 	end)
+
+	-- Cancel rather than abandon. A thread suspended on a WaitForChild that will
+	-- never resolve otherwise stays parked for the session holding the chunk's
+	-- upvalues, and every timed-out run leaves another one. pcall'd because
+	-- cancel refuses threads it cannot cancel, and a failure here is a leak
+	-- rather than something worth failing the run over.
+	if timedOut then
+		pcall(task.cancel, thread)
+	end
 
 	-- Both output blocks cap the same way, and used to say so twice.
 	local function appendCapped(lines: { string }, heading: string, from: { string })
@@ -229,7 +297,24 @@ local function runSource(self: any, code: string?): (string?, string?)
 	-- another plugin printing at the same moment lands here too, and the heading
 	-- must not claim an origin it cannot check.
 	local function appendEscaped(lines: { string })
-		appendCapped(lines, "--- also printed during this call (not captured by run) ---", escaped)
+		appendCapped(lines, "--- also printed during this call ---", escaped)
+	end
+
+	-- Before the ranOk check: on this path the chunk never returned, so ranOk is
+	-- still its initial false and requireErr is nil, which would otherwise be
+	-- reported as the error "nil".
+	--
+	-- The message names the cause rather than the symptom. "timed out" alone sends
+	-- the agent looking for a slow loop, when what actually happened is a wait on
+	-- something that edit mode is never going to provide: a LocalScript's
+	-- LocalPlayer, a RemoteEvent's reply, an instance streamed in at runtime.
+	if timedOut then
+		local failure = {
+			string.format("gave up after %gs — suspended on a wait, not looping", RUN_TIMEOUT),
+			"nothing runs here: LocalPlayer is nil, no events fire. WaitForChild(name, 1) returns nil instead of hanging",
+		}
+		appendEscaped(failure)
+		return nil, table.concat(failure, "\n")
 	end
 
 	if not ranOk then
@@ -333,7 +418,9 @@ end
 -- reports line N, and the require cache is never touched so there is no clone
 -- and nothing to go stale. What it costs is `script`, which refers to the
 -- generated module and not to the file, unavoidable either way since edit-mode
--- require cannot run a module twice without cloning it.
+-- require cannot run a module twice without cloning it. The target's parent goes
+-- through so that at least `script.Parent` is the file's own parent rather than
+-- wherever the generated module happened to be parked; see runSource.
 function Exec.run(self: any, path: string?): (string?, string?)
 	if not path or path == "" then
 		return nil, "run needs a path to a script. Write one to /ServerStorage/tmp first"
@@ -347,7 +434,7 @@ function Exec.run(self: any, path: string?): (string?, string?)
 	if not source or source:match("^%s*$") then
 		return nil, "empty script: " .. instancePath(target)
 	end
-	return runSource(self, source)
+	return runSource(self, source, target.Parent)
 end
 
 function Exec.selfTest(probeTerm: any): (boolean, string?)
@@ -369,7 +456,7 @@ function Exec.selfTest(probeTerm: any): (boolean, string?)
 
 	if runGuard and runGuard() then
 		local probe = Instance.new("ModuleScript")
-		probe.Name = "ClaudeReloadProbe"
+		probe.Name = "AgentReloadProbe"
 		probe.Source = "return 1"
 		probe.Parent = ServerStorage
 		local out, runErr = runSource(probeTerm, string.format([[
@@ -394,7 +481,7 @@ return tostring(a) .. "/" .. tostring(b) .. "/" .. tostring(c)
 		-- this is where it shows up as a number rather than as the agent
 		-- editing the wrong line.
 		local byPath = Instance.new("ModuleScript")
-		byPath.Name = "ClaudeRunPathProbe"
+		byPath.Name = "AgentRunPathProbe"
 		-- Not a bare number: "ran in 0.07 ms" heads every result, so `find("7")`
 		-- would pass whether or not the print ever landed.
 		byPath.Source = "print(\"probe-printed\")\nerror(\"boom\")"
@@ -422,6 +509,47 @@ return tostring(a) .. "/" .. tostring(b) .. "/" .. tostring(c)
 		local multi = runSource(term, "return 1, nil, \"three\"")
 		if not multi or not multi:find("1, nil, three", 1, true) then
 			return false, "run dropped values past the first:\n" .. tostring(multi)
+		end
+
+		-- A chunk that yields and comes back must still be read normally: the
+		-- poll loop is the whole path here, and getting it wrong reports a
+		-- perfectly good run as a timeout.
+		local yielded = runSource(term, "task.wait(0.1)\nprint(\"after-yield\")\nreturn \"resumed\"")
+		if not yielded or not yielded:find("after-yield", 1, true) or not yielded:find("resumed", 1, true) then
+			return false, "a chunk that yielded and finished was not read back:\n" .. tostring(yielded)
+		end
+
+		-- And the deadline itself. Borrows RUN_TIMEOUT down rather than waiting
+		-- the real one out, restored in both exits so a failure here does not
+		-- leave every later run on a fractional budget.
+		local saved = RUN_TIMEOUT
+		RUN_TIMEOUT = 0.5
+		local hung, hungErr = runSource(term, "game:GetService(\"ServerStorage\"):WaitForChild(\"AgentNeverArrives\")")
+		RUN_TIMEOUT = saved
+		if hung then
+			return false, "a chunk waiting on a child that never arrives returned success:\n" .. hung
+		end
+		if not tostring(hungErr):find("gave up", 1, true) then
+			return false, "an endless wait did not report as timed out:\n" .. tostring(hungErr)
+		end
+
+		-- script.Parent is the file's parent, not wherever the generated module
+		-- was parked. This is the bug that started all of it: a sibling lookup
+		-- that found ServerStorage and waited forever.
+		local sibling = Instance.new("Folder")
+		sibling.Name = "AgentSiblingProbe"
+		sibling.Parent = ServerStorage
+		local reader = Instance.new("ModuleScript")
+		reader.Name = "AgentSiblingReader"
+		reader.Source = "return script.Parent.Name"
+		reader.Parent = sibling
+		local sibOut, sibErr = Exec.run(term, "/ServerStorage/AgentSiblingProbe/AgentSiblingReader")
+		sibling:Destroy()
+		if not sibOut then
+			return false, "sibling probe failed to run: " .. tostring(sibErr)
+		end
+		if not sibOut:find("AgentSiblingProbe", 1, true) then
+			return false, "script.Parent was not the file's parent:\n" .. sibOut
 		end
 	end
 

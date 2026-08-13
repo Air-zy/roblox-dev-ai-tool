@@ -175,7 +175,7 @@ function Sessions.save()
 
 	local ok, json = pcall(function() return HttpService:JSONEncode(conversation) end)
 	if not ok then
-		warn("[Claude Code] session not saved: " .. tostring(json))
+		warn("[agent] session not saved: " .. tostring(json))
 		return
 	end
 	if #json > MAX_BYTES then

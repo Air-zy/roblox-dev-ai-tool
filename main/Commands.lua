@@ -40,7 +40,7 @@ handlers["/help"] = function()
 		Console.appendLine(string.format("  %-14s %s", entry.cmd, entry.desc), "info")
 	end
 	Console.appendLine("", "info")
-	Console.appendLine("Claude's tools:", "info")
+	Console.appendLine("tools:", "info")
 	-- Both lines are derived, not hand-written, which is how the old list ended
 	-- up advertising eleven shell commands out of twenty-six, and why the tool
 	-- line now comes from the registry rather than a literal that goes stale the

@@ -68,10 +68,16 @@ local function capsFor(model: string): { thinking: string, effort: boolean }
 	return MODEL_CAPS[model] or DEFAULT_CAPS
 end
 
+-- Carried as parts, not as one string the callers take apart again. `label` is
+-- the whole line for anything with room for it; `name` and `hint` exist because
+-- the compact rows want them separately and used to recover them with a pair of
+-- regexes in main.luau — one of which had to strip the vendor word, which meant
+-- naming a vendor in a file that is not allowed to. Composing here is free;
+-- parsing it back cost a heuristic that guessed wrong on a two-word vendor.
 local MODELS = {
-	{ id = "claude-sonnet-5",              label = "Claude Sonnet 5 (recommended)" },
-	{ id = "claude-opus-5",                label = "Claude Opus 5 (Max only)" },
-	{ id = "claude-haiku-4-5",             label = "Claude Haiku 4.5 (fastest)" },
+	{ id = "claude-sonnet-5",  label = "Claude Sonnet 5 (recommended)", name = "Sonnet 5",  hint = "recommended" },
+	{ id = "claude-opus-5",    label = "Claude Opus 5 (Max only)",      name = "Opus 5",    hint = "Max only" },
+	{ id = "claude-haiku-4-5", label = "Claude Haiku 4.5 (fastest)",    name = "Haiku 4.5", hint = "fastest" },
 }
 local DEFAULT_MODEL = "claude-sonnet-5"
 
