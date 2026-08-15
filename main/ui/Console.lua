@@ -969,7 +969,7 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 		Size = UDim2.new(1, 0, 0, 20),
 		FontFace = Theme.MONO,
 		TextSize = Theme.SMALL_SIZE,
-		TextColor3 = isError and Theme.ERR_CLR or Theme.ACCENT,
+		TextColor3 = isError and Theme.ERR_CLR or Theme.TOOL_CLR,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextTruncate = Enum.TextTruncate.AtEnd,
 		Text = "▶ " .. label,

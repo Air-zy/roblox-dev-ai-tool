@@ -21,6 +21,7 @@ Theme.THINK_CLR   = Color3.fromRGB(184, 168, 156) -- #B8A89C warm light brown
 Theme.CODE_CLR    = Color3.fromRGB(226, 183, 148) -- #E2B794 sand, for code spans
 Theme.ERR_CLR     = Color3.fromRGB(229, 120, 110) -- #E5786E lighter red
 Theme.BAR_CLR     = Color3.fromRGB(140, 178, 214) -- #8CB2D6 creamy blue, usage bars
+Theme.TOOL_CLR    = Color3.fromRGB(160, 172, 218) -- #A0ACDA periwinkle, tool calls
 
 -- Fonts
 -- Enum.Font.Code (Source Code Pro) everywhere made prose hard to read at 13px.
