@@ -8,10 +8,12 @@
 -- whole response, prose, tool calls, and thinking alike, and needs no beta
 -- header on current models. "high" is the API default.
 --
--- thinkingBudget below exists only for models that predate adaptive thinking
--- (Haiku 4.5 here). On those, effort is unsupported and budget_tokens is the
--- only lever; on Claude 5 models budget_tokens is rejected outright. Wire.luau
--- picks the right one per model.
+-- The level is stored globally and always kept, the way /effort does it in
+-- Claude Code, which never asks whether the model supports the parameter. The
+-- gate is at send time: Wire.luau drops it for a model that does not take one,
+-- so picking Haiku 4.5 makes the setting do nothing and switching back makes it
+-- matter again. Nothing is substituted in the meantime — budget_tokens is not an
+-- effort dial.
 
 local Theme = require(script.Parent:WaitForChild("Theme"))
 -- Reaches into agent/ for the model list only. Settings is the one module that
@@ -33,15 +35,20 @@ local KEY_SEARCH = "cc_web_search"
 local DEFAULT_SYSTEM = "we are in edit mode roblox studio, do not do anything from scratch"
 Settings.DEFAULT_SYSTEM = DEFAULT_SYSTEM
 
--- maxTokens is a hard ceiling on thinking PLUS answer, so it has to scale with
--- effort or a high-effort turn gets truncated mid-thought. legacyBudget is the
--- budget_tokens fallback for pre-adaptive models (1024 minimum).
-local EFFORT_LEVELS: { { name: string, api: string, hint: string, maxTokens: number, legacyBudget: number } } = {
-	{ name = "Low",    api = "low",    hint = "fastest, cheapest",   maxTokens = 8192,  legacyBudget = 1024 },
-	{ name = "Medium", api = "medium", hint = "balanced",            maxTokens = 16384, legacyBudget = 4096 },
-	{ name = "High",   api = "high",   hint = "API default",         maxTokens = 32768, legacyBudget = 8192 },
-	{ name = "Xhigh",  api = "xhigh",  hint = "long agentic work",   maxTokens = 64000, legacyBudget = 16384 },
-	{ name = "Max",    api = "max",    hint = "no token constraints", maxTokens = 64000, legacyBudget = 24576 },
+-- Effort is one string on the wire and nothing else. It used to carry a
+-- per-level max_tokens and a per-level budget_tokens beside it; both were
+-- invented. max_tokens is a ceiling, not a reservation — an unused one costs
+-- nothing — and effort governs how hard the model thinks, not how long the
+-- answer may be, so scaling it meant a Low-effort turn truncated mid-`write` on
+-- a long file. budget_tokens does not track effort either: it is the ceiling
+-- minus one, on the only models that still take it. Both live in the provider
+-- now, which is the only thing that should know a model's limits.
+local EFFORT_LEVELS: { { name: string, api: string, hint: string } } = {
+	{ name = "Low",    api = "low",    hint = "fastest, cheapest" },
+	{ name = "Medium", api = "medium", hint = "balanced" },
+	{ name = "High",   api = "high",   hint = "API default" },
+	{ name = "Xhigh",  api = "xhigh",  hint = "long agentic work" },
+	{ name = "Max",    api = "max",    hint = "no token constraints" },
 }
 Settings.EFFORT_LEVELS = EFFORT_LEVELS
 
@@ -81,15 +88,6 @@ function Settings.effortName(): string return EFFORT_LEVELS[state.effort].name e
 -- The value sent as output_config.effort on models that support it.
 function Settings.effort(): string
 	return EFFORT_LEVELS[state.effort].api
-end
-
--- Fallback for pre-adaptive models; ignored elsewhere.
-function Settings.thinkingBudget(): number
-	return EFFORT_LEVELS[state.effort].legacyBudget
-end
-
-function Settings.maxTokens(): number
-	return EFFORT_LEVELS[state.effort].maxTokens
 end
 
 function Settings.setModel(id: string)

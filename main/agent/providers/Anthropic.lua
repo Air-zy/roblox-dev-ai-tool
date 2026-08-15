@@ -41,10 +41,11 @@ local ANTHROPIC_VERSION = "2023-06-01"
 --     model that supports it.
 --   fine-grained-tool-streaming-2025-05-14, no longer a beta at all. The
 --     switch is `eager_input_streaming` on the TOOL DEFINITION; the header
---     does nothing. Not set here either, deliberately: onToolUseStart already
---     puts the call header up at content_block_start, before any argument has
---     streamed, and setInput runs once with the finished input. Nothing renders
---     partial arguments, so there is currently nothing for it to improve.
+--     does nothing. It IS set, in Tools.definitions, and the reason given here
+--     for leaving it off — that nothing renders partial arguments, so it had
+--     nothing to improve — was wrong. It is not about rendering. Buffered
+--     parameters put nothing on the wire while a long `write` is generated, and
+--     a silent stream is one Roblox closes.
 local ANTHROPIC_BETA = "claude-code-20250219,oauth-2025-04-20"
 
 -- The identity block Anthropic checks for. Must be the FIRST system block.
@@ -57,14 +58,29 @@ local CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for 
 --   thinking = "budget": legacy extended thinking. budget_tokens is the only
 --     control; output_config.effort is NOT supported and must be omitted.
 -- Unknown models default to adaptive, matching every current Claude release.
-local MODEL_CAPS: { [string]: { thinking: string, effort: boolean } } = {
-	["claude-opus-5"]             = { thinking = "adaptive", effort = true },
-	["claude-sonnet-5"]           = { thinking = "adaptive", effort = true },
-	["claude-haiku-4-5"]          = { thinking = "budget",   effort = false },
+--
+-- maxOutput is the documented per-model output ceiling. A ceiling is not a
+-- reservation: billing counts tokens actually generated, and max_tokens is
+-- explicitly excluded from the output-per-minute rate limit, so asking for the
+-- documented maximum costs nothing and only removes a way to be truncated
+-- mid-answer. The default is the smaller number because an unknown model is
+-- more likely to be a smaller one, and asking for more than a model allows is a
+-- 400 rather than a silent clamp.
+--
+-- ponytail: hand-written, and it goes stale the day a model ships — the numbers
+-- here were copied from Claude Code's own table and were already wrong for two
+-- of these three. Claude Code keeps the same table but treats it as a fallback
+-- under GET /v1/models, which reports max_tokens per model and is the upgrade
+-- path if this is ever wrong again. Three models and a 400 that says so is not
+-- yet worth a fetch and a cache.
+local MODEL_CAPS: { [string]: { thinking: string, effort: boolean, maxOutput: number } } = {
+	["claude-opus-5"]             = { thinking = "adaptive", effort = true,  maxOutput = 128000 },
+	["claude-sonnet-5"]           = { thinking = "adaptive", effort = true,  maxOutput = 128000 },
+	["claude-haiku-4-5"]          = { thinking = "budget",   effort = false, maxOutput = 64000 },
 }
-local DEFAULT_CAPS = { thinking = "adaptive", effort = true }
+local DEFAULT_CAPS = { thinking = "adaptive", effort = true, maxOutput = 64000 }
 
-local function capsFor(model: string): { thinking: string, effort: boolean }
+local function capsFor(model: string): { thinking: string, effort: boolean, maxOutput: number }
 	return MODEL_CAPS[model] or DEFAULT_CAPS
 end
 
@@ -101,7 +117,7 @@ local function Initialize(oauthModule: any)
 end
 
 -- Builds the thinking/effort part of the body.
-local function applyReasoning(bodyTable: { [string]: any }, model: string, effort: string?, thinkingBudget: number?)
+local function applyReasoning(bodyTable: { [string]: any }, model: string, effort: string?)
 	local caps = capsFor(model)
 
 	if caps.effort and effort and effort ~= "" then
@@ -111,20 +127,24 @@ local function applyReasoning(bodyTable: { [string]: any }, model: string, effor
 	end
 
 	if caps.thinking == "adaptive" then
-		-- `display` defaults to "omitted" on current models, and omitted does not
-		-- mean "no thinking blocks", it means the blocks arrive with an EMPTY
-		-- thinking field. The console's thinking drawer was therefore opening on
-		-- nothing at all. "summarized" is what actually puts words in it. Thinking
-		-- happens and is billed the same either way; this only controls whether
-		-- you get to read it.
+		-- "summarized" is the documented default, and Claude Code omits the field
+		-- entirely, so this is explicit rather than load-bearing. It is spelled
+		-- out because the drawer once opened on blocks whose thinking field was
+		-- empty, which "omitted" would explain — but that was a guess, and the
+		-- API reference contradicts it. The real cause was never found. If empty
+		-- thinking blocks come back, this line is not what fixed it.
 		bodyTable.thinking = { type = "adaptive", display = "summarized" }
-	elseif thinkingBudget and thinkingBudget > 0 then
-		bodyTable.thinking = { type = "enabled", budget_tokens = thinkingBudget }
-		-- Thinking tokens count against max_tokens, so the budget has to leave
-		-- room for the actual answer.
-		if (bodyTable.max_tokens :: number) <= thinkingBudget then
-			bodyTable.max_tokens = thinkingBudget + 4096
-		end
+	elseif caps.thinking == "budget" then
+		-- Thinking tokens come out of max_tokens, and the API requires the budget
+		-- to be strictly under it. There is nothing to tune: a budget is a
+		-- ceiling on thinking, not a quota that gets spent, so handing over
+		-- everything but one token costs nothing on a turn that thinks briefly
+		-- and never truncates one that does not. Effort does not enter into it —
+		-- these are the models that reject output_config.effort outright.
+		bodyTable.thinking = {
+			type = "enabled",
+			budget_tokens = (bodyTable.max_tokens :: number) - 1,
+		}
 	end
 end
 
@@ -202,12 +222,12 @@ local function streamMessage(args: {
 	messages: { any },
 	maxTokens: number?,
 	effort: string?,
-	thinkingBudget: number?,
 	tools: { any }?,
 	}, callbacks: {
 		onText: ((string) -> ())?,
 		onThinking: ((string) -> ())?,
 		onToolUseStart: ((string?, string) -> ())?,  -- (blockId, toolName), before any input
+		onToolInput: ((string?, string) -> ())?,     -- (blockId, raw JSON fragment)
 		onServerToolUse: ((string, string?, any) -> ())?,  -- (toolName, blockId, parsedInput)
 		onServerToolResult: ((string, string?, any) -> ())?, -- (toolName, toolUseId, rawContent)
 		onComplete: ((any) -> ())?,
@@ -233,7 +253,9 @@ local function streamMessage(args: {
 	end
 
 	local model = args.model or DEFAULT_MODEL
-	local maxTokens = args.maxTokens or 4096
+	-- Ask for everything the model will give; see MODEL_CAPS for why that is
+	-- free. Callers may still pass a smaller ceiling, and nothing currently does.
+	local maxTokens = args.maxTokens or capsFor(model).maxOutput
 
 	local systemBlocks = {
 		{ type = "text", text = CLAUDE_CODE_IDENTITY },
@@ -278,7 +300,7 @@ local function streamMessage(args: {
 		system = systemBlocks,
 	}
 
-	applyReasoning(bodyTable, model, args.effort, args.thinkingBudget)
+	applyReasoning(bodyTable, model, args.effort)
 
 	if args.tools and #args.tools > 0 then
 		-- Writes into the caller's table. Agent.buildTools() hands over freshly
@@ -377,9 +399,18 @@ local function streamMessage(args: {
 				local evt = parsed :: any
 
 				if currentEvent == "message_start" then
-					-- Initial message object (empty content). Its usage carries
-					-- input_tokens and the cache counts; message_delta repeats them
-					-- cumulatively, so reading only the latter is not a loss.
+					-- Initial message object, empty content. Its usage is where
+					-- input_tokens and the two cache counts are guaranteed to
+					-- appear. message_delta MAY repeat them, and the streaming
+					-- reference shows it both ways: its web-search example carries
+					-- the full set, its plain text and tool_use examples carry
+					-- output_tokens alone. Keeping this one and letting the delta
+					-- overwrite field by field is correct under either, where
+					-- taking only the delta silently zeroes the cache line on
+					-- exactly the ordinary turns it exists to report.
+					if evt.message and evt.message.usage then
+						usage = table.clone(evt.message.usage)
+					end
 
 				elseif currentEvent == "content_block_start" then
 					local idx = evt.index
@@ -439,6 +470,13 @@ local function streamMessage(args: {
 						block.signature = delta.signature
 					elseif delta.type == "input_json_delta" then
 						block.input = block.input .. delta.partial_json
+						-- Raw, unparsed, and possibly mid-token: these fragments are
+						-- only valid JSON once the block closes, so this is for
+						-- display and nothing else. content_block_stop still owns the
+						-- parse that decides whether the tool may run.
+						if callbacks.onToolInput then
+							callbacks.onToolInput(block.id, delta.partial_json)
+						end
 					elseif delta.type == "citations_delta" then
 						-- Cited text blocks carry their sources alongside the text;
 						-- dropping them on replay loses the grounding for later turns.
@@ -484,8 +522,15 @@ local function streamMessage(args: {
 					if evt.delta and evt.delta.stop_reason then
 						stopReason = evt.delta.stop_reason
 					end
+					-- Merged, not replaced: output_tokens here is cumulative and
+					-- always present, the input and cache counts sometimes are
+					-- not, and an absent field must leave message_start's value
+					-- standing rather than erase it.
 					if evt.usage then
-						usage = evt.usage
+						usage = usage or {}
+						for key, value in pairs(evt.usage) do
+							usage[key] = value
+						end
 					end
 
 				elseif currentEvent == "message_stop" then
@@ -560,6 +605,15 @@ local function streamMessage(args: {
 	-- Assign to the forward-declared `stream` local (so processSSEEvents can see it)
 	stream = client
 
+	-- InactivityTimeout is raised by Roblox, not by the API, and it says nothing
+	-- about WHERE the silence was. The two cases have different causes and
+	-- different fixes: before the first byte is the server reprocessing an
+	-- uncached prefix, which is a caching problem; after it is a stall mid-answer,
+	-- which is not. Wall clock, because the thing being measured is a network
+	-- wait, and seconds are enough against a window Roblox puts near 20.
+	local startedAt = os.time()
+	local firstByteAt: number? = nil
+
 	stream.Opened:Connect(function(statusCode: number, headers: string)
 		if statusCode ~= 200 then
 			-- Non-200 status, the error body will come through MessageReceived
@@ -570,6 +624,7 @@ local function streamMessage(args: {
 
 	stream.MessageReceived:Connect(function(message: string)
 		if handle.cancelled then return end
+		if firstByteAt == nil then firstByteAt = os.time() end
 		-- Try to parse as SSE events first (normal streaming response)
 		-- If the response is an error (JSON, not SSE format), processSSEEvents
 		-- won't find any valid events, and we'll check if it's a JSON error.
@@ -599,7 +654,24 @@ local function streamMessage(args: {
 	stream.Error:Connect(function(statusCode: number, errorMessage: string)
 		if handle.cancelled then return end
 		handle.cancelled = true  -- latch first: a late MessageReceived must not race this
-		warn("[Claude Code] Stream error (HTTP " .. tostring(statusCode) .. "): " .. tostring(errorMessage))
+
+		-- Which side of the first byte this died on, and how long it took to get
+		-- there. Spelled out in the message itself rather than logged separately,
+		-- because the person who sees this is the one who has to decide whether
+		-- the history is too big or the connection is bad.
+		local now = os.time()
+		local where: string
+		if firstByteAt == nil then
+			where = string.format(
+				"silent for %ds, no first byte — the prefix was almost certainly uncached and the server was still reading it",
+				now - startedAt)
+		else
+			where = string.format(
+				"first byte after %ds, then stalled %ds mid-answer",
+				(firstByteAt :: number) - startedAt, now - (firstByteAt :: number))
+		end
+		warn(string.format("[Claude Code] Stream error (HTTP %s): %s — %s",
+			tostring(statusCode), tostring(errorMessage), where))
 		if callbacks.onError then
 			-- textParts is only filled in at message_stop, which an error mid-
 			-- stream never reaches, so it is empty here even when real text
@@ -619,7 +691,8 @@ local function streamMessage(args: {
 			-- mostly-finished answer instead of discarding it on what is usually
 			-- a transient stall, not a real failure.
 			callbacks.onError(
-				"Stream error (HTTP " .. tostring(statusCode) .. "): " .. tostring(errorMessage),
+				string.format("Stream error (HTTP %s): %s — %s",
+					tostring(statusCode), tostring(errorMessage), where),
 				#partial > 0 and table.concat(partial, "\n") or nil)
 		end
 		-- Only six WebStreamClients may exist at once. Every other exit path
@@ -689,6 +762,37 @@ local function selfTest(): (boolean, string?)
 	end
 	if conversation[#conversation].content[1].cache_control ~= nil then
 		return false, "withMessageCache tagged a live tool_result block"
+	end
+
+	-- applyReasoning picks between two request shapes that each 400 if they
+	-- reach the wrong model: budget_tokens on an adaptive model, effort on one
+	-- that predates it. Both directions are checked because both were sent at
+	-- some point.
+	local adaptive: { [string]: any } = { max_tokens = 128000 }
+	applyReasoning(adaptive, "claude-sonnet-5", "xhigh")
+	if adaptive.thinking.type ~= "adaptive" then
+		return false, "adaptive model did not get adaptive thinking"
+	end
+	if adaptive.thinking.budget_tokens ~= nil then
+		return false, "adaptive model was sent budget_tokens; the API rejects it"
+	end
+	if not adaptive.output_config or adaptive.output_config.effort ~= "xhigh" then
+		return false, "effort did not reach output_config on a model that supports it"
+	end
+
+	local budget: { [string]: any } = { max_tokens = 64000 }
+	applyReasoning(budget, "claude-haiku-4-5", "xhigh")
+	if budget.output_config ~= nil then
+		return false, "effort was sent to a model that does not support it"
+	end
+	if budget.thinking.type ~= "enabled" then
+		return false, "pre-adaptive model did not get extended thinking"
+	end
+	-- Strictly under max_tokens, or the request is rejected outright.
+	if budget.thinking.budget_tokens ~= 63999 then
+		return false, string.format(
+			"budget_tokens was %s, expected max_tokens - 1",
+			tostring(budget.thinking.budget_tokens))
 	end
 
 	return true

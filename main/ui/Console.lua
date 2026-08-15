@@ -173,6 +173,26 @@ end
 -- Returns the box and a setter. Content has to go through the setter so the
 -- guard knows what the text is supposed to be; assigning .Text directly would
 -- be immediately reverted.
+-- Roblox truncates a TextLabel or TextBox `.Text` at 16 KiB. Silently, with no
+-- warning and no property saying it happened, and it is documented nowhere but
+-- the devforum. The failure therefore does not look like a display limit: a long
+-- thinking drawer or a large code block simply stops mid-word, which reads as the
+-- model having given up rather than the label having.
+--
+-- Every unbounded assignment goes through here or through the cap in
+-- renderDetail. A new one is a new instance of the same silent bug.
+local ENGINE_TEXT_LIMIT = 16384
+
+local function fitText(text: string): string
+	if #text <= ENGINE_TEXT_LIMIT then return text end
+	-- Reserve is generous because the note has to fit INSIDE the limit; a note
+	-- appended past it is the one part guaranteed to be cut off.
+	local keep = ENGINE_TEXT_LIMIT - 64
+	return text:sub(1, keep)
+		.. string.format("\n… %d more characters, past what Roblox will render",
+			#text - keep)
+end
+
 local function readOnlyBox(parent: Instance, font: Font, size: number, color: Color3)
 	local box = make("TextBox", {
 		Parent = parent,
@@ -204,9 +224,13 @@ local function readOnlyBox(parent: Instance, font: Font, size: number, color: Co
 	end)
 
 	return box, function(text: string)
-		content = text
+		-- Fitted BEFORE it is stored, not just before it is shown: `content` is
+		-- what the typing guard above puts back, so storing the unfitted string
+		-- would make every keystroke restore a value the box can never hold, and
+		-- the two would never compare equal again.
+		content = fitText(text)
 		setting = true
-		box.Text = text
+		box.Text = content
 		setting = false
 	end
 end
@@ -825,11 +849,28 @@ function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinki
 	end)
 
 	local text = ""
+	-- Latched at the point the label stops accepting more. A long thought runs to
+	-- tens of thousands of characters, and reassigning a 16 KiB string on every
+	-- delta once it can no longer change anything is pure cost, so past the limit
+	-- this stops writing to the label entirely.
+	--
+	-- The note carries no count, deliberately. Thinking is still streaming when
+	-- this fires, so any number written here would be wrong a moment later, and a
+	-- stale number is worse than none: it reads as the total.
+	local capped = false
 	Console.scrollToBottom()
 	return {
 		append = function(delta: string)
 			text ..= delta
-			body.Text = text
+			if not capped then
+				if #text > ENGINE_TEXT_LIMIT then
+					capped = true
+					body.Text = text:sub(1, ENGINE_TEXT_LIMIT - 64)
+						.. "\n… still thinking, past what Roblox will render"
+				else
+					body.Text = text
+				end
+			end
 			if expanded then Console.scrollToBottom() end
 		end,
 		finish = function()
@@ -941,8 +982,23 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 	detailBox.LayoutOrder = 2
 	make("UIPadding", { Parent = detailBox, PaddingLeft = UDim.new(0, 12) })
 
+	-- The raw argument JSON as it streams, before there is anything parsed to
+	-- show. Kept separately from `detail` because it is replaced wholesale the
+	-- moment setInput lands, rather than merged with it.
+	--
+	-- Two counters, and the split is the point: `streamed` stops growing at the
+	-- cap so re-rendering stays O(cap) per fragment instead of O(n), while
+	-- `streamedLen` keeps counting so the header can report the real size. A
+	-- `write` arrives as thousands of fragments, and concatenating the whole
+	-- buffer on each one is how a progress display becomes the slow part.
+	local streamed = ""
+	local streamedLen = 0
+
 	local function renderDetail(res: string?)
 		local lines = table.clone(detail)
+		if #lines == 0 and streamed ~= "" then
+			lines = { streamed }
+		end
 		if res then
 			table.insert(lines, "")
 			table.insert(lines, res)
@@ -959,10 +1015,22 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 	-- No result yet means the call is still running, so the header spins the same
 	-- way the thinking header does until setResult lands.
 	local expanded = false
+	-- Declared above the handlers that close over it, not beside setResult where
+	-- it is written: a `local` introduced later is a different binding, and the
+	-- click handler would have captured a global nil instead.
+	local lastResult = result
 	local pending = result == nil
 	local frame = SPINNER[1]
 	local function renderHeader()
-		header.Text = (expanded and "▼ " or "▶ ") .. label .. (pending and (" " .. frame) or "")
+		-- While the arguments are still streaming there is nothing to summarise,
+		-- so the size stands in for them. It is the only thing on screen that
+		-- distinguishes a large `write` making progress from a call that has
+		-- stalled, which is the whole reason the spinner alone was not enough.
+		local size = if streamedLen > 0 and #detail == 0
+			then string.format(" %.1fk", streamedLen / 1000)
+			else ""
+		header.Text = (expanded and "▼ " or "▶ ") .. label .. size
+			.. (pending and (" " .. frame) or "")
 	end
 	local stopSpin: (() -> ())? = nil
 	if pending then
@@ -975,11 +1043,14 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 	header.MouseButton1Click:Connect(function()
 		expanded = not expanded
 		detailBox.Visible = expanded
+		-- Re-rendered on open because appendInput skips the render while the block
+		-- is closed. Without this, expanding a call mid-stream showed whatever was
+		-- there when it was last open, which for a `write` is nothing at all.
+		if expanded then renderDetail(lastResult) end
 		renderHeader()
 		Console.scrollToBottom()
 	end)
 
-	local lastResult = result
 	Console.scrollToBottom()
 	return {
 		-- The arguments, once the streamed input has finished and parsed. The
@@ -987,8 +1058,30 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 		-- holding both.
 		setInput = function(from: { [string]: any })
 			readInput(from)
+			-- The parsed arguments supersede the raw stream, and dropping it here
+			-- is what lets renderDetail prefer `detail` without a mode flag.
+			streamed = ""
+			streamedLen = 0
 			renderHeader()
 			renderDetail(lastResult)
+		end,
+		-- A fragment of the argument JSON, exactly as it came off the wire. Only
+		-- reaches here because tools set eager_input_streaming; without it the API
+		-- holds the whole parameter back and there is nothing to append.
+		--
+		-- Renders only while the block is open. A collapsed block still counts the
+		-- bytes for the header, so the common case of a long `write` nobody has
+		-- expanded costs one concat and one string.format per fragment.
+		appendInput = function(fragment: string)
+			streamedLen += #fragment
+			if #streamed < MAX_DETAIL_CHARS then
+				streamed ..= fragment
+			end
+			renderHeader()
+			if expanded then
+				renderDetail(lastResult)
+				Console.scrollToBottom()
+			end
 		end,
 		-- `failed` recolours the header the way the isError argument does at
 		-- creation, for a call that only turns out to be a failure once its

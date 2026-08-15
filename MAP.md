@@ -35,10 +35,11 @@ main.lua                        window, toolbar, popups, usage panel
 
 | Question | Answer |
 |---|---|
-| the system prompt is built | `providers/Anthropic.lua:238` `systemBlocks` — identity first, user block if non-empty, cache_control on the last |
-| the user's system prompt is stored | `Settings.lua:78` `Settings.system()`, default `DEFAULT_SYSTEM:33` (one line, edit-mode framing) |
-| a request is assembled | `providers/Anthropic.lua:199` `streamMessage` -> `applyReasoning:104` -> tools+cache -> `withMessageCache:151` |
-| a response is parsed | `providers/Anthropic.lua:345` `processSSEEvents` |
+| the system prompt is built | `providers/Anthropic.lua:248` `systemBlocks` — identity first, user block if non-empty, cache_control on the last |
+| the user's system prompt is stored | `Settings.lua:85` `Settings.system()`, default `DEFAULT_SYSTEM:33` (one line, edit-mode framing) |
+| a request is assembled | `providers/Anthropic.lua:206` `streamMessage` -> `applyReasoning:107` -> tools+cache -> `withMessageCache:158` |
+| a response is parsed | `providers/Anthropic.lua:355` `processSSEEvents` |
+| effort / thinking / the output ceiling | `providers/Anthropic.lua:107` `applyReasoning` against `MODEL_CAPS:60`; the ceiling is `maxOutput` on the same table. `Settings` picks a level and nothing else — no per-effort token maths lives there |
 | which provider is live | `agent/Provider.lua` — `wire` and `auth`; nothing outside `providers/` names a vendor |
 | the turn loop | `Agent.lua:466` `runTurn` |
 | a turn's result is handled | `Agent.lua:674` `onComplete` -> assemble -> dispatch tools -> `continueTurn:516` |

@@ -143,7 +143,7 @@ caching is a prefix match, so reordering them throws away the cache behind it.
 
 Every turn resends the whole conversation, so one call that dumps 3000 lines
 keeps costing for the rest of the session. Against that: the system prompt and
-tools cache for an hour and the conversation for five minutes, grep and find
+tools and the conversation all cache for an hour, grep and find
 return locations rather than content, output is capped and tells you the command
 that gets the rest, and tool descriptions stay near empty because a model
 already knows what ls does, it just cannot know this is a DataModel.

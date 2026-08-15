@@ -503,6 +503,18 @@ local function runTurn(turn: number)
 		thinkingSeen = false
 	end
 
+	-- Puts a tool-call block on screen and registers it so a later result can
+	-- find it. Shared by our tools and Anthropic's, which differ only in whether
+	-- any arguments exist yet: both split the bubble underneath, both key the
+	-- block by id, and both have to stop the spinner immediately when there is no
+	-- id, because nothing can ever pair a result to a block that has none.
+	local function beginCall(name: string, id: string?, input: { [string]: any }): any
+		splitPending = true
+		local call = Console.appendToolCall(name, input)
+		if id then pendingCalls[id] = call else call.finish() end
+		return call
+	end
+
 	local function finish()
 		if finished then return true end
 		finished = true
@@ -604,9 +616,7 @@ local function runTurn(turn: number)
 		model = Settings.model(),
 		system = Settings.system(),
 		messages = conversation,
-		maxTokens = Settings.maxTokens(),
 		effort = Settings.effort(),
-		thinkingBudget = Settings.thinkingBudget(),
 		tools = buildTools(),
 	}, {
 		onThinking = function(delta: string)
@@ -639,23 +649,24 @@ local function runTurn(turn: number)
 		-- lands below a bubble that may still be written to, so the text that
 		-- comes after the call must start a new bubble under it.
 		onToolUseStart = function(id: string?, name: string)
-			splitPending = true
-			local call = Console.appendToolCall(name, {})
-			-- Nothing can pair a result to a block with no id, so it must not be
-			-- left spinning for one.
-			if id then pendingCalls[id] = call else call.finish() end
+			beginCall(name, id, {})
+		end,
+
+		-- Each fragment of the arguments as the model writes them. The block is
+		-- already on screen from onToolUseStart, so this only feeds it; a fragment
+		-- for an id we never saw start has nowhere to go and is dropped rather
+		-- than opening a second block halfway through a call.
+		onToolInput = function(id: string?, fragment: string)
+			local call = id and pendingCalls[id] or nil
+			if call then call.appendInput(fragment) end
 		end,
 
 		onServerToolUse = function(name: string, id: string?, input: any)
-			splitPending = true
 			-- Header goes up now, results are filled in when they arrive: the API
 			-- runs these itself and sends the call and its result as two separate
 			-- blocks, so waiting for both would leave the console silent for the
 			-- whole search.
-			local call = Console.appendToolCall(name, type(input) == "table" and input or {})
-			-- No id means nothing can ever pair a result to this block, so it must
-			-- not be left spinning for one.
-			if id then pendingCalls[id] = call else call.finish() end
+			beginCall(name, id, type(input) == "table" and input or {})
 		end,
 
 		onServerToolResult = function(name: string, toolUseId: string?, content: any)

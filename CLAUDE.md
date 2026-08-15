@@ -21,7 +21,8 @@ REFER TO https://create.roblox.com/docs/llms.txt for complex roblox stuff
   https://docs.claude.com/en/docs/agents-and-tools/tool-use/fine-grained-tool-streaming
   NOT a beta any more — the `fine-grained-tool-streaming-2025-05-14` header does
   nothing and has been removed. The switch is `eager_input_streaming` on the
-  tool definition, and it is deliberately not set: see the note on
-  `ANTHROPIC_BETA` in `agent/providers/Anthropic.lua` for what would have to
-  change first.
+  tool definition and it IS set, on every tool, in `agent/Tools.lua`. On Roblox
+  it is load-bearing, not a latency tweak: buffered parameters send nothing
+  while a long `write` generates, and WebStreamClient closes a stream that goes
+  quiet with `HttpError: InactivityTimeout`.
 - Messages API: https://platform.claude.com/docs/en/api/messages

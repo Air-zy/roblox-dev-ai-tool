@@ -301,15 +301,10 @@ end
 
 -- Refresh tokens using the stored refresh_token. Returns (true, nil) on success.
 local function refresh(): (boolean, string?)
-	warn("[Claude Code] OAuth.refresh() called")
 	local refreshToken = getSetting(KEY_REFRESH_TOKEN) :: string?
 	if not refreshToken or refreshToken == "" then
-		warn("[Claude Code] refresh: no refresh_token stored")
 		return false, "No refresh_token stored — please log in again."
 	end
-
-	warn(string.format("[Claude Code] refresh: using refresh_token prefix '%s…' (len=%d)",
-		string.sub(refreshToken :: string, 1, 16), #refreshToken))
 
 	local body = {
 		grant_type = "refresh_token",
@@ -352,9 +347,10 @@ local function refresh(): (boolean, string?)
 		return false, "Refresh response missing access_token."
 	end
 
-	warn(string.format("[Claude Code] refresh: success! new access_token prefix '%s…', expires_in=%s",
-		string.sub(accessToken, 1, 16), tostring(expiresIn)))
-
+	-- Nothing is logged on the way through here, deliberately. Output is a shared
+	-- window that ends up in screenshots and bug reports, and a token prefix is
+	-- still token material. Failures below carry their reason back to the caller,
+	-- which is where a person can actually see it.
 	saveTokens(accessToken, newRefresh, tonumber(expiresIn) :: number)
 	return true, nil
 end
@@ -372,12 +368,6 @@ local function getAccessToken(): (string?, string?)
 	local at = getSetting(KEY_ACCESS_TOKEN) :: string?
 	local rt = getSetting(KEY_REFRESH_TOKEN) :: string?
 	local exp = getSetting(KEY_EXPIRES_AT) :: number?
-
-	--[[warn(string.format("[Claude Code] getAccessToken: at_len=%s rt_len=%s exp=%s now=%s",
-		at and #at or "nil",
-		rt and #rt or "nil",
-		exp and tostring(exp) or "nil",
-		os.time()))]]
 
 	if not rt or rt == "" then
 		return nil, "Not logged in."

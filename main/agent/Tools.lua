@@ -55,6 +55,26 @@ end
 
 -- The API-shaped definitions, in stable order. Agent copies this before tagging
 -- a cache breakpoint onto the last entry.
+--
+-- eager_input_streaming is on for every tool, and on this host it is a
+-- correctness flag rather than a latency one. Without it "the API buffers and
+-- validates each parameter value before streaming it back", so a `write` whose
+-- parameter IS a 2000-line script puts NOTHING on the wire for as long as the
+-- model takes to generate it. Roblox's WebStreamClient kills a stream that goes
+-- quiet — the announcement for the feature recommends a heartbeat every 20
+-- seconds — and it does not expose a knob to extend that. So the longer the
+-- script, the more reliably the request died, which is exactly the shape the bug
+-- had. Fragments flowing keep the connection alive.
+--
+-- The cost is that the accumulated input may be partial or invalid JSON, which
+-- this codebase already had to handle for the max_tokens case: the parse at
+-- content_block_stop is guarded, leaves inputParsed nil, and Agent turns that
+-- into a tool_result carrying the raw fragment. That guard is what makes this
+-- flag safe to set; do not remove it.
+--
+-- On every tool rather than just the big-input ones because any tool can be
+-- handed a large argument, and a per-tool allowlist is another thing to keep
+-- right. It costs one cache write the first time the tool block changes.
 function Tools.definitions(): { any }
 	local out: { any } = {}
 	for i, tool in ipairs(defs) do
@@ -62,6 +82,7 @@ function Tools.definitions(): { any }
 			name = tool.name,
 			description = tool.description,
 			input_schema = tool.input_schema,
+			eager_input_streaming = true,
 		}
 	end
 	return out
