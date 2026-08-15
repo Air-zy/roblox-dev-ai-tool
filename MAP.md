@@ -35,70 +35,70 @@ main.lua                        window, toolbar, popups, usage panel
 
 | Question | Answer |
 |---|---|
-| the system prompt is built | `providers/Anthropic.lua:259` `systemBlocks` — identity first, user block if non-empty, cache_control on the last |
+| the system prompt is built | `providers/Anthropic.lua:238` `systemBlocks` — identity first, user block if non-empty, cache_control on the last |
 | the user's system prompt is stored | `Settings.lua:78` `Settings.system()`, default `""` |
-| a request is assembled | `providers/Anthropic.lua:220` `streamMessage` -> `applyReasoning:123` -> tools+cache -> `withMessageCache:170` |
-| a response is parsed | `providers/Anthropic.lua:366` `processSSEEvents` |
+| a request is assembled | `providers/Anthropic.lua:199` `streamMessage` -> `applyReasoning:104` -> tools+cache -> `withMessageCache:151` |
+| a response is parsed | `providers/Anthropic.lua:345` `processSSEEvents` |
 | which provider is live | `agent/Provider.lua` — `wire` and `auth`; nothing outside `providers/` names a vendor |
-| the turn loop | `Agent.lua:460` `runTurn` |
-| a turn's result is handled | `Agent.lua:668` `onComplete` -> assemble -> dispatch tools -> `continueTurn` |
-| the user hits enter | `main.lua:808` `submit` -> `Commands.handle:188` -> `Agent.send:988` |
+| the turn loop | `Agent.lua:466` `runTurn` |
+| a turn's result is handled | `Agent.lua:674` `onComplete` -> assemble -> dispatch tools -> `continueTurn:516` |
+| the user hits enter | `main.lua:792` `submit` -> `Commands.handle:184` -> `Agent.send:1003` |
 | a tool runs | `Tools.lua:85` `dispatch` — never throws |
-| tool definitions on the wire | `Tools.lua:58` `definitions` + `Agent.lua:207` `buildTools` |
-| model / thinking / effort / search per model | `providers/Anthropic.lua:82` `MODEL_CAPS`; UI list at `:96` |
-| beta headers | `providers/Anthropic.lua:66` — read the comment before adding one |
-| history trimming | `Agent.lua:396` `clearOldToolResults`, gated by `cacheIsCold:369` |
-| one result capped / a turn's batch capped | `Agent.lua:128` `forModel`, `:156` `capTurn` |
-| open-editor hint on each message | `Agent.lua:967` `editorContext` — `""` when nothing is open; capped by `MAX_OPEN_DOCS`/`MAX_OPEN_CHARS:956` |
-| login | `providers/AnthropicAuth.lua:208` `startLogin` -> `:244` `completeLogin`; refresh `:313`, used by `getAccessToken:381` |
-| a shell line runs | `Shell.lua:3641` `Shell.run` -> `runCommand:3501`; entered from `Terminal:shell:766` |
-| a line becomes tokens | `Shell.lua:88` `tokenize` |
-| flags parsed / refused | `Shell.lua:232` `partition` against `SPECS:569` |
-| the command table | `Shell.lua:847` `HANDLERS` |
-| the list `/help` prints | `Shell.lua:3459` `Shell.COMMANDS` |
-| heredocs / redirection | `Shell.lua:409` `extractHeredoc`, `:469` `takeRedirect`, `:533` `applyRedirect` |
-| diff | `Shell.lua:3164` `diffOne`, handler at `:3224` |
-| a path becomes an instance | `Fs.lua:289` `Fs.resolve` — also `.luau` suffixes and root case-folding |
-| an instance becomes a path | `Fs.lua:271` `instancePath` |
-| a script is read / written | `Fs.lua:71` `getSource`, `:118` `Fs.writeSource` |
-| undo recording | `Fs.lua:636` `Fs.withUndo` — every mutation goes through it |
-| root/service protection | `Fs.lua:655` `Fs.guardProtected` |
-| modification times (we keep our own) | `Fs.lua:465` `Fs.watch` |
-| ls / cat / stat / find / grep / tree | `Terminal.lua:115 / 135 / 208 / 252 / 316 / 403` |
-| write / multiedit | `Terminal.lua:518 / 565` |
-| Luau is executed | `studio/Exec.lua:129` `Exec.run`; PROLOGUE at `:58`, every entry one physical line |
-| the run guard (off by default) | `studio/Exec.lua:33` `setRunGuard`, backed by `Settings.allowRun` |
-| free models | `studio/Catalog.lua:174` `search`, `:247` `load` |
-| regex compiled / matched | `text/Regex.lua:782` `compile`, `:753` `Program:find` |
-| sed parsed / applied | `text/Sed.lua:197` `parseSedCommand`, `:104` `substitute` |
+| tool definitions on the wire | `Tools.lua:58` `definitions` + `Agent.lua:219` `buildTools` |
+| model / thinking / effort / search per model | `providers/Anthropic.lua:60` `MODEL_CAPS`; UI list at `:77` |
+| beta headers | `providers/Anthropic.lua:48` — read the comment before adding one |
+| history trimming | `Agent.lua:404` `clearOldToolResults`, gated by `cacheIsCold:377` |
+| one result capped / a turn's batch capped | `Agent.lua:140` `forModel`, `:168` `capTurn` |
+| open-editor hint on each message | `Agent.lua:967` `editorContext` — `""` when nothing is open; capped by `MAX_OPEN_DOCS:956`/`MAX_OPEN_CHARS:965` |
+| login | `providers/AnthropicAuth.lua:198` `startLogin` -> `:234` `completeLogin`; refresh `:303`, used by `getAccessToken:371` |
+| a shell line runs | `Shell.lua:3637` `Shell.run` -> `runCommand:3497`; entered from `Terminal:shell:761` |
+| a line becomes tokens | `Shell.lua:86` `tokenize` |
+| flags parsed / refused | `Shell.lua:230` `partition` against `SPECS:567` |
+| the command table | `Shell.lua:845` `HANDLERS` |
+| the list `/help` prints | `Shell.lua:3455` `Shell.COMMANDS` |
+| heredocs / redirection | `Shell.lua:407` `extractHeredoc`, `:467` `takeRedirect`, `:531` `applyRedirect` |
+| diff | `Shell.lua:3160` `diffOne`, handler at `:3220` |
+| a path becomes an instance | `Fs.lua:283` `Fs.resolve` — also `.luau` suffixes and root case-folding |
+| an instance becomes a path | `Fs.lua:265` `instancePath` |
+| a script is read / written | `Fs.lua:69` `getSource`, `:116` `Fs.writeSource` |
+| undo recording | `Fs.lua:632` `Fs.withUndo` — every mutation goes through it |
+| root/service protection | `Fs.lua:651` `Fs.guardProtected` |
+| modification times (we keep our own) | `Fs.lua:467` `Fs.watch` |
+| ls / cat / stat / find / grep / tree | `Terminal.lua:113 / 133 / 206 / 250 / 315 / 402` |
+| write / multiedit | `Terminal.lua:515 / 562` |
+| Luau is executed | `studio/Exec.lua:424` `Exec.run`; PROLOGUE at `:56`, every entry one physical line |
+| the run guard (off by default) | `studio/Exec.lua:31` `setRunGuard`, backed by `Settings.allowRun` |
+| free models | `studio/Catalog.lua:186` `search`, `:247` `load` |
+| regex compiled / matched | `text/Regex.lua:772` `compile`, `:743` `Program:find` |
+| sed parsed / applied | `text/Sed.lua:195` `parseSedCommand`, `:102` `substitute` |
 | property names / defaults | `studio/Props.lua:85` `names`, `:137` `default` |
-| sessions | `Sessions.lua:174` `save`, `:327` `load`, `:379` `restoreLast` |
-| text on screen | `Console.lua:236` `appendLine`, `:608` `createBubble`, `:904` `appendToolCall` |
+| sessions | `Sessions.lua:172` `save`, `:323` `load`, `:375` `restoreLast` |
+| text on screen | `Console.lua:232` `appendLine`, `:600` `createBubble`, `:890` `appendToolCall` |
 
 ## Per file
 
 | File | Lines | Owns |
 |---|---:|---|
-| `fs/Shell.lua` | 4475 | The command line. Still the biggest — see below. |
-| `main.lua` | 948 | Widget, toolbar, popups. Owns `plugin`, hands it to Provider / Sessions / Settings — the only four that touch it. |
-| `text/Regex.lua` | 969 | BRE/ERE engine. Requires nothing. |
-| `ui/Console.lua` | 1029 | Bubbles, thinking drawers, tool-call blocks. |
-| `agent/Agent.lua` | 1201 | Turn loop, conversation state, trimming, stop. |
-| `fs/Terminal.lua` | 860 | Commands as tree operations. No parsing. |
-| `fs/Fs.lua` | 725 | Paths, `.Source`, undo, mtime, globs, mode bits. |
-| `agent/providers/Anthropic.lua` | 731 | One request. Knows nothing about turns. |
-| `ui/Sessions.lua` | 694 | Session list and persistence. |
-| `ui/Settings.lua` | 582 | Preferences + panel. |
-| `agent/providers/AnthropicAuth.lua` | 494 | PKCE login, refresh, usage. |
-| `studio/Catalog.lua` | 360 | Free model search / insert. Tool-only. |
-| `ui/Markdown.lua` | 352 | Markdown to labels. |
-| `studio/Exec.lua` | 353 | Luau execution. Tool-only. |
-| `text/Sed.lua` | 331 | sed engine. Pure text. |
-| `main/Commands.lua` | 208 | Slash commands. |
-| `studio/Props.lua` | 202 | API dump. The only network I/O in fs. |
-| `auth/Sha256.lua` | 170 | For PKCE. |
+| `fs/Shell.lua` | 4477 | The command line. Still the biggest — see below. |
+| `agent/Agent.lua` | 1209 | Turn loop, conversation state, trimming, stop. |
+| `ui/Console.lua` | 1015 | Bubbles, thinking drawers, tool-call blocks. |
+| `text/Regex.lua` | 957 | BRE/ERE engine. Requires nothing. |
+| `main.lua` | 930 | Widget, toolbar, popups. Owns `plugin`, hands it to Provider / Sessions / Settings — the only four that touch it. |
+| `fs/Terminal.lua` | 798 | Commands as tree operations. No parsing. |
+| `fs/Fs.lua` | 717 | Paths, `.Source`, undo, mtime, globs, mode bits. |
+| `agent/providers/Anthropic.lua` | 708 | One request. Knows nothing about turns. |
+| `ui/Sessions.lua` | 686 | Session list and persistence. |
+| `ui/Settings.lua` | 579 | Preferences + panel. |
+| `studio/Exec.lua` | 564 | Luau execution. Tool-only. |
+| `agent/providers/AnthropicAuth.lua` | 484 | PKCE login, refresh, usage. |
+| `studio/Catalog.lua` | 402 | Free model search / insert. Tool-only. |
+| `ui/Markdown.lua` | 346 | Markdown to labels. |
+| `text/Sed.lua` | 329 | sed engine. Pure text. |
+| `main/Commands.lua` | 204 | Slash commands. |
+| `studio/Props.lua` | 200 | API dump. The only network I/O in fs. |
+| `util/Sha256.lua` | 170 | For PKCE. |
 | `agent/Tools.lua` | 97 | Registry + dispatch. |
-| `ui/Theme.lua` | 97 | Colours and `make`. |
+| `ui/Theme.lua` | 91 | Colours and `make`. |
 | `agent/Provider.lua` | 23 | The active provider. |
 | `agent/tools/*.lua` | 17-50 | One per tool. |
 
@@ -106,12 +106,12 @@ main.lua                        window, toolbar, popups, usage panel
 
 | Lines | Region |
 |---:|---|
-| 1-60 | header, requires, aliases |
-| 61-846 | parsing: `tokenize:88`, `partition:232`, `extractHeredoc:409`, `takeRedirect:469`, `SPECS:569` |
-| 847-2850 | HANDLERS — 33 commands + private helpers |
-| 2851-3460 | diff, `Shell.COMMANDS:3459` |
-| 3461-3706 | pipelines, `runCommand:3501`, `Shell.run:3641` |
-| 3707-end | `Shell.selfTest` |
+| 1-63 | header, requires, aliases |
+| 64-844 | parsing: `tokenize:86`, `partition:230`, `extractHeredoc:407`, `takeRedirect:467`, `SPECS:567` |
+| 845-3005 | HANDLERS — 33 commands + private helpers |
+| 3006-3456 | diff core, the last five handlers, `Shell.COMMANDS:3455` |
+| 3457-3696 | pipelines, `runCommand:3497`, `Shell.run:3637` |
+| 3697-end | `Shell.selfTest:3701` |
 
 `tokenize`/`partition` and the diff core are pure text and are the next
 extractions; `HANDLERS` is not (below).

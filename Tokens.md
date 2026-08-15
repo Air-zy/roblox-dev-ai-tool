@@ -394,7 +394,7 @@ gap 1 restores it.
 | Cleared output is unrecoverable; a plugin has nowhere to spill | same |
 | `capTurn` can compute a negative share once truncation markers overshoot enough budget, and `string.sub(s, 1, negative)` slices from the **end** — latent, needs an implausible number of parallel calls in one turn | `Agent.lua`, `capTurn` |
 | `tree` and `du` are bounded only by the per-result cap | `Agent.lua`, above `MODEL_RESULT_CHARS` |
-| No overage gating, allowlist or session latch on the 1 h TTL (§1) | `Claude.lua`, `withMessageCache` |
+| No overage gating, allowlist or session latch on the 1 h TTL (§1) | `providers/Anthropic.lua`, `withMessageCache` |
 | `grep` grouping costs per-line file attribution when piped into another `grep` | `Shell.lua`, end of `HANDLERS.grep` |
 
 The upgrade path for the clearing gaps is summarising compaction — replacing

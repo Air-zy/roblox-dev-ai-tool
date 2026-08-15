@@ -63,7 +63,7 @@ at the root ignore case but everything below it does not. Scripts are listed
 with a .luau suffix, -type f means a script and -type d means anything else.
 Changes go through ChangeHistoryService, so Ctrl+Z works.
 
-Patterns are real regular expressions, from a real engine in `fs/Regex.luau` —
+Patterns are real regular expressions, from a real engine in `text/Regex.luau` —
 not Lua patterns in a costume. Plain `grep` and `sed` are POSIX **BRE**, `-E`
 `egrep` and `find -regex` are **ERE**, `-F` and `fgrep` are fixed strings, and
 `-P` adds lazy quantifiers, `(?:)`, backreferences and lookahead. Groups,
@@ -100,23 +100,32 @@ main.lua          widget, toolbar, input row, wiring
 main/
   Commands.lua    slash commands
   agent/
-    Claude.lua    Messages API client, SSE streaming
+    Provider.lua  which provider is live; nothing outside providers/ names one
+    providers/
+      Anthropic.lua      Messages API client, SSE streaming
+      AnthropicAuth.lua  PKCE login, token storage and refresh
     Agent.lua     history and the tool-use loop
     Tools.lua     tool registry
     tools/        one file per tool
   fs/
     Fs.lua        paths, .Source access, undo, globs
-    Props.lua     property names and defaults
     Terminal.lua  the commands themselves
     Shell.lua     tokenizer, pipes, redirection, heredocs
+  studio/
+    Props.lua     property names and defaults
+    Exec.lua      runs Luau                (run tool only)
+    Catalog.lua   free model search / load (catalog tool only)
+  text/
+    Regex.lua     BRE/ERE engine
+    Sed.lua       sed engine
   ui/
     Theme.lua     palette, fonts, the make helper
     Markdown.lua  markdown to renderable blocks
     Console.lua   output, streaming reply, tool calls
     Settings.lua  prefs, panel, usage bars
-  auth/
+    Sessions.lua  session list, save/load/restore
+  util/
     Sha256.lua    PKCE hashing
-    OAuth.lua     OAuth, token storage and refresh
 ```
 
 Requires inside a folder are just script.Parent:WaitForChild. Only five files
