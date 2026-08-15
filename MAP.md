@@ -36,7 +36,7 @@ main.lua                        window, toolbar, popups, usage panel
 | Question | Answer |
 |---|---|
 | the system prompt is built | `providers/Anthropic.lua:238` `systemBlocks` — identity first, user block if non-empty, cache_control on the last |
-| the user's system prompt is stored | `Settings.lua:78` `Settings.system()`, default `""` |
+| the user's system prompt is stored | `Settings.lua:78` `Settings.system()`, default `DEFAULT_SYSTEM:33` (one line, edit-mode framing) |
 | a request is assembled | `providers/Anthropic.lua:199` `streamMessage` -> `applyReasoning:104` -> tools+cache -> `withMessageCache:151` |
 | a response is parsed | `providers/Anthropic.lua:345` `processSSEEvents` |
 | which provider is live | `agent/Provider.lua` — `wire` and `auth`; nothing outside `providers/` names a vendor |

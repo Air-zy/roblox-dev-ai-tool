@@ -30,7 +30,7 @@ local KEY_SYSTEM = "cc_system"
 local KEY_RUN    = "cc_allow_run"
 local KEY_SEARCH = "cc_web_search"
 
-local DEFAULT_SYSTEM = ""
+local DEFAULT_SYSTEM = "we are in edit mode roblox studio, do not do anything from scratch"
 Settings.DEFAULT_SYSTEM = DEFAULT_SYSTEM
 
 -- maxTokens is a hard ceiling on thinking PLUS answer, so it has to scale with

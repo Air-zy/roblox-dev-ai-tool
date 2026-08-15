@@ -259,10 +259,10 @@ local function streamMessage(args: {
 	-- That 2x may never actually be charged, and the breakpoint stays anyway.
 	-- There is a MINIMUM cacheable prefix and it varies by model, 512 tokens on
 	-- opus-5, 1024 on sonnet-5, 4096 on haiku-4-5, under which nothing is
-	-- written and nothing is billed. Identity plus an empty default system
+	-- written and nothing is billed. Identity plus the one-line default system
 	-- prompt plus seven short tool descriptions is plausibly under all three, so
 	-- on a cold turn expect cache_creation_input_tokens = 0 rather than a write.
-	-- Costing nothing is exactly why it stays: the moment a user sets a real
+	-- Costing nothing is exactly why it stays: the moment a user writes a longer
 	-- system prompt the prefix crosses the line and this starts paying.
 	--
 	-- No beta header is needed for `ttl`, it is GA, not gated.
