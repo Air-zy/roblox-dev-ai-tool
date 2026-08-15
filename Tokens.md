@@ -75,11 +75,20 @@ cache pricing; the archive states none of them.
 
 ## 2. The static prefix is small, and stable
 
-`Tools.definitions()` emits `name`, `description`, `input_schema` and nothing
-else — the registry's `run` function and aliases stay client-side. Serialized,
-the whole tool block is **1 436 characters, ~359 tokens**, written once an hour.
-With an empty default system prompt and a one-sentence identity line, that is
-very nearly the entire static prefix.
+`Tools.definitions()` emits `name`, `description`, `input_schema` and
+`eager_input_streaming` — the registry's `run` function and aliases stay
+client-side. Serialized, the whole tool block is **1 610 characters, ~403
+tokens**, written once an hour. Alongside a one-line default system prompt and a
+one-sentence identity line, that is very nearly the entire static prefix.
+
+`eager_input_streaming` costs 29 characters × 6 tools = 174 of that, and buys
+something no token count expresses: without it the API buffers each parameter
+whole before sending any of it, so a large `write` puts nothing on the wire for
+as long as it takes to generate, and Roblox closes a stream that quiet. It is a
+correctness flag here, not a latency one *(theirs: the same field, set in
+`toolToAPISchema` behind `tengu_fgts` and gated to first-party endpoints because
+proxies and Bedrock reject it — neither gate applies to a client that only ever
+talks to api.anthropic.com)*.
 
 That number is why trimming descriptions is not worth doing and why avoiding one
 turn is worth more than the whole block. It is also why `defer_loading` and the
@@ -358,6 +367,20 @@ carry their payload in the **input**, not the result, and those blocks go into
 A `write` the size of this repo's `Shell.lua` is 78 001 characters (~19 500
 tokens) that stay for the session and that no threshold here can see, including
 `URGENT_CHARS`.
+
+**This got worse, deliberately, and the trade was made with the cost known.**
+`max_tokens` used to scale with effort — 8 192 at Low, 32 768 at High — which
+meant it was also the accidental ceiling on how large a single `write` input
+could be, since thinking and the tool call share it. That ceiling is now the
+model's real one: 128 000 on Opus 5 and Sonnet 5. The bound was accidental and
+was costing truncated files mid-`write`, so removing it was right; but nothing
+replaced it, and the largest unmeasured thing in the history just got roughly 4×
+more headroom. One `write` at the new ceiling is ~120 000 tokens that
+`historyChars` scores as zero.
+
+That makes the measurement fix below stop being tidy-up. `URGENT_CHARS` is the
+only backstop, it is blinded by this, and the thing it is blind to is now able to
+be four times bigger.
 
 **Do not "fix" this by clearing those inputs.** Upstream goes the other way, and
 deliberately. Its only tool-use clearing is server-side

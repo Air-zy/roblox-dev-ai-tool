@@ -1026,7 +1026,14 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 		-- so the size stands in for them. It is the only thing on screen that
 		-- distinguishes a large `write` making progress from a call that has
 		-- stalled, which is the whole reason the spinner alone was not enough.
-		local size = if streamedLen > 0 and #detail == 0
+		--
+		-- It survives the call finishing, which it did not at first. Clearing it
+		-- on setInput meant the number only existed while the arguments were in
+		-- flight, so on a fast call it flashed for a frame and on a slow one you
+		-- had to be looking at the right moment — and afterwards there was no way
+		-- to tell whether it had ever appeared. A finished `write` saying how big
+		-- it was is worth more than a tidier header.
+		local size = if streamedLen > 0
 			then string.format(" %.1fk", streamedLen / 1000)
 			else ""
 		header.Text = (expanded and "▼ " or "▶ ") .. label .. size
@@ -1060,8 +1067,9 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 			readInput(from)
 			-- The parsed arguments supersede the raw stream, and dropping it here
 			-- is what lets renderDetail prefer `detail` without a mode flag.
+			-- streamedLen deliberately survives: it is what the header reports,
+			-- and a call that has finished still had a size.
 			streamed = ""
-			streamedLen = 0
 			renderHeader()
 			renderDetail(lastResult)
 		end,

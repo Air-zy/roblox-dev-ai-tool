@@ -378,9 +378,37 @@ local function cacheIsCold(): boolean
 	return lastRequestAt == nil or os.time() - lastRequestAt >= COLD_AFTER
 end
 
+-- A tool_use input is a TABLE, so it cannot be measured with `#` like the rest.
+-- Summing its strings rather than JSONEncoding it keeps this allocation-free:
+-- historyChars walks the entire conversation every turn, and encoding every
+-- `write` payload each time to measure it would cost more than the threshold
+-- saves. Undercounts keys, braces and quoting, which is the right direction for
+-- a trigger whose action costs a cache re-write.
+local function inputChars(value: any, depth: number): number
+	if type(value) == "string" then return #value end
+	-- multiedit nests one level (an array of {old, new}); the bound is here so a
+	-- malformed input cannot walk forever.
+	if type(value) ~= "table" or depth > 4 then return 0 end
+	local total = 0
+	for _, inner in pairs(value) do
+		total += inputChars(inner, depth + 1)
+	end
+	return total
+end
+
 -- Deliberately an estimate, not a token count: it only decides whether to look
--- closer. tool_use inputs are tables and go uncounted, which biases it low
--- the right direction for a trigger that costs a cache re-write to act on.
+-- closer.
+--
+-- tool_use inputs USED to go uncounted, which mattered more than it looked:
+-- `write` and `multiedit` carry their whole payload there, nothing ever clears a
+-- tool_use, and URGENT_CHARS is the only backstop against a history that will
+-- not fit. It was the largest object in the conversation and scored zero. That
+-- was survivable while max_tokens scaled with effort and capped a single write
+-- at ~8k tokens; it is not now that the ceiling is the model's real 128k.
+--
+-- Counting them reclaims nothing by itself and changes no clearing behaviour —
+-- clearing still touches results only, deliberately, since a write's input is
+-- the record of what changed. It makes the threshold measure what it guards.
 local function historyChars(messages: { any }): number
 	local total = 0
 	for _, message in ipairs(messages) do
@@ -392,6 +420,7 @@ local function historyChars(messages: { any }): number
 				if type(block) == "table" then
 					if type(block.text) == "string" then total += #block.text end
 					if type(block.content) == "string" then total += #block.content end
+					if block.input ~= nil then total += inputChars(block.input, 0) end
 				end
 			end
 		end
@@ -804,6 +833,10 @@ local function runTurn(turn: number)
 					break
 				end
 				local toolResult: string
+				-- Whether the input never parsed, as opposed to a tool that ran and
+				-- returned an error string. Only the first is a protocol-level
+				-- failure, and only it sets is_error on the result below.
+				local inputFailed = false
 				-- The block onToolUseStart put up while the input was streaming.
 				-- Claimed here so the cleanup in setBusy cannot finish a block this
 				-- loop is about to write a result into.
@@ -839,6 +872,7 @@ local function runTurn(turn: number)
 					if toolResult == "" then toolResult = "(no output)" end
 					call.setResult(toolResult)
 				else
+					inputFailed = true
 					-- Naming the stop reason is what makes this recoverable: on
 					-- "max_tokens" the input was cut off mid-JSON, and the answer
 					-- is to send less rather than to send the same thing again.
@@ -868,6 +902,12 @@ local function runTurn(turn: number)
 					type = "tool_result",
 					tool_use_id = block.id,
 					content = toolResult,
+					-- `or nil` so the field is absent rather than false: this is the
+					-- documented signal for input that could not be parsed, and now
+					-- that eager_input_streaming is on it is a live path rather than
+					-- a max_tokens rarity. A tool that ran and failed is NOT this;
+					-- its error is an ordinary result the model reads and retries.
+					is_error = inputFailed or nil,
 				})
 			end
 			-- Capped HERE and not in Tools.dispatch: setResult() above has already
@@ -927,6 +967,14 @@ local function runTurn(turn: number)
 				Console.appendLine("  " .. table.concat(parts, " · "), "system")
 			end
 			setBusy(false)
+		end,
+
+		-- A transient failure the provider is going to retry by itself. Printed
+		-- rather than swallowed: the turn is about to sit there for several
+		-- seconds, and the spinner alone reads as the request having died.
+		onRetry = function(reason: string, wait: number, attempt: number, ofAttempts: number)
+			Console.appendLine(string.format(
+				"  %s — retrying in %.0fs (%d/%d)", reason, wait, attempt, ofAttempts), "system")
 		end,
 
 		onError = function(message: string)

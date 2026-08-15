@@ -1,6 +1,7 @@
 we are working with roblox... so language is luau
 
 never make unnecessary changes.
+do not do anything from scratch.
 
 for this harness.. THE AGENT SHOULD NOT NEED TO KNOW that its working on roblox.. for good quality or tool use... but it can...
 this harness should be general/good like that yk? to not confuse the agent with unnecessary clobbering of its context window and rules...

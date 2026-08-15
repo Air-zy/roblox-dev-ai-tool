@@ -37,11 +37,32 @@ local warn = warn
 -- function that touches settings storage.
 local plugin: any = nil
 
--- Constants (verified against the gist and the LinkedIn writeup)
+-- Constants, since cross-referenced against Claude Code's own oauth.ts rather
+-- than the gist these were first taken from. CLIENT_ID matches it exactly, as do
+-- every authorize parameter, the token-exchange body including its non-standard
+-- `state` field, and the usage endpoint below.
+--
+-- The two URLs do NOT match: Claude Code moved to platform.claude.com. Both were
+-- checked rather than assumed, and console.anthropic.com is not merely a
+-- redirect — /v1/oauth/token answers a POST directly, no 30x, so nothing here is
+-- at risk of a redirect downgrading the method. /oauth/code/callback does 301 to
+-- platform.claude.com, which costs nothing: it is a string the server matches and
+-- a page the user's browser lands on, never something this plugin fetches.
+--
+-- Left as-is deliberately. These values are known to work, and the pair can only
+-- be validated by a fresh login, so switching them is worth doing the next time
+-- a re-login is happening anyway rather than speculatively.
+--
+-- CLAUDE_AI_AUTHORIZE_URL upstream is claude.com/cai/oauth/authorize, which
+-- 307s here in two hops purely for attribution. Going straight to the
+-- destination is equivalent.
 local CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 local AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 local TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 local REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
+-- Claude Code requests three more (user:sessions:claude_code, user:mcp_servers,
+-- user:file_upload). Two are for features this has no equivalent of; none are
+-- needed for inference, and a narrower consent screen is the better default.
 local SCOPES = "org:create_api_key user:profile user:inference"
 -- Subscription usage, the same endpoint Claude Code's /usage reads for its plan
 -- bars. Not in the public API reference (that documents the API-key rate limit
@@ -207,9 +228,16 @@ local function startLogin(): { authorizeUrl: string, state: string }
 	plugin:SetSetting(KEY_PKCE_VERIFIER, verifier)
 	plugin:SetSetting(KEY_PKCE_STATE, state)
 
-	-- Build URL with proper URL-encoding of each parameter.
-	-- `code=true` enables copy/paste mode. Anthropic's redirect page will display
-	-- the auth code prominently instead of trying to hit a localhost callback.
+	-- Build URL with proper URL-encoding of each parameter. Same parameters, same
+	-- names, same S256, as Claude Code's buildAuthUrl.
+	--
+	-- `code=true` does NOT mean copy/paste mode, which is what this said before
+	-- and is worth correcting because it makes the flow look conditional when it
+	-- is not. Claude Code's own comment on the identical line reads "this tells
+	-- the login page to show Claude Max upsell". What actually selects the manual
+	-- flow is redirect_uri: theirs is either MANUAL_REDIRECT_URL or a
+	-- http://localhost:PORT/callback that a temporary server is listening on, and
+	-- only the first exists here.
 	local params = {
 		{ "code",                  "true" },
 		{ "client_id",             CLIENT_ID },
@@ -236,11 +264,19 @@ local function completeLogin(pastedCode: string): (boolean, string?)
 		return false, "No code provided."
 	end
 
-	-- The user might paste "CODE#STATE" or just "CODE". Split on '#'.
-	local code, returnedState = string.match(pastedCode, "^([^#]+)#?(.*)$")
-	if not code or code == "" then
-		code = pastedCode
-		returnedState = ""
+	-- The callback hands over "CODE#STATE", and BOTH halves are required. This
+	-- used to fall back to treating the whole paste as the code when there was no
+	-- '#', which quietly turned the CSRF check off for anyone who pasted only the
+	-- first half — the check was only as strong as the paste.
+	--
+	-- Claude Code refuses the same way ("make sure the full code was copied"), and
+	-- the reason matters more here than there: it has a localhost listener that
+	-- validates state on the automatic path, so its manual path can afford to be
+	-- lax. Roblox cannot listen on a port, so manual paste is the ONLY path and
+	-- this comparison is the entire CSRF story.
+	local code, returnedState = string.match(pastedCode, "^([^#]+)#(.+)$")
+	if not code or not returnedState then
+		return false, "Incomplete code — copy the whole value, including the part after the #."
 	end
 
 	local verifier = getSetting(KEY_PKCE_VERIFIER) :: string?
@@ -249,12 +285,11 @@ local function completeLogin(pastedCode: string): (boolean, string?)
 	if not verifier or verifier == "" then
 		return false, "No PKCE verifier found. Click 'Start Login' first."
 	end
-
-	-- If we have an expected state and a returned state, verify they match (CSRF check).
-	if expectedState and expectedState ~= "" and returnedState and returnedState ~= "" then
-		if returnedState ~= expectedState then
-			return false, "State mismatch — possible CSRF attack. Aborting."
-		end
+	if not expectedState or expectedState == "" then
+		return false, "No login in progress. Click 'Start Login' first."
+	end
+	if returnedState ~= expectedState then
+		return false, "State mismatch — possible CSRF attack. Aborting."
 	end
 
 	local body = {
@@ -263,7 +298,11 @@ local function completeLogin(pastedCode: string): (boolean, string?)
 		redirect_uri = REDIRECT_URI,
 		client_id = CLIENT_ID,
 		code_verifier = verifier,
-		state = expectedState or verifier,
+		-- Not in RFC 6749, and sent anyway because Claude Code sends it too. It
+		-- used to fall back to the VERIFIER when no state was stored, which put
+		-- the PKCE secret in a field that is not it; the guard above now makes
+		-- that branch unreachable, so it is gone rather than rewritten.
+		state = expectedState,
 	}
 
 	local response = httpPostJson(TOKEN_URL, body)
