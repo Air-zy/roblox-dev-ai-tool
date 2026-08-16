@@ -12,6 +12,10 @@ Folder and every .lua a ModuleScript. Build that into a .rbxmx in your plugins
 folder, with Rojo or by hand. You also need Game Settings, Security, Allow HTTP
 Requests.
 
+## Why these methods?
+agenting AI models are already trained to be good at terminal, so instead of a bunch of tool for specific tasks a terminal can do.
+A simple bash tool is self explanatory and the agent is already a pro at using bash. So a bash tool is super intuitive for this usecase...
+
 ## Use
 
 Click the toolbar button, run /login, open the URL it prints, then paste the
@@ -57,6 +61,55 @@ scripts inside a model arrive live and able to run. LoadAssetAsync would strip
 that, but it gates on ownership and the setting that lifts the gate is off
 limits to plugins. Every load reports how many scripts came with it, so look
 before you run.
+
+curl fetches a URL and writes the body to stdout, so it composes with everything
+else: `curl URL | grep -n thing`, `| sed -n '1,80p'`, or `> /ServerStorage/tmp/doc.luau`
+to keep it. -X -H -d --json --data-urlencode -G and the header shorthands -e -b -r
+--oauth2-bearer cover an API, -d @path reads the body out of a script the way `>`
+writes one, -o and -O save instead of printing (`-o /dev/null` throws away),
+-i and -I show headers, -m bounds the request, and -s -L -k -f --compressed are
+accepted and do nothing because each asks for what already happens.
+
+-w prints a report instead of the body, so the usual status-code check works:
+`curl -s -o /dev/null -w "%{http_code}\n" URL`. It knows the variables a response
+can answer — http_code, response_code, content_type, size_download, num_headers,
+url, url_effective, time_total, speed_download — and refuses the rest by name,
+because RequestAsync is one call returning one table and reports nothing about
+the connection behind it, so time_connect and remote_ip have no value to give and
+expanding them to nothing would print a measurement that was never taken. -w is
+also the one case where a non-2xx is not an error: asking for the code is saying
+you intend to read it.
+
+The rest are refused with the reason, because RequestAsync takes a URL, a method,
+headers, a body, a compression mode and a timeout, and nothing else is a knob that
+exists. --connect-timeout because there is one timeout for the whole request and
+-m is it, -v because there is no stderr to trace onto and it would land in the pipe
+with the body, -x because the engine picks the route, -A and -H User-Agent because
+Roblox locks that header along with Roblox-Id and derives Content-Length from the
+body. The verb after -X is checked against the eight RequestAsync takes, and GET
+and HEAD are refused a body, both because the engine fails the whole call rather
+than dropping what it cannot use.
+
+Three departures from real curl. Roblox's own domains are rejected before the
+request, since HttpService blocks every one of them and create.roblox.com is the
+first URL anyone tries; a mirror is the way in, which is how this plugin reads the
+API dump. A non-2xx is an error rather than a body, because a 404 page flowing
+down a pipe looks exactly like a page that fetched fine and had nothing to say.
+And there is a 30 second timeout by default, which curl has no equivalent of: the
+engine's own default is undocumented and reported at a minute or more, and a
+request that hangs that long holds the turn it was called from, the same objection
+that rules out `tail -f`. -m moves it, downward only, since RequestAsync refuses a
+timeout above its own.
+
+wget is the same request with the other default: it saves. `wget URL` writes a
+script named from the last path segment, -O names one instead and -O - prints to
+stdout, --spider is a HEAD that saves nothing, -S shows the headers, -q drops the
+message, and --header --post-data --post-file --method -T are wget's spellings of
+curl's. Where the file goes is settled before the fetch, so a URL with no name in
+it costs no request. Refused is the half of wget that is wget: -r -m -p walk links
+to rebuild a tree, and a DataModel is not a tree to rebuild into. Everything about
+the request itself is the same code curl runs, so the two cannot drift on what a
+404 means or which hosts are refused.
 
 Paths are what you would expect. / is game, . and .. do the usual, service names
 at the root ignore case but everything below it does not. Scripts are listed

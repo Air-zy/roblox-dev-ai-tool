@@ -503,11 +503,10 @@ local UNSUPPORTED: { [string]: string } = {
 	ps = "no processes; `ls /Workspace` or the run tool is what you want",
 	kill = "no processes",
 	man = "no man pages; an unknown command lists what exists",
-	curl = "use the run tool with HttpService",
-	wget = "use the run tool with HttpService",
 	-- Named with their replacements, because both are reached for as the fallback
-	-- after something else was missing, and "use the run tool" was the answer that
-	-- sent a read-only session into a write-capable one.
+	-- after something else was missing, and "use the run tool" is the answer that
+	-- sends a read-only session into a write-capable one. curl and wget were on
+	-- this list for exactly that reason until they became commands.
 	awk = "no awk; `sed -n '10,40p'` prints a line range and `grep -A/-B/-C` gives context",
 	xargs = "no xargs; pipe into grep/head/tail/wc/sort/uniq/sed/tr instead",
 }
@@ -596,6 +595,56 @@ local SPECS: { [string]: FlagSpec } = {
 			["-l"] = "makes a hard link, and the DataModel has no such thing — an " ..
 				"instance has exactly one Parent. `ln` makes an ObjectValue instead.",
 			["-s"] = "makes a symlink; `ln -s` is the command for that here",
+		},
+	},
+	curl = {
+		bool = "sSLkfiIGO", value = "XHdmebrow",
+		long = { ["--silent"] = "bool:-s", ["--location"] = "bool:-L", ["--fail"] = "bool:-f",
+			["--insecure"] = "bool:-k", ["--head"] = "bool:-I", ["--include"] = "bool:-i",
+			["--request"] = "value:-X", ["--header"] = "value:-H", ["--data"] = "value:-d",
+			["--data-raw"] = "value:-d", ["--data-binary"] = "value:-d",
+			["--max-time"] = "value:-m", ["--get"] = "bool:-G", ["--referer"] = "value:-e",
+			["--cookie"] = "value:-b", ["--range"] = "value:-r",
+			["--output"] = "value:-o", ["--remote-name"] = "bool:-O",
+			["--write-out"] = "value:-w",
+			-- No short form: --json postdates single letters, and the other three
+			-- never had one.
+			["--json"] = "value", ["--compressed"] = "bool",
+			["--data-urlencode"] = "value", ["--oauth2-bearer"] = "value" },
+		-- -s -S -L -k -f --compressed are accepted and do nothing, which is not
+		-- the same as ignoring an unknown flag: each one asks for behaviour that
+		-- is already the case here. There is no progress meter to silence,
+		-- RequestAsync follows redirects itself, certificates are not ours to
+		-- skip, a non-2xx already fails, and asking for a gzipped response only
+		-- to decompress it wins nothing when the engine handles the transfer.
+		-- Refusing them would cost a corrected turn to arrive back at an
+		-- identical request.
+		--
+		-- What is left out is what RequestAsync has no field for. It takes a URL,
+		-- a method, headers, a body, a compression mode and a timeout, so every
+		-- flag below is asking for a knob that does not exist rather than one
+		-- nobody got round to wiring up.
+		why = {
+			["-u"] = "sends HTTP basic auth, which is a base64 this shell cannot " ..
+				"compute — `--oauth2-bearer` covers a token, and -H takes the " ..
+				"`Authorization: Basic …` header ready-made",
+			["-A"] = "sets User-Agent, which RequestAsync will not send: Roblox " ..
+				"locks that header along with Roblox-Id, and Content-Length is " ..
+				"derived from the body",
+			["--user-agent"] = "sets User-Agent, which Roblox locks; see -A",
+			["--connect-timeout"] = "bounds the connect phase alone, and " ..
+				"RequestAsync has one timeout for the whole request — that is -m",
+			["-v"] = "traces the exchange on stderr, and there is no stderr here: " ..
+				"it would land in the same pipe as the body. -i prints the " ..
+				"response headers, -I prints them alone",
+			["-x"] = "routes through a proxy, and RequestAsync has no field for " ..
+				"one; the engine picks the route",
+			["-T"] = "uploads a file with PUT — `-X PUT -d @path` reads a script " ..
+				"and sends it",
+			["-F"] = "sends a multipart form, and there is no file to attach: " ..
+				"build the body with -d, or -d @path from a script",
+			["-c"] = "saves cookies to a jar between runs, and each command here " ..
+				"is its own request — -b sends a Cookie header",
 		},
 	},
 	diff = {
@@ -740,6 +789,37 @@ local SPECS: { [string]: FlagSpec } = {
 		bool = "clLmw",
 		long = { ["--lines"] = "bool:-l", ["--words"] = "bool:-w", ["--bytes"] = "bool:-c",
 			["--chars"] = "bool:-m", ["--max-line-length"] = "bool:-L" },
+	},
+	wget = {
+		bool = "qS", value = "OT",
+		long = { ["--quiet"] = "bool:-q", ["--server-response"] = "bool:-S",
+			["--output-document"] = "value:-O", ["--timeout"] = "value:-T",
+			["--header"] = "value", ["--post-data"] = "value",
+			["--post-file"] = "value", ["--method"] = "value", ["--spider"] = "bool" },
+		-- The refusals here are wget's identity rather than its edges: recursion
+		-- and mirroring are the reason to reach for wget over curl, and they are
+		-- the one thing a DataModel cannot be the target of.
+		why = {
+			["-r"] = "downloads recursively by following links, and there is no " ..
+				"tree here to mirror into — fetch the pages you want by name",
+			["--recursive"] = "follows links to build a local copy; see -r",
+			["-m"] = "is -r with timestamps and infinite depth; see -r",
+			["-p"] = "fetches the images and stylesheets a page needs, which is " ..
+				"-r under another name; see -r",
+			["-N"] = "re-downloads only when the remote is newer, and the times " ..
+				"this shell keeps are its own observations of edits made here, " ..
+				"with nothing to compare against a server's",
+			["-c"] = "resumes a partial download, and RequestAsync returns a " ..
+				"whole response or fails — there is no partial file to continue",
+			["-t"] = "retries a failed download, and re-running the command is " ..
+				"the retry; nothing here is holding state between the two",
+			["-i"] = "reads a list of URLs from a file, and this shell has no " ..
+				"loop to spend them on — one URL per command",
+			["-P"] = "sets a directory to save under, which is the leading part " ..
+				"of the path -O already takes whole",
+			["-o"] = "redirects wget's own log to a file, and the log is the " ..
+				"return value here; -q silences it and `> path` captures it",
+		},
 	},
 	which = { bool = "a", long = { ["--all"] = "bool:-a" } },
 	pwd = { bool = "LP" },
@@ -3445,6 +3525,519 @@ end
 HANDLERS.egrep = HANDLERS.grep
 HANDLERS.fgrep = HANDLERS.grep
 
+-- curl and wget: the two commands here that are not about the DataModel.
+--
+-- They earn the exception by feeding everything that is. A fetched body lands in
+-- the same pipeline as any other output, so `curl URL | grep -n foo`, `| sed -n
+-- '1,80p'` and `> /ServerStorage/tmp/doc.luau` all work with no second tool, and
+-- wget writes a script directly. What that replaces was four calls — mkdir, write
+-- a probe, run it, read it back — to reach a 500-character cap on the run tool's
+-- returned value, with its 10-second yield budget over an HTTP request.
+--
+-- The two split on one line: curl prints, wget saves. Everything either of them
+-- knows about HTTP lives in the helpers below, so the split really is that line
+-- and not two implementations that agree today.
+--
+-- RequestAsync rather than GetAsync: GetAsync throws on a non-2xx and hands back
+-- no status, and "the server said 404" arriving as a Lua error string is the
+-- shape that gets misread as "the network is broken".
+local HttpService = game:GetService("HttpService")
+
+-- Every verb RequestAsync documents. Checked here rather than passed through,
+-- because the engine answers a misspelled one with a generic failure that reads
+-- like the server refused the request. The set is derived from the list so the
+-- check and the message it prints cannot disagree.
+local HTTP_METHODS = { "GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS", "TRACE", "PATCH" }
+local METHOD_SET: { [string]: boolean } = {}
+for _, verb in ipairs(HTTP_METHODS) do
+	METHOD_SET[verb] = true
+end
+
+-- Flags that are one request header and nothing else. curl gives each its own
+-- letter; here they are a table, because four near-identical branches is how one
+-- of them ends up reading the wrong value.
+local HEADER_FLAGS: { [string]: { header: string, prefix: string? } } = {
+	["-e"] = { header = "referer" },
+	["-b"] = { header = "cookie" },
+	["-r"] = { header = "range", prefix = "bytes=" },
+	["--oauth2-bearer"] = { header = "authorization", prefix = "Bearer " },
+}
+
+-- Headers RequestAsync will not let a caller set, and why. Named on the way in:
+-- sending one otherwise fails the whole request with nothing to say which header
+-- was the problem. Above parseHeaders because that is what reads it: a local
+-- declared below a function that names it is not an upvalue, it is a nil global.
+local LOCKED_HEADERS: { [string]: string } = {
+	["content-length"] = "is derived from the body",
+	["user-agent"] = "is locked by Roblox",
+	["roblox-id"] = "is locked by Roblox",
+}
+
+-- `Name: value`, the spelling curl's -H and wget's --header share.
+--
+-- Keys are lowercased. Header names are case-insensitive, HTTP/2 requires the
+-- wire form to be lowercase anyway, and it means a default can be written as
+-- `if not headers["content-type"]` rather than a scan for whichever casing the
+-- caller happened to use. Getting that wrong sends two Content-Types and leaves
+-- the server to pick.
+local function parseHeaders(raw: { string }?): ({ [string]: string }?, string?)
+	local headers: { [string]: string } = {}
+	for _, header in ipairs(raw or {}) do
+		local name, value = header:match("^%s*([^:]+):%s*(.*)$")
+		if not name then
+			return nil, string.format("bad header %q — expected `Name: value`", header)
+		end
+		local lower = name:lower()
+		local locked = LOCKED_HEADERS[lower]
+		if locked then
+			return nil, string.format(
+				"%s %s, and RequestAsync refuses a request that sets it", name, locked)
+		end
+		headers[lower] = value
+	end
+	return headers, nil
+end
+
+-- A body read out of a script: curl's `-d @path` and wget's `--post-file`. The
+-- counterpart of `> path`, so a payload is written once with the editor and
+-- resent rather than retyped into every call.
+local function bodyFromScript(self: any, path: string): (string?, string?)
+	local target, err = self:resolve(path)
+	if not target then
+		return nil, err
+	end
+	if not isScript(target) then
+		return nil, "not a script: " .. instancePath(target)
+	end
+	return getSource(target) or "", nil
+end
+
+-- RequestAsync's own default is undocumented and reported at a minute or more.
+-- A request that hangs that long holds the turn it was called from, which is the
+-- same objection that rules out `tail -f`, so this shell sets its own and lets
+-- -m move it. curl has no default max-time; this is a deliberate departure.
+--
+-- ponytail: the engine refuses a Timeout ABOVE its own default, so this number
+-- only works while it stays under that. Every report puts the default at 60s or
+-- more. If it is ever lowered past this, the failure is loud and immediate and
+-- names Timeout, rather than silent.
+local CURL_TIMEOUT = 30
+
+-- Where -G puts the data. Its own function because the branch is silent when it
+-- is wrong: a second `?` in a URL is not an error anyone reports, the server just
+-- reads a parameter nobody sent.
+local function appendQuery(url: string, query: string): string
+	return url .. (url:find("?", 1, true) and "&" or "?") .. query
+end
+
+-- What wget saves under when -O does not say. wget takes the last path segment
+-- and falls back to index.html; the query string is dropped, because parameters
+-- are not a name. Its own function for the same reason as appendQuery: a wrong
+-- answer here writes a real script into someone's place under a name nobody
+-- asked for. nil means there was nothing to take, and wget refuses rather than
+-- inventing index.html.
+local function nameFromUrl(url: string): string?
+	local path = url:match("^https?://[^/?#]*([^?#]*)") or ""
+	return path:match("([^/]+)$")
+end
+
+-- HttpService refuses every Roblox domain outright. Worth naming here rather
+-- than letting the engine's own wording come back, because the docs an agent is
+-- most likely to reach for live on create.roblox.com, and a refusal that reads
+-- like a network failure invites a retry loop against a wall.
+local function robloxDomain(url: string): boolean
+	-- Authority only: userinfo off the front, port off the back, path never seen.
+	-- Each of those is a way to hide the real host from a naive `find("roblox")`,
+	-- and the frontier anchors the rest — `notroblox.com` ends in the same ten
+	-- characters and is somebody else's domain.
+	local host = url:match("^https?://([^/?#]+)") or ""
+	host = (host:match("([^@]+)$") or host):match("^[^:]*")
+	return host:lower():match("%f[%w]roblox%.com$") ~= nil
+end
+
+-- The request itself, and every rule RequestAsync enforces about one. Shared,
+-- because above this line curl and wget are two flag vocabularies and below it
+-- they want exactly the same thing — and a second copy is a second place for the
+-- Roblox-domain rule or the body-on-GET rule to be quietly wrong in one command
+-- and right in the other.
+--
+-- `timeoutFlag` is only ever printed: curl spells it -m and wget spells it -T,
+-- and a timeout message that names the wrong one sends the reader to a flag their
+-- command does not have.
+local function httpRequest(opts: {
+	url: string, method: string?, head: boolean?, headers: { [string]: string },
+	body: string?, maxTime: string?, timeoutFlag: string,
+}): (any?, string?)
+	if not opts.url:match("^https?://") then
+		-- curl defaults a bare host to http://. Not copied: every endpoint worth
+		-- reaching is https, and silently downgrading is not a default to have.
+		return nil, "URL must start with http:// or https:// — got " .. opts.url
+	end
+	if robloxDomain(opts.url) then
+		return nil, opts.url .. " is a Roblox domain, and HttpService refuses every " ..
+			"one of them. A mirror is the way in: this plugin reads the API dump " ..
+			"from raw.githubusercontent.com for the same reason"
+	end
+	-- Data implies POST unless the verb was named, and curl's -I and wget's
+	-- --spider are both a HEAD. Derived here rather than in each handler, because
+	-- it is the same rule twice under two spellings.
+	local method = opts.head and "HEAD"
+		or (opts.method or (opts.body and "POST") or "GET"):upper()
+	if not METHOD_SET[method] then
+		return nil, string.format("unknown method %s — RequestAsync takes %s",
+			method, table.concat(HTTP_METHODS, " "))
+	end
+	-- The engine's rule: RequestAsync excludes Body on these two and fails the
+	-- call rather than dropping what it cannot send.
+	if opts.body and (method == "GET" or method == "HEAD") then
+		return nil, method .. " cannot carry a body — RequestAsync excludes it"
+	end
+
+	local timeout = CURL_TIMEOUT
+	if opts.maxTime then
+		local seconds = tonumber(opts.maxTime)
+		if not seconds or seconds <= 0 then
+			return nil, string.format("%s takes a number of seconds greater than zero — got %s",
+				opts.timeoutFlag, opts.maxTime)
+		end
+		-- Whole seconds, because the field is an Integer, and rounded UP so that
+		-- half a second stays a request that can succeed rather than becoming a
+		-- zero the engine rejects outright.
+		timeout = math.ceil(seconds)
+	end
+
+	-- Yielding is fine here for the same reason it is fine in Props' dump fetch,
+	-- which is already reached from `cat`: tool dispatch runs after the response
+	-- stream has closed. What is ruled out is blocking forever, and Timeout is
+	-- what guarantees an end. See tail -f, which is refused on exactly that line.
+	local ok, response = pcall(function()
+		return HttpService:RequestAsync({
+			Url = opts.url, Method = method, Headers = opts.headers,
+			Body = opts.body, Timeout = timeout,
+		})
+	end)
+	if not ok then
+		-- No response at all: a timeout, DNS, TLS, or HttpEnabled being off. All
+		-- but the first are passed through, because the engine's own wording
+		-- already names a thing the user can go and fix.
+		local why = tostring(response)
+		local lower = why:lower()
+		if lower:find("timeout", 1, true) or lower:find("timed out", 1, true) then
+			-- The budget is ours, so a timeout has to say so. Otherwise the number
+			-- the request actually ran against appears nowhere.
+			why ..= string.format(" (gave it %ds; %s sets that, up to the engine's own limit)",
+				timeout, opts.timeoutFlag)
+		end
+		return nil, why
+	end
+	return response, nil
+end
+
+-- curl's --write-out, filled from what RequestAsync actually hands back.
+--
+-- The refusal this replaces claimed these were "curl's own internals", which was
+-- only true of some of them: a status code and a content type are exactly what
+-- the response carries. What is genuinely missing is the connection phases —
+-- time_namelookup, time_connect, time_appconnect, remote_ip, num_redirects,
+-- ssl_verify_result — because RequestAsync is one call that returns one table and
+-- never reports what happened inside it.
+--
+-- time_total is wall time around the call, which is honest but coarser than
+-- curl's: it includes the scheduler getting back to us, not just the transfer.
+local function writeOutValues(response: any, url: string, elapsed: number)
+	local body = response.Body or ""
+	local contentType, count = "", 0
+	for name, value in pairs(response.Headers or {}) do
+		count += 1
+		if name:lower() == "content-type" then
+			contentType = tostring(value)
+		end
+	end
+	return {
+		http_code = tostring(response.StatusCode),
+		response_code = tostring(response.StatusCode),
+		content_type = contentType,
+		size_download = tostring(#body),
+		num_headers = tostring(count),
+		url = url,
+		url_effective = url,
+		time_total = string.format("%.6f", elapsed),
+		speed_download = string.format("%.3f", elapsed > 0 and #body / elapsed or 0),
+	}
+end
+
+-- Expand a --write-out format. An unknown %{name} is an ERROR rather than an
+-- empty string: a format that quietly drops %{time_connect} prints a number that
+-- reads as a measurement and is not one.
+local function expandWriteOut(format: string, values: { [string]: string }): (string?, string?)
+	local unknown: string? = nil
+	-- [%w_], not %w: Lua's %w has no underscore, and every name curl uses has one.
+	local out = format:gsub("%%{([%w_]+)}", function(name)
+		local value = values[name:lower()]
+		if not value then
+			unknown = unknown or name
+		end
+		return value or ""
+	end)
+	if unknown then
+		local known: { string } = {}
+		for name in pairs(values) do
+			known[#known + 1] = name
+		end
+		table.sort(known)
+		return nil, string.format(
+			"-w %%{%s} is not something RequestAsync reports — it returns one response " ..
+			"and nothing about the connection behind it. Available: %s",
+			unknown, table.concat(known, " "))
+	end
+	-- curl's own escapes, and %% for a literal percent.
+	out = out:gsub("\\([ntr\\])", { n = "\n", t = "\t", r = "\r", ["\\"] = "\\" })
+	return (out:gsub("%%%%", "%%")), nil
+end
+
+-- The one URL both take. Real curl fetches several and concatenates the bodies;
+-- refused for both, because two documents run together with no marker between
+-- them is a result nothing downstream can take apart again.
+local function oneUrl(cmd: string, operands: { string }): (string?, string?)
+	if #operands == 0 then
+		return nil, fail(cmd, "requires a URL")
+	end
+	if #operands > 1 then
+		return nil, fail(cmd, "one URL at a time")
+	end
+	return operands[1], nil
+end
+
+-- The head of a response as output lines, plus whether its status makes the call
+-- a failure. What happens to the BODY differs between the two commands, and with
+-- -w even whether the failure counts, so both decisions stay with the caller —
+-- `fail` sets the flag `&&` and `||` read, and calling it on a path that then
+-- returns successfully would mark a working command failed.
+--
+-- The rule itself is shared: real curl prints an error page and exits 0, and real
+-- wget saves it; -f and --content-on-error are what change that. Inverted here
+-- for both, because a 404's HTML flowing into a pipe, or saved under the name of
+-- the document you wanted, looks exactly like the document.
+local function renderResponse(response: any, showHead: boolean): ({ string }, boolean)
+	local status = string.format("HTTP %d %s", response.StatusCode, response.StatusMessage or "")
+	local out: { string } = {}
+	-- curl -i/-I and wget -S/--spider.
+	if showHead then
+		out[1] = status
+		local names: { string } = {}
+		for name in pairs(response.Headers or {}) do
+			names[#names + 1] = name
+		end
+		table.sort(names)
+		for _, name in ipairs(names) do
+			out[#out + 1] = name .. ": " .. tostring(response.Headers[name])
+		end
+		out[#out + 1] = ""
+	elseif not response.Success then
+		-- The status leads when the head was not printed, or the failure is an
+		-- HTML page with no number attached to it.
+		out[1] = status
+	end
+	return out, not response.Success
+end
+
+HANDLERS.curl = function(self, argv)
+	local flags, values, operands = parse(argv)
+	local url, urlErr = oneUrl("curl", operands)
+	if not url then return urlErr end
+
+	local headers, headerErr = parseHeaders(values["-H"])
+	if not headers then return fail("curl", headerErr) end
+	for flag, spec in pairs(HEADER_FLAGS) do
+		local value = valueOf(values, flag)
+		if value then
+			headers[spec.header] = (spec.prefix or "") .. value
+		end
+	end
+
+	-- Data, assembled in curl's order: every -d and --data-urlencode joined with
+	-- &, which is what curl does with repeated data flags rather than keeping the
+	-- last one.
+	local data: { string } = {}
+	for _, value in ipairs(values["-d"] or {}) do
+		if value:sub(1, 1) == "@" then
+			local fromFile, readErr = bodyFromScript(self, value:sub(2))
+			if not fromFile then return fail("curl", readErr) end
+			data[#data + 1] = fromFile
+		else
+			data[#data + 1] = value
+		end
+	end
+	for _, pair in ipairs(values["--data-urlencode"] or {}) do
+		-- curl's two common forms: `name=content` encodes the content only, a bare
+		-- string encodes the whole thing. The `@file` forms are left out, since -d
+		-- @path already covers reading a body out of the DataModel.
+		local name, content = pair:match("^([^=@]*)=(.*)$")
+		if name and name ~= "" then
+			data[#data + 1] = name .. "=" .. HttpService:UrlEncode(content)
+		else
+			data[#data + 1] = HttpService:UrlEncode((pair:gsub("^=", "")))
+		end
+	end
+	local body: string? = #data > 0 and table.concat(data, "&") or nil
+
+	-- --json is -d plus the two headers everyone forgets, which is the whole of
+	-- why it exists alongside -d.
+	local json = valueOf(values, "--json")
+	if json then
+		body = json
+		headers["content-type"] = headers["content-type"] or "application/json"
+		headers["accept"] = headers["accept"] or "application/json"
+	elseif body then
+		headers["content-type"] = headers["content-type"] or "application/x-www-form-urlencoded"
+	end
+
+	-- -G moves the data onto the URL and leaves the request a GET, which is the
+	-- only way to send a long query through a body-less method.
+	if flags["-G"] and body then
+		url = appendQuery(url, body)
+		body = nil
+	end
+
+	-- Where the body goes, settled before the fetch for the same reason wget does
+	-- it: -o naming a path that cannot be written is worth knowing before the
+	-- request rather than after it.
+	local saveTo: string? = valueOf(values, "-o")
+	if flags["-O"] then
+		saveTo = nameFromUrl(url)
+		if not saveTo then
+			return fail("curl", "-O takes the name from the URL, and " .. url ..
+				" has none — name one with -o, or drop -O to print the body")
+		end
+	end
+
+	local started = os.clock()
+	local response, requestErr = httpRequest({
+		url = url, method = valueOf(values, "-X"), head = flags["-I"],
+		headers = headers, body = body,
+		maxTime = valueOf(values, "-m"), timeoutFlag = "-m",
+	})
+	if not response then return fail("curl", requestErr) end
+	local elapsed = os.clock() - started
+
+	local format = valueOf(values, "-w")
+	local out, statusFailed = renderResponse(response, flags["-i"] or flags["-I"])
+	-- -w is a request for the status, so the caller is already handling it and
+	-- the non-2xx inversion only gets in the way: `-o /dev/null -w "%{http_code}"`
+	-- exists precisely to read a 404 without treating it as a broken call. Every
+	-- other shape keeps the failure, because nothing else asked to see the number.
+	if statusFailed and not format then
+		table.insert(out, response.Body or "")
+		return fail("curl", table.concat(out, "\n"))
+	end
+
+	-- -I asked for headers alone, and HEAD has no body either way.
+	if not flags["-I"] then
+		if saveTo then
+			-- -o writes the body instead of printing it, and /dev/null throws it
+			-- away. Unlike wget this says nothing about the write: curl is silent
+			-- about where the body went, and -w is how you ask it to speak.
+			if saveTo ~= DEV_NULL then
+				local wrote, writeErr = self:write(saveTo, response.Body or "")
+				if not wrote then return fail("curl", writeErr) end
+			end
+		else
+			table.insert(out, response.Body or "")
+		end
+	end
+
+	if format then
+		local report, formatErr = expandWriteOut(format,
+			writeOutValues(response, url, elapsed))
+		if not report then return fail("curl", formatErr) end
+		table.insert(out, report)
+	end
+	return table.concat(out, "\n")
+end
+
+-- wget: fetch a URL and SAVE it.
+--
+-- That default is the whole of what makes it wget rather than a second spelling
+-- of curl, so it is the part kept, and it is the ONLY part: the request, the
+-- headers and the non-2xx rule are the same functions curl calls. Aliasing the
+-- two outright would have been shorter and would have made `wget URL` print to
+-- stdout, which is wget's `-O -` and not wget.
+--
+-- Left out is the half of wget that is actually wget: -r, -m and the rest walk
+-- links and rebuild a tree on disk, and there is no tree here to rebuild into.
+-- Those are refused by name in SPECS rather than approximated.
+HANDLERS.wget = function(self, argv)
+	local flags, values, operands = parse(argv)
+	local url, urlErr = oneUrl("wget", operands)
+	if not url then return urlErr end
+
+	local headers, headerErr = parseHeaders(values["--header"])
+	if not headers then return fail("wget", headerErr) end
+
+	local body = valueOf(values, "--post-data")
+	local postFile = valueOf(values, "--post-file")
+	if postFile then
+		local fromFile, readErr = bodyFromScript(self, postFile)
+		if not fromFile then return fail("wget", readErr) end
+		body = fromFile
+	end
+	if body then
+		headers["content-type"] = headers["content-type"] or "application/x-www-form-urlencoded"
+	end
+
+	-- Where this is going, decided BEFORE the request rather than after it.
+	-- Finding out there is no name to save under once the body is already here
+	-- spends a fetch to learn something the URL said all along, and on a service
+	-- that counts requests it spends one that counted.
+	local target = valueOf(values, "-O")
+	local path: string? = nil
+	if target ~= "-" and not flags["--spider"] then
+		path = target or nameFromUrl(url)
+		if not path then
+			-- wget writes index.html here. Not copied: inventing a name for a
+			-- script in someone's place is a guess, and -O costs one argument.
+			return fail("wget",
+				"no filename in " .. url .. " — name one with -O, or -O - for stdout")
+		end
+	end
+
+	-- --spider asks whether a URL is there, which is a HEAD and never a download.
+	local response, requestErr = httpRequest({
+		url = url, method = valueOf(values, "--method"), head = flags["--spider"],
+		headers = headers, body = body,
+		maxTime = valueOf(values, "-T"), timeoutFlag = "-T",
+	})
+	if not response then return fail("wget", requestErr) end
+
+	-- Nothing is saved when the fetch failed, which is wget's own rule too.
+	local out, statusFailed = renderResponse(response, flags["-S"] or flags["--spider"])
+	if statusFailed then
+		table.insert(out, response.Body or "")
+		return fail("wget", table.concat(out, "\n"))
+	end
+	if flags["--spider"] then
+		return table.concat(out, "\n")
+	end
+
+	local content = response.Body or ""
+	if not path then
+		-- -O -, wget's spelling for stdout, and the one form that composes with
+		-- a pipe.
+		table.insert(out, content)
+		return table.concat(out, "\n")
+	end
+	-- Terminal:write creates the script, records undo and updates the observed
+	-- mtime, which is every part of writing a file this shell already knows how to
+	-- do. The parent has to exist, the same as for `> path`.
+	local wrote, writeErr = self:write(path, content)
+	if not wrote then return fail("wget", writeErr) end
+	if flags["-q"] then
+		return table.concat(out, "\n")
+	end
+	table.insert(out, wrote)
+	return table.concat(out, "\n")
+end
+
 local COMMANDS: { string } = {}
 for name in pairs(HANDLERS) do
 	COMMANDS[#COMMANDS + 1] = name
@@ -4296,6 +4889,62 @@ function Shell.selfTest(probe: any): (boolean, string?)
 	end
 	if not Shell.run(probe, "chown me /Workspace"):match("no owner") then
 		return false, "UNSUPPORTED lookup is not firing"
+	end
+
+	-- curl and wget, up to but never past the point where a request would be
+	-- made: a startup self-test has no business touching the network. The three
+	-- string functions are therefore called directly, since anything that gets
+	-- past them goes out on the wire.
+	--
+	-- Deliberately not checked: the flags that exist only to be refused. Their
+	-- `why` text is a literal, and the spec validator below already proves every
+	-- entry is reachable and does not contradict a declared flag. One case keeps
+	-- the lookup itself honest. Nor is any shared rule checked twice under both
+	-- command names — after httpRequest and parseHeaders, that would only be
+	-- testing that wget spelled its own flag correctly.
+	if not robloxDomain("https://create.roblox.com/docs/llms.txt")
+		or not robloxDomain("http://user@WWW.Roblox.com:443/y")
+		or robloxDomain("https://notroblox.com/x") then
+		return false, "the Roblox-domain rule is wrong"
+	end
+	if appendQuery("https://h/p", "a=1") ~= "https://h/p?a=1"
+		or appendQuery("https://h/p?x=0", "a=1") ~= "https://h/p?x=0&a=1" then
+		return false, "curl -G built the wrong query string"
+	end
+	-- The name wget saves under, which becomes a real script in someone's place.
+	-- A path ending in / names a directory: wget writes index.html there, and
+	-- refusing is the honest answer when the tree is a DataModel.
+	if nameFromUrl("https://h/docs/llms.txt?v=2#top") ~= "llms.txt"
+		or nameFromUrl("https://h/a/b/") ~= nil then
+		return false, "wget picked the wrong name to save under"
+	end
+	-- -w, the half of `curl -s -o /dev/null -w "%{http_code}\n"` that is not just
+	-- flags. An unknown variable has to be refused rather than expanded to
+	-- nothing, or the format prints a number that reads as a measurement.
+	local report = expandWriteOut("%{http_code} %{size_download}\\n%%",
+		{ http_code = "404", size_download = "12" })
+	if report ~= "404 12\n%" then
+		return false, "curl -w expanded wrongly: " .. tostring(report)
+	end
+	local _, wErr = expandWriteOut("%{time_connect}", { http_code = "200" })
+	if not wErr or not wErr:find("http_code", 1, true) then
+		return false, "curl -w accepted a variable RequestAsync cannot report"
+	end
+	for line, wanted in pairs({
+		["curl create.roblox.com"] = "http:// or https://",
+		['curl -H "User-Agent: me" https://example.invalid'] = "locked by Roblox",
+		["curl -X PU https://example.invalid"] = "unknown method",
+		["curl -X GET -d x https://example.invalid"] = "cannot carry a body",
+		["curl -m 0 https://example.invalid"] = "greater than zero",
+		["curl -d @/nope https://example.invalid"] = "no child named",
+		["curl -v https://example.invalid"] = "no stderr here",
+		-- wget's own half: where the body goes, decided before the fetch.
+		["wget https://example.invalid"] = "name one with -O",
+	}) do
+		local out = Shell.run(probe, line)
+		if not out:find(wanted, 1, true) then
+			return false, string.format("%q wanted %q, got: %s", line, wanted, out)
+		end
 	end
 
 	-- Every declared flag must be REACHABLE. This is the mechanical half of the
