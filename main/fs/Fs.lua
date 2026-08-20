@@ -279,6 +279,27 @@ local function instancePath(inst: Instance): string
 end
 Fs.instancePath = instancePath
 
+-- One child by name: the exact name, or a script addressed by the displayed
+-- `.luau` form that `ls` prints. Shared with the slash fallback in resolve so
+-- both spellings work there too — two copies would be two lists to keep in
+-- sync, and the slash path would be the one that silently disagreed.
+local function findChild(parent: Instance, name: string): Instance?
+	local child = parent:FindFirstChild(name)
+	if child then
+		return child
+	end
+	-- Every suffix a Roblox developer might write is accepted, not just `.luau`:
+	-- `.lua`, and the `.server`/`.client` forms that name the script class. All
+	-- of them resolve to the same instance, because in the DataModel the class
+	-- is a property, not part of the name.
+	local bare = Fs.stripScriptSuffix(name)
+	local stripped = bare and parent:FindFirstChild(bare)
+	if stripped and isScript(stripped) then
+		return stripped
+	end
+	return nil
+end
+
 -- Resolve `path` relative to `base`. Absolute paths ignore `base` entirely.
 function Fs.resolve(base: Instance, path: string?): (Instance?, string?)
 	if not path or path == "" or path == "." then
@@ -297,7 +318,12 @@ function Fs.resolve(base: Instance, path: string?): (Instance?, string?)
 	end
 
 	local current: Instance = start
-	for i, seg in ipairs(segments) do
+	-- A while loop rather than ipairs: a Name that contains "/" spans several
+	-- segments, and the fallback at the bottom has to skip past the ones it
+	-- consumed.
+	local i = 1
+	while i <= #segments do
+		local seg = segments[i]
 		if seg == "" or seg == "." then
 			-- no-op
 		elseif seg == ".." then
@@ -311,19 +337,7 @@ function Fs.resolve(base: Instance, path: string?): (Instance?, string?)
 			-- files, then feeds those names straight back to cat/cd/head/grep.
 			-- Fixing this in resolve rather than in cat covers every command at
 			-- once. Exact name wins: an instance may genuinely be named "foo.luau".
-			--
-			-- Every suffix a Roblox developer might write is accepted, not just
-			-- `.luau`: `.lua`, and the `.server`/`.client` forms that name the
-			-- script class. All of them resolve to the same instance, because in
-			-- the DataModel the class is a property, not part of the name.
-			local child = current:FindFirstChild(seg)
-			if not child then
-				local bare = Fs.stripScriptSuffix(seg)
-				local stripped = bare and current:FindFirstChild(bare)
-				if stripped and isScript(stripped) then
-					child = stripped
-				end
-			end
+			local child = findChild(current, seg)
 			-- `workspace` is a real Luau global for game.Workspace, so a model
 			-- writes it lowercase and is not wrong to, the engine accepts it
 			-- everywhere else. Services generally: their names are fixed and
@@ -350,11 +364,37 @@ function Fs.resolve(base: Instance, path: string?): (Instance?, string?)
 			if not child and i == 1 and seg:lower() == "workspace" then
 				child = game:GetService("Workspace")
 			end
+			-- A Name is allowed to contain "/", the separator itself, and mesh
+			-- imports do it by default: a MeshPart arrives named
+			-- "Meshes/Anime_Girl". instancePath emits that raw, so the path it
+			-- produces splits back apart in the wrong place, and `ls -R` — which
+			-- walks by re-resolving the paths it prints — reported the LEADING
+			-- fragment missing, `no child named "Meshes"`, while the instance sat
+			-- right there in the listing it had just printed. Worse, that error
+			-- aborted the whole walk, so one imported mesh anywhere in a subtree
+			-- returned nothing but the error. Every other lookup is tried first,
+			-- so a real child always wins over this.
+			--
+			-- ponytail: longest match first, no backtracking. Ceiling: a name
+			-- that is also a real path ("a/b" beside a folder "a" holding "b")
+			-- picks the deeper one. Full backtracking is the upgrade path if a
+			-- place ever manages to be that ambiguous.
+			if not child then
+				for j = #segments, i + 1, -1 do
+					local joined = findChild(current, table.concat(segments, "/", i, j))
+					if joined then
+						child = joined
+						i = j
+						break
+					end
+				end
+			end
 			if not child then
 				return nil, string.format("no child named %q in %s", seg, instancePath(current))
 			end
 			current = child
 		end
+		i += 1
 	end
 
 	return current, nil

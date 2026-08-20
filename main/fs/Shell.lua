@@ -4403,6 +4403,27 @@ function Shell.selfTest(probe: any): (boolean, string?)
 	if Fs.resolve(fixture, "workspace") ~= impostor then
 		return false, "workspace fallback shadowed a real child"
 	end
+	-- A Name may contain "/", the path separator: mesh imports produce
+	-- "Meshes/Anime_Girl" by default. instancePath emits it raw, and `ls -R`
+	-- walks by re-resolving the paths it prints, so one such part used to abort
+	-- the entire listing with `no child named "Meshes"` — a fragment of its own
+	-- name. Resolving one is the fix; a real two-level path of the same spelling
+	-- still winning is what makes the fix safe to have made.
+	local sliced = Instance.new("Folder")
+	sliced.Name = "Meshes/Anime_Girl"
+	sliced.Parent = nested
+	if Fs.resolve(fixture, "nested/Meshes/Anime_Girl") ~= sliced then
+		return false, "resolve could not reach a child whose Name contains a slash"
+	end
+	local realFolder = Instance.new("Folder")
+	realFolder.Name = "Meshes"
+	realFolder.Parent = nested
+	local realLeaf = Instance.new("Folder")
+	realLeaf.Name = "Anime_Girl"
+	realLeaf.Parent = realFolder
+	if Fs.resolve(fixture, "nested/Meshes/Anime_Girl") ~= realLeaf then
+		return false, "the slash fallback shadowed a real two-level path"
+	end
 	fixture:Destroy()
 
 	-- Globs: a bare word stays a substring match, a wildcard anchors.
