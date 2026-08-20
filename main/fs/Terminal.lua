@@ -273,11 +273,18 @@ function Terminal:find(path: string?, test: (Instance) -> boolean, opts: FindOpt
 	end
 	-- A recursive walk rather than GetDescendants(), so -maxdepth can stop early
 	-- instead of building the whole list and filtering it afterwards.
+	--
+	-- The cap is on RESULTS, not on the walk: past MAX_RESULTS it keeps going to
+	-- count what it is not printing, which is what makes "… N more matches" a
+	-- number rather than a shrug. On a large place that is the whole DataModel,
+	-- so it breathes — see Fs.breather.
+	local breathe = Fs.breather()
 	local function walk(inst: Instance, depth: number)
 		if depth > maxDepth then
 			return
 		end
 		for _, child in ipairs(inst:GetChildren()) do
+			breathe()
 			if depth >= minDepth and test(child) then
 				keep(child)
 			end
@@ -336,8 +343,12 @@ function Terminal:grep(programs: { any }?, path: string?, opts: Fs.GrepOpts?,
 	-- that throws in here is the engine's step budget, and when a pattern is too
 	-- expensive it is too expensive for every line, so the walk is abandoned and
 	-- the pattern is named, instead of paying a pcall a hundred thousand times.
+	-- Every script in the scope is read, and through the editor when one is open,
+	-- so this is the most expensive walk here by some distance.
+	local breathe = Fs.breather()
 	local walkOk, walkErr = pcall(function()
 		for _, inst in ipairs(scope) do
+			breathe()
 			local source = getSource(inst)
 			if source and filter.include and not Fs.matchesName(inst, filter.include) then
 				source = nil
@@ -412,8 +423,10 @@ function Terminal:tree(path: string?, depth: number?, opts: TreeOpts?): (string?
 	local exclude = o.exclude and Fs.nameMatcher(o.exclude) or nil
 
 	local lines = {}
+	local breathe = Fs.breather()
 	local function walk(inst: Instance, prefix: string, d: number)
 		if d > maxDepth then return end
+		breathe()
 		local children = inst:GetChildren()
 		if o.dirsFirst then
 			-- Stable within each group: containers by name, then scripts by name.

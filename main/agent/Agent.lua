@@ -569,10 +569,36 @@ local function runTurn(turn: number)
 		return false
 	end
 
+	-- Forward-declared and assigned AFTER the call, so stopCurrent must not
+	-- capture it by value. Registering the stop handler BEFORE the request also
+	-- closes a real gap: Auth.getAccessToken() yields on a token refresh, and
+	-- during that window there was previously no handler at all. Stop did
+	-- nothing, or worse, referenced a local that had not been assigned yet.
+	local stream: any = nil
+	local cancelRequested = false
+	-- The tool-call block currently executing. It is claimed OUT of pendingCalls
+	-- before dispatch, so setBusy's sweep cannot reach it, without this handle
+	-- its spinner turns forever after a Stop.
+	local runningCall: any = nil
+	-- The tool_use blocks onComplete has already committed to the history and
+	-- that nothing has answered yet. Stop has to answer them: Anthropic rejects
+	-- a tool_use with no matching tool_result, so abandoning a turn here would
+	-- poison every later request in the session rather than just this one.
+	local unanswered: { any }? = nil
+	-- Set once onComplete has put this turn's assistant message into the history.
+	-- Stop reads it, because after that point the two rollback branches it used
+	-- to fall through to are both wrong — see stopCurrent below.
+	local committed = false
+
 	-- Hand the next turn to a fresh task so the UI paints before the request
 	-- goes out, and so the recursion is not one ever-deepening call stack.
 	-- Both continuation paths below, pause_turn and tool results, used a
 	-- copy of these lines.
+	--
+	-- Declared BELOW `cancelRequested` and not above it, which is not a matter
+	-- of taste: a local named before it exists is not that local, it is a nil
+	-- global, so the guard below would read nil forever and never fire. The same
+	-- trap `lastRequestAt` fell into at the top of this file.
 	--
 	-- `checkpoint` is passed only by the tool-results path, where every tool_use
 	-- in the history has its tool_result beside it and the conversation is
@@ -595,26 +621,17 @@ local function runTurn(turn: number)
 				if not ok then warn("[agent] checkpoint failed: " .. tostring(err)) end
 			end
 			task.wait(0.1)
+			-- Re-checked AFTER the wait, and this is the only yield in a run where
+			-- Stop can land with nothing left to catch it. Without it: the handler
+			-- below runs, prints "Stopped.", clears busy — and 0.1s later this
+			-- task starts turn N+1 regardless, spending real tokens and drawing
+			-- real tool calls with the Stop button hidden, because busy is false
+			-- and nothing sets it back. That is the "I pressed stop and it kept
+			-- going" report, and it is not a UI glitch: the turn genuinely ran.
+			if cancelRequested then return end
 			runTurn(turn + 1)
 		end)
 	end
-
-	-- Forward-declared and assigned AFTER the call, so stopCurrent must not
-	-- capture it by value. Registering the stop handler BEFORE the request also
-	-- closes a real gap: Auth.getAccessToken() yields on a token refresh, and
-	-- during that window there was previously no handler at all. Stop did
-	-- nothing, or worse, referenced a local that had not been assigned yet.
-	local stream: any = nil
-	local cancelRequested = false
-	-- The tool-call block currently executing. It is claimed OUT of pendingCalls
-	-- before dispatch, so setBusy's sweep cannot reach it, without this handle
-	-- its spinner turns forever after a Stop.
-	local runningCall: any = nil
-	-- The tool_use blocks onComplete has already committed to the history and
-	-- that nothing has answered yet. Stop has to answer them: Anthropic rejects
-	-- a tool_use with no matching tool_result, so abandoning a turn here would
-	-- poison every later request in the session rather than just this one.
-	local unanswered: { any }? = nil
 
 	stopCurrent = function()
 		if cancelRequested then return end
@@ -658,6 +675,14 @@ local function runTurn(turn: number)
 				table.insert(conversation, { role = "user", content = answers })
 			end
 			unanswered = nil
+		elseif committed then
+			-- Stopped in the gap between two turns: this turn's assistant message
+			-- and every tool_result answering it are ALREADY in the history, and
+			-- what Stop is actually cancelling is the continuation queued after
+			-- them. So there is nothing to add, and both branches below would do
+			-- damage — the first appends a second assistant message holding text
+			-- that is already up there, the second deletes a tool_result message
+			-- and leaves its tool_use unanswered for the rest of the session.
 		elseif text ~= "" then
 			-- Stopped mid-stream. Partial text becomes a normal assistant message
 			-- so roles still alternate; a partial tool_use is dropped, since it has
@@ -856,6 +881,7 @@ local function runTurn(turn: number)
 				-- runs when the turn produced no blocks at all.
 				content = #assistantContent > 0 and assistantContent or (result.text or "(empty)"),
 			})
+			committed = true
 
 			-- Run the tools. Every tool_use needs a matching tool_result, including
 			-- ones whose input failed to parse, an unanswered tool_use is a

@@ -200,8 +200,15 @@ Every turn resends the whole conversation, so one call that dumps 3000 lines
 keeps costing for the rest of the session. Against that: the system prompt and
 tools and the conversation all cache for an hour, grep and find
 return locations rather than content, output is capped and tells you the command
-that gets the rest, and tool descriptions stay near empty because a model
-already knows what ls does, it just cannot know this is a DataModel.
+that gets the rest, `ls /` collapses the hundred-odd empty services Studio
+instantiates whether the place uses them or not (`ls -a /` still lists them),
+and tool descriptions stay near empty because a model already knows what ls
+does, it just cannot know this is a DataModel.
+
+Walks breathe. Luau is single-threaded and this plugin shares that thread with
+the editor, so find, grep, tree and `ls -R` yield a frame whenever they have
+held it for one. A big place makes those commands slow; it no longer makes
+Studio stop drawing.
 
 The gap is compaction. Old tool output is blanked once it is stale, but nothing
 summarises, so a long session grows until you /clear. The tool loop itself is

@@ -1085,16 +1085,27 @@ local function lsRow(row: any, flags: { [string]: boolean }): string
 	-- Still no column padding and no "0 children": alignment is for eyes, the
 	-- reader here is a model, and on a 200-part listing that padding plus a zero
 	-- on every leaf is most of the bytes.
-	local size, isBytes = Fs.size(inst)
 	local sizeText = ""
 	if isScript(inst) then
 		-- Lines by default, because "how big is this file" is the question `ls -l`
 		-- is asked about code. -h asks for human-readable BYTES specifically, so
 		-- it switches the column rather than scaling a line count.
-		sizeText = flags["-h"] and string.format("  %s", Fs.humanSize(size))
+		sizeText = flags["-h"] and string.format("  %s", Fs.humanSize(Fs.size(inst)))
 			or string.format("  %d lines", #splitLines(getSource(inst) or ""))
-	elseif size > 0 then
-		sizeText = string.format("  %d children", #inst:GetChildren())
+	else
+		-- GetChildren, NOT Fs.size. Fs.size on a container is
+		-- `#GetDescendants()`, and this branch only ever asked it "is that more
+		-- than zero" before printing the CHILD count anyway — so every row of
+		-- every `ls -l` was materialising the whole subtree under it to answer a
+		-- question its own next line already had. `ls -la /` paid that once per
+		-- service, Workspace included, which on a large place is the entire
+		-- DataModel walked a hundred times over for a listing of a hundred lines.
+		-- A container with descendants but no children cannot exist, so the two
+		-- tests agree everywhere and only the cost differs.
+		local children = #inst:GetChildren()
+		if children > 0 then
+			sizeText = string.format("  %d children", children)
+		end
 	end
 
 	-- The time column only when time was asked about. Ours is unknown for most
@@ -1131,19 +1142,45 @@ HANDLERS.ls = function(self, argv)
 	-- that every later turn re-sends. One budget across the whole walk, because
 	-- what costs is the size of the tool result, not of any single listing.
 	--
-	-- The ROOT is exempt. That cap is for a container holding thousands of parts;
-	-- the service list is a different animal, the engine bounds it, and every
-	-- entry is load-bearing, because a service you cannot see is a whole subtree
-	-- you cannot reach. Studio instantiates well over a hundred services, and
-	-- rows are sorted before the cut, so `ls /` was dropping the alphabetical
-	-- tail: Workspace, starting with W, fell off every single time while find,
-	-- tree, stat and cat all still saw it. Deterministic, and invisible unless
-	-- you counted.
+	-- The ROOT is exempt from the CAP. That cap is for a container holding
+	-- thousands of parts; the service list is a different animal, the engine
+	-- bounds it, and a service you cannot see is a whole subtree you cannot
+	-- reach. Studio instantiates well over a hundred services, and rows are
+	-- sorted before the cut, so `ls /` was dropping the alphabetical tail:
+	-- Workspace, starting with W, fell off every single time while find, tree,
+	-- stat and cat all still saw it. Deterministic, and invisible unless you
+	-- counted.
+	--
+	-- The empty ones are collapsed instead, which is a different question — see
+	-- hideEmpty below. A cut takes the tail whatever is in it; that one takes
+	-- only rows with no subtree behind them, and says how many.
 	local out: { string } = {}
-	local budget = (self:resolve(target) == game) and math.huge or MAX_LIST
+	local atRoot = self:resolve(target) == game
+	local budget = atRoot and math.huge or MAX_LIST
 	local skipped = 0
 	local firstDropped: string? = nil
 	local emptyLabel: string? = nil
+
+	-- Studio instantiates well over a hundred services whether the place uses
+	-- them or not, and `ls /` is the first thing anything types. Almost all of
+	-- them are empty: AdService, AnalyticsService, AvatarEditorService and ninety
+	-- more, one line each, in the tool result of every session for the rest of
+	-- that session. The ones with children are the place; the rest are furniture.
+	--
+	-- Collapsed rather than cut, and -a still lists them, which is what `-a`
+	-- means everywhere else and what it did here before: nothing. Discovery
+	-- survives either way — resolve reaches a service through game:GetChildren,
+	-- not through this listing, so `ls /AdService` works whether or not it was
+	-- printed.
+	--
+	-- Only the root, only without a glob, and only for containers with nothing
+	-- in them. An empty Folder somewhere in a place is a real answer to `ls`.
+	local hideEmpty = atRoot and not matcher and not flags["-a"] and not flags["-A"]
+	local hidden = 0
+
+	-- `ls -R /` re-resolves a path string for every container it descends into,
+	-- so on a large place this walk is long enough to freeze Studio on its own.
+	local breathe = Fs.breather()
 
 	local function listOne(path: string?, header: boolean): string?
 		local rows, err = self:ls(path, matcher)
@@ -1158,7 +1195,10 @@ HANDLERS.ls = function(self, argv)
 			out[#out + 1] = (path or ".") .. ":"
 		end
 		for _, row in ipairs(rows) do
-			if budget <= 0 then
+			breathe()
+			if hideEmpty and not header and #row.inst:GetChildren() == 0 then
+				hidden += 1
+			elseif budget <= 0 then
 				skipped += 1
 				-- Remember WHICH entry the cut started at. A bare "... 23 more"
 				-- reads as "the boring tail", naming the first casualty is what
@@ -1206,6 +1246,13 @@ HANDLERS.ls = function(self, argv)
 	if skipped > 0 then
 		out[#out + 1] = string.format("… %d more from %q on (narrow it: `ls %s/A*`, or `ls | grep <name>`)",
 			skipped, firstDropped or "?", target or ".")
+	end
+	-- Says what was left out and how to see it, so an absence is never something
+	-- the reader has to infer from a count that does not add up.
+	if hidden > 0 then
+		out[#out + 1] = string.format(
+			"… %d empty services not shown (`ls -a /` lists them; each is still reachable by name)",
+			hidden)
 	end
 	return table.concat(out, "\n")
 end
@@ -4712,13 +4759,35 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		return false, "capped ls did not name the first dropped entry:\n" ..
 			bigOut:sub(-120)
 	end
-	-- ...and the root is exempt from the cap entirely, because every service is
+	-- ...and the root is exempt from the cap entirely, because a service is
 	-- reachable-or-not, not merely interesting. Asserted against `game` itself
 	-- rather than a fixture: this is the one listing whose completeness matters.
-	local rootRows = #splitLines(Shell.run(probe, "ls /"))
-	if rootRows ~= #game:GetChildren() then
-		return false, string.format("ls / listed %d of %d services — the root must never be capped",
-			rootRows, #game:GetChildren())
+	-- `-a` is the complete form: plain `ls /` collapses the EMPTY services, which
+	-- Studio instantiates by the hundred and none of which has a subtree behind
+	-- it. Both halves are pinned, because each fails in its own direction — the
+	-- cap coming back would silently drop Workspace, and the collapse reaching a
+	-- service with children would hide a whole tree.
+	local allRows = #splitLines(Shell.run(probe, "ls -a /"))
+	if allRows ~= #game:GetChildren() then
+		return false, string.format("ls -a / listed %d of %d services — the root must never be capped",
+			allRows, #game:GetChildren())
+	end
+	local occupied = 0
+	for _, service in ipairs(game:GetChildren()) do
+		if #service:GetChildren() > 0 then
+			occupied += 1
+		end
+	end
+	local rootOut = Shell.run(probe, "ls /")
+	-- One trailer line when anything was collapsed, and none when nothing was.
+	local wantRows = occupied + (occupied < #game:GetChildren() and 1 or 0)
+	if #splitLines(rootOut) ~= wantRows then
+		return false, string.format(
+			"ls / emitted %d lines, want %d (%d of %d services have children):\n%s",
+			#splitLines(rootOut), wantRows, occupied, #game:GetChildren(), rootOut)
+	end
+	if occupied < #game:GetChildren() and not rootOut:match("empty services not shown") then
+		return false, "ls / collapsed the empty services without saying so:\n" .. rootOut
 	end
 	if #splitLines(bigOut) ~= MAX_LIST + 1 then
 		return false, string.format("capped ls emitted %d lines, want %d",

@@ -43,6 +43,7 @@ main.lua                        window, toolbar, popups, usage panel
 | effort / thinking / the output ceiling | `providers/Anthropic.lua:251` `applyReasoning` against `MODEL_CAPS:76`; the ceiling is `maxOutput` on the same table. `Settings` picks a level and nothing else — no per-effort token maths lives there |
 | which provider is live | `agent/Provider.lua` — `wire` and `auth`; nothing outside `providers/` names a vendor |
 | the turn loop | `Agent.lua:513` `runTurn` |
+| Stop | `Agent.lua:631` `stopCurrent`, reached through `Agent.stop`. The queued continuation re-checks `cancelRequested` after its wait (`continueTurn:612`), and `committed:591` is what keeps Stop from rolling back a turn already in the history |
 | a turn's result is handled | `Agent.lua:751` `onComplete` -> assemble -> dispatch tools -> `continueTurn:590` |
 | the user hits enter | `main.lua:804` `submit` -> `Commands.handle:184` -> `Agent.send:1102` |
 | a tool runs | `Tools.lua:106` `dispatch` — never throws |
@@ -68,6 +69,8 @@ main.lua                        window, toolbar, popups, usage panel
 | root/service protection | `Fs.lua:691` `Fs.guardProtected` |
 | modification times (we keep our own) | `Fs.lua:507` `Fs.watch` |
 | ls / cat / stat / find / grep / tree | `Terminal.lua:113 / 133 / 206 / 250 / 315 / 402` |
+| a walk stays off the main thread's back | `Fs.lua:645` `Fs.breather` — one call per node in `Terminal:find:281`, `:grep:348`, `:tree:426` and `ls -R` (`Shell.lua:1183`) |
+| the root listing collapses empty services | `Shell.lua:1178` `hideEmpty`; `ls -a /` is the complete form |
 | write / multiedit | `Terminal.lua:515 / 562` |
 | Luau is executed | `studio/Exec.lua:424` `Exec.run`; PROLOGUE at `:56`, every entry one physical line |
 | the run guard (off by default) | `studio/Exec.lua:31` `setRunGuard`, backed by `Settings.allowRun` |
@@ -83,13 +86,13 @@ main.lua                        window, toolbar, popups, usage panel
 
 | File | Lines | Owns |
 |---|---:|---|
-| `fs/Shell.lua` | 5477 | The command line. Still the biggest — see below. |
-| `agent/Agent.lua` | 1300 | Turn loop, conversation state, trimming, stop. |
+| `fs/Shell.lua` | 5557 | The command line. Still the biggest — see below. |
+| `agent/Agent.lua` | 1338 | Turn loop, conversation state, trimming, stop. |
 | `ui/Console.lua` | 1117 | Bubbles, thinking drawers, tool-call blocks. |
 | `text/Regex.lua` | 958 | BRE/ERE engine. Requires nothing. |
 | `main.lua` | 943 | Widget, toolbar, popups. Owns `plugin`, hands it to Provider / Sessions / Settings — the only four that touch it. |
-| `fs/Terminal.lua` | 799 | Commands as tree operations. No parsing. |
-| `fs/Fs.lua` | 758 | Paths, `.Source`, undo, mtime, globs, mode bits. |
+| `fs/Terminal.lua` | 811 | Commands as tree operations. No parsing. |
+| `fs/Fs.lua` | 791 | Paths, `.Source`, undo, mtime, globs, mode bits. |
 | `agent/providers/Anthropic.lua` | 1278 | One request. Knows nothing about turns. |
 | `ui/Sessions.lua` | 687 | Session list and persistence. |
 | `ui/Settings.lua` | 578 | Preferences + panel. |
@@ -112,12 +115,12 @@ main.lua                        window, toolbar, popups, usage panel
 |---:|---|
 | 1-63 | header, requires, aliases |
 | 64-941 | parsing: `tokenize:86`, `partition:230`, `extractHeredoc:407`, `takeRedirect:467`, `SPECS:578` |
-| 942-3299 | HANDLERS — 33 commands + private helpers |
-| 3300-4115 | diff core, the last handlers, curl/wget, `Shell.COMMANDS:4114` |
-| 4116-4316 | pipelines and statements, `runCommand:4156`, `runStatements:4294` |
-| 4317-4485 | loops: `parseLoop:4334`, `expandVar:4402`, `runLoop:4419`, `runTokens:4417` |
-| 4486-4525 | `Shell.run:4486` |
-| 4526-end | `Shell.selfTest:4527` |
+| 942-3352 | HANDLERS — 33 commands + private helpers |
+| 3353-4162 | diff core, the last handlers, curl/wget, `Shell.COMMANDS:4161` |
+| 4163-4363 | pipelines and statements, `runCommand:4203`, `runStatements:4341` |
+| 4364-4544 | loops: `parseLoop:4381`, `expandVar:4461`, `runLoop:4478`, `runTokens:4501` |
+| 4545-4585 | `Shell.run:4545` |
+| 4586-end | `Shell.selfTest:4586` |
 
 `tokenize`/`partition` and the diff core are pure text and are the next
 extractions; `HANDLERS` is not (below).

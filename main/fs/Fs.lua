@@ -619,6 +619,40 @@ function Fs.setMode(inst: Instance, letter: string, on: boolean): string?
 	return nil
 end
 
+-- Keeping Studio responsive during a walk
+-- Luau is single-threaded and this plugin shares that thread with the editor,
+-- so a walk over a large place is not a slow command, it is a frozen window: no
+-- rendering, no input, and eventually Studio's own not-responding dialog on top
+-- of it. `find`, `grep`, `tree` and `ls -R` all walk without a natural stopping
+-- point, and a place with a few hundred thousand instances is an ordinary size
+-- for a game someone is asking an agent about.
+--
+-- Yielding from tool dispatch is safe, and not by accident: dispatch runs from
+-- onComplete at message_stop, where the stream has already delivered
+-- everything. Fs.writeSource and `catalog` have both been yielding there since
+-- they shipped.
+--
+-- Time, not a counter. A counter added a fixed cost to every walk whether or
+-- not it was slow — `ls -R` over twenty instances would still stop to wait —
+-- and it cannot know how expensive one step was, which for grep is a whole
+-- script read through the editor. This yields only once the thread has actually
+-- been held for a frame, so a small place never waits at all and a huge one
+-- gives a frame back every frame.
+local BREATH = 1 / 60
+
+-- Returns a function to call once per node visited. One closure per walk, and
+-- the deadline lives in it, so nested walks cannot reset each other's.
+function Fs.breather(): () -> ()
+	local deadline = os.clock() + BREATH
+	return function()
+		if os.clock() < deadline then
+			return
+		end
+		task.wait()
+		deadline = os.clock() + BREATH
+	end
+end
+
 -- Size and identity
 -- A script's size is its source in bytes, a real byte count, and the one `wc
 -- -c` already reports. Nothing else here has bytes to count, so its size is its
