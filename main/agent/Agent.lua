@@ -229,13 +229,30 @@ local term: any = nil
 local conversation: { any } = {}
 local busy = false
 local onBusyChanged: ((boolean) -> ())? = nil
+-- Fired where the conversation is complete and valid but the run is nowhere
+-- near idle: as the user's message goes in, and after each batch of tool
+-- results. The session used to be written to disk on the busy -> idle edge and
+-- NOWHERE else, and a long run is a single busy period — a place that crashed
+-- twenty tool calls into one lost every one of them and reopened from before
+-- the message that started it. The edge still saves; this is the same save, at
+-- each step of the way there.
+--
+-- A callback rather than requiring Sessions, which requires Agent — the entry
+-- point owns that wiring, as it does for onBusyChanged.
+local onCheckpoint: (() -> ())? = nil
 -- Set while a turn is in flight; cleared the moment it settles. Agent.stop()
 -- calls this, which is what the Stop button drives.
 local stopCurrent: (() -> ())? = nil
 -- Running total for this session, the equivalent of the Session block in Claude
 -- Code's /usage. Plan limits are a separate thing and come from the usage
 -- endpoint (Auth.fetchUsage); this is just what this session has spent.
-local totals = { input = 0, output = 0 }
+--
+-- `cached` is the read half of `input`, not a third number beside it: input is
+-- fresh + read + written, so cached/input is the hit rate over the session. A
+-- turn's own split is printed under it by the per-turn line below; this is the
+-- one that says whether the cache is working at all, which is the question a
+-- long run actually has.
+local totals = { input = 0, output = 0, cached = 0 }
 -- tool_use / server_tool_use id -> the console block waiting for its result.
 -- Keyed by id rather than "the last one", because a turn can run several calls
 -- and parallel tool use means their blocks are all open at once.
@@ -259,9 +276,11 @@ local pendingCalls: { [string]: any } = {}
 -- did nothing and a restored session was treated as cache-warm.
 local lastRequestAt: number? = nil
 
-function Agent.Initialize(terminal: any, busyCallback: ((boolean) -> ())?)
+function Agent.Initialize(terminal: any, busyCallback: ((boolean) -> ())?,
+	checkpointCallback: (() -> ())?)
 	term = terminal
 	onBusyChanged = busyCallback
+	onCheckpoint = checkpointCallback
 end
 
 function Agent.conversation(): { any }
@@ -282,7 +301,7 @@ function Agent.restore(messages: { any })
 	lastRequestAt = nil
 end
 
-function Agent.usage(): { input: number, output: number }
+function Agent.usage(): { input: number, output: number, cached: number }
 	return totals
 end
 
@@ -553,9 +572,28 @@ local function runTurn(turn: number)
 	-- Hand the next turn to a fresh task so the UI paints before the request
 	-- goes out, and so the recursion is not one ever-deepening call stack.
 	-- Both continuation paths below, pause_turn and tool results, used a
-	-- copy of these four lines.
-	local function continueTurn()
+	-- copy of these lines.
+	--
+	-- `checkpoint` is passed only by the tool-results path, where every tool_use
+	-- in the history has its tool_result beside it and the conversation is
+	-- therefore valid to send back. The OTHER caller is pause_turn, where the
+	-- assistant message carries a server_tool_use whose result has not arrived
+	-- yet: saving there and restoring from it leaves an unanswered tool_use in
+	-- the history permanently, which Anthropic rejects on every later request —
+	-- a session that is dead and cannot be repaired, traded for a crash window
+	-- of a few seconds.
+	--
+	-- Inside the spawn rather than before it, so the disk write lands in the
+	-- same 0.1s the UI was already given to paint. No throttle: every checkpoint
+	-- is separated from the next by a whole request, so the rate is bounded by
+	-- the network however fast the tools are. pcall because a failed save must
+	-- not take the run down with it.
+	local function continueTurn(checkpoint: boolean?)
 		task.spawn(function()
+			if checkpoint and onCheckpoint then
+				local ok, err = pcall(onCheckpoint)
+				if not ok then warn("[agent] checkpoint failed: " .. tostring(err)) end
+			end
 			task.wait(0.1)
 			runTurn(turn + 1)
 		end)
@@ -746,6 +784,7 @@ local function runTurn(turn: number)
 				totals.input += (result.usage.input_tokens or 0)
 					+ (result.usage.cache_read_input_tokens or 0)
 					+ (result.usage.cache_creation_input_tokens or 0)
+				totals.cached += result.usage.cache_read_input_tokens or 0
 				totals.output += result.usage.output_tokens or 0
 			end
 
@@ -940,7 +979,9 @@ local function runTurn(turn: number)
 				table.insert(conversation, { role = "user", content = toolResults })
 				-- Answered, so a later Stop must not answer them a second time.
 				unanswered = nil
-				continueTurn()
+				-- Checkpointed: every tool_use above now has its tool_result, so
+				-- this is a history a crash can be restored from.
+				continueTurn(true)
 				return
 			end
 
@@ -1069,6 +1110,14 @@ function Agent.send(text: string, isLoggedIn: () -> boolean)
 	-- Shown to the model, not to the user: the console echoes what was typed.
 	Console.appendLine(text, "user")
 	table.insert(conversation, { role = "user", content = text .. editorContext() })
+	-- Before the first request, not after it. Otherwise the whole of turn one is
+	-- unsaved, and a crash inside it puts the session back to before the message
+	-- was ever typed — the one loss the user has to retype by hand rather than
+	-- just wait out.
+	if onCheckpoint then
+		local saved, err = pcall(onCheckpoint)
+		if not saved then warn("[agent] checkpoint failed: " .. tostring(err)) end
+	end
 	setBusy(true)
 	runTurn(1)
 end

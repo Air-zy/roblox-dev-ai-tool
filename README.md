@@ -41,7 +41,9 @@ word would hand you the markup around it.
 
 ## Tools
 
-bash runs a command line with pipes, ; && ||, redirects, heredocs and globs.
+bash runs a command line with pipes, ; && ||, redirects, heredocs, globs and
+`for f in <words>; do ... ; done`. There is no `while`: nothing here changes
+between two iterations, so it would run zero times or forever.
 edit and multiedit swap unique substrings, write replaces a whole .Source
 (creating the script if it is missing), run executes Luau, and catalog searches
 and loads free models. run is off by default since it runs at plugin permission
@@ -163,7 +165,7 @@ main/
   fs/
     Fs.lua        paths, .Source access, undo, globs
     Terminal.lua  the commands themselves
-    Shell.lua     tokenizer, pipes, redirection, heredocs
+    Shell.lua     tokenizer, pipes, redirection, heredocs, for loops
   studio/
     Props.lua     property names and defaults
     Exec.lua      runs Luau                (run tool only)

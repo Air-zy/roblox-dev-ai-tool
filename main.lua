@@ -437,6 +437,16 @@ local toggleSettings, refreshSettings = Settings.mountPanel(widget, function(): 
 		label = "Tokens",
 		value = string.format("%s in · %s out", compact(usage.input), compact(usage.output)),
 	})
+	-- Cache hit rate over the session. Its own row rather than a third figure on
+	-- the one above, which truncates at the end and would drop it. Absent before
+	-- the first turn, where 0 of 0 is not 0%.
+	if usage.input > 0 then
+		table.insert(rows, {
+			label = "Cache hits",
+			value = string.format("%d%% · %s read", math.floor(usage.cached / usage.input * 100),
+				compact(usage.cached)),
+		})
+	end
 	return rows
 end)
 
@@ -772,9 +782,11 @@ end)
 -- editable and keeps its own text; only SENDING is blocked while busy, see the
 -- Enter handler.
 --
--- The idle edge is also where the session is written to disk: it fires on a
--- finished turn, an error and a Stop alike, so a crash only ever costs the turn
--- that was in flight.
+-- The idle edge is one of the two places the session is written to disk: it
+-- fires on a finished turn, an error and a Stop alike. The other is the
+-- checkpoint passed alongside it, which Agent fires as a message is sent and
+-- after each batch of tool results — the edge alone meant a run of forty tool
+-- calls was a single busy period, and a Studio crash inside it cost the lot.
 Agent.Initialize(term, function(busy: boolean)
 	Console.setWorking(busy)
 	stopButton.Visible = busy
@@ -784,7 +796,7 @@ Agent.Initialize(term, function(busy: boolean)
 		refreshModel()
 		Sessions.save()
 	end
-end)
+end, Sessions.save)
 Commands.Initialize(term, toggleSettings)
 
 local UserInputService = game:GetService("UserInputService")

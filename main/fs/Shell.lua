@@ -509,6 +509,18 @@ local UNSUPPORTED: { [string]: string } = {
 	-- this list for exactly that reason until they became commands.
 	awk = "no awk; `sed -n '10,40p'` prints a line range and `grep -A/-B/-C` gives context",
 	xargs = "no xargs; pipe into grep/head/tail/wc/sort/uniq/sed/tr instead",
+	-- A `for` loop IS supported, but only as the whole line: the parser claims it
+	-- before statements are split, so one reached as a command means it was
+	-- written after a `;`. Three entries rather than one, because a mis-placed
+	-- loop leaves all three of its keywords stranded, and "unknown command"
+	-- prints the entire command list beside each.
+	["for"] = "a `for` loop has to start the command line, not follow a `;` — " ..
+		"`for f in *.luau; do head -5 $f; done`",
+	["do"] = "only appears inside a loop — `for f in *.luau; do head -5 $f; done`",
+	["done"] = "only appears inside a loop — `for f in *.luau; do head -5 $f; done`",
+	["while"] = "no `while`: nothing here changes between two iterations, so it " ..
+		"would run zero times or forever. `for f in <words>; do ... ; done` is the loop",
+	["until"] = "no `until`; see `while`",
 }
 
 -- Which script class a suffix asks for. Owned by Fs, because `write` creates
@@ -1940,18 +1952,39 @@ HANDLERS.find = function(self, argv)
 		i += 1
 	end
 
-	-- `find / -type f` has no name at all, and `find Handler` has no path, so
-	-- the bare operands are classified by shape rather than position: a leading
-	-- / or a bare . is unambiguously a root, anything else is the pattern.
+	-- How many tests the expression itself carries. Counted BEFORE the bare
+	-- operands are classified, because that count is what tells a path from a
+	-- pattern below.
+	local total = 0
+	for _, group in ipairs(groups) do
+		total += #group
+	end
+
+	-- `find / -type f` has no name at all, and `find Handler` has no path, so the
+	-- bare operands cannot be classified by position alone.
+	--
+	-- A leading / or a bare . is unambiguously a root. The rest is decided by
+	-- whether the expression has any tests: with one, every bare word is a PATH,
+	-- which is GNU's rule and the shape the model writes; with none there is
+	-- nothing else the word could be, so the first is the native `find <pattern>`
+	-- and any after it are paths.
+	--
+	-- ROOTS, plural, because `find /A /B -name x` is how the search gets written
+	-- the moment there is more than one place to look, and it is the exact shape
+	-- that used to go wrong twice over: the second path was not searched at all,
+	-- AND it was taken as the pattern, which then AND-ed itself into the last
+	-- -o group and killed that clause too. The output was a short, plausible,
+	-- silently incomplete list — the most expensive kind of wrong answer here,
+	-- since the reader's next move is to conclude the instances do not exist.
 	local pattern: string? = nil
-	local root: string? = nil
+	local roots: { string } = {}
 	for _, arg in ipairs(bare) do
-		if not root and (arg:sub(1, 1) == "/" or arg == "." or arg == "..") then
-			root = arg
-		elseif not pattern then
+		if arg:sub(1, 1) == "/" or arg == "." or arg == ".." then
+			roots[#roots + 1] = arg
+		elseif total == 0 and not pattern then
 			pattern = arg
-		elseif not root then
-			root = arg
+		else
+			roots[#roots + 1] = arg
 		end
 	end
 	if pattern then
@@ -1959,19 +1992,28 @@ HANDLERS.find = function(self, argv)
 		add(function(inst)
 			return matches(inst.Name) or matches(displayName(inst))
 		end)
+		total += 1
 	end
 
 	-- A bare `find` would otherwise accept everything from the cwd, which at /
-	-- means walking every descendant of the DataModel for nothing.
-	local total = 0
-	for _, group in ipairs(groups) do
-		total += #group
-	end
+	-- means walking every descendant of the DataModel for nothing. A path is NOT
+	-- enough to lift that, despite what the refusal used to say: `find /Workspace`
+	-- with no test prints the whole subtree, which is `ls -R` with extra steps.
 	if total == 0 and not minDepth and not maxDepth then
-		return fail("find", "requires a pattern, a path or a test")
+		return fail("find", "requires a pattern or a test — a path on its own lists " ..
+			"the whole subtree, which is what `ls -R` is for")
 	end
 
 	local function test(inst: Instance): boolean
+		-- No tests at all is `find /x -maxdepth 2`, which in GNU find lists the
+		-- subtree down to that depth. The fold below returns false on an empty
+		-- expression, so without this the depth bounds were the one thing you
+		-- could pass find that made it report "no matches" for everything —
+		-- `-maxdepth` on its own was dead, and dead in the direction that looks
+		-- like an empty place rather than a broken flag.
+		if total == 0 then
+			return true
+		end
 		for _, group in ipairs(groups) do
 			local all = true
 			for _, one in ipairs(group) do
@@ -1989,9 +2031,34 @@ HANDLERS.find = function(self, argv)
 		return false
 	end
 
-	local found, err = self:find(root, test, { minDepth = minDepth, maxDepth = maxDepth })
-	if not found then
-		return fail("find", err)
+	-- One walk per root, merged. Deduped by instance, because roots are allowed
+	-- to overlap — `find / /Workspace` is legal and names some instances twice,
+	-- and -delete below would then try to destroy the same one twice.
+	local found: { Instance } = {}
+	local seen: { [Instance]: boolean } = {}
+	local skipped = 0
+	-- "." is the cwd, which is what a find with no path at all searches.
+	if #roots == 0 then
+		roots = { "." }
+	end
+	for _, where in ipairs(roots) do
+		local batch, err = self:find(where, test, { minDepth = minDepth, maxDepth = maxDepth })
+		if not batch then
+			return fail("find", err)
+		end
+		skipped += ((batch :: any).skipped or 0)
+		for _, inst in ipairs(batch) do
+			if not seen[inst] then
+				seen[inst] = true
+				-- Capped across the whole command, not per root: N roots must not
+				-- buy N times the ceiling every other search is held to.
+				if #found >= MAX_LIST then
+					skipped += 1
+				else
+					found[#found + 1] = inst
+				end
+			end
+		end
 	end
 	if #found == 0 then
 		return "no matches"
@@ -2019,8 +2086,7 @@ HANDLERS.find = function(self, argv)
 	for _, inst in ipairs(found) do
 		lines[#lines + 1] = instancePath(inst) .. "  [" .. inst.ClassName .. "]"
 	end
-	local skipped = (found :: any).skipped
-	if skipped then
+	if skipped > 0 then
 		lines[#lines + 1] = string.format("… %d more matches (narrow the path or the pattern)",
 			skipped)
 	end
@@ -4222,6 +4288,208 @@ local function label(statement: Statement): string
 	return table.concat(parts, " | ")
 end
 
+-- Run a statement list. `lastOk` seeds the `&&`/`||` chain, which matters when
+-- something ran before these statements did — see the loop below, where `done &&
+-- echo ok` has to know whether the loop failed.
+local function runStatements(self: any, statements: { Statement }, readOnly: boolean?,
+	stdin: string?, lastOk: boolean): (string, boolean)
+	local outputs: { string } = {}
+	for index, statement in ipairs(statements) do
+		local skip = (statement.joiner == "&&" and not lastOk)
+			or (statement.joiner == "||" and lastOk)
+		if not skip then
+			-- A heredoc body belongs to the last statement, the way a shell
+			-- attaches it to the command it followed.
+			local output, ok = runPipeline(self, statement.stages, readOnly,
+				index == #statements and stdin or nil)
+			lastOk = ok
+			if #statements == 1 then
+				return output, ok
+			end
+			-- With several commands the outputs need labelling, or there is no
+			-- telling which block came from which.
+			outputs[#outputs + 1] = string.format("$ %s\n%s", label(statement), output)
+		end
+	end
+	return table.concat(outputs, "\n"), lastOk
+end
+
+-- Loops
+--
+-- `for NAME in WORDS; do BODY; done`, and only that one. There is no `while`
+-- and no `until`: nothing in this shell can change a condition between two
+-- iterations, so either would run zero times or forever, and forever is a frozen
+-- Studio with no way out. A word list is finite by construction.
+--
+-- What it buys is the thing that had no spelling before: one command per
+-- instance over a set. `head -5 a b c` prints three files, but `sed -i` on each,
+-- or a grep whose pattern differs per file, was a separate tool call each time.
+type Loop = { name: string, words: { string }, body: { string }, rest: { string } }
+
+local LOOP_SYNTAX = "`for f in *.luau; do head -5 $f; done`"
+
+-- nil, nil means "not a loop"; nil with a message means it is one and it is
+-- malformed. Silently falling through on a malformed loop would run `for` as a
+-- command and report an unknown one, which points at the wrong thing.
+local function parseLoop(argv: { string }): (Loop?, string?)
+	-- Leading `;` tokens are skipped first. A body written on its own line starts
+	-- with the one tokenize made from the newline, and a NESTED loop is exactly
+	-- that shape: without this, the inner loop of
+	--     for a in 1 2; do
+	--       for b in x y; do ... ; done
+	--     done
+	-- is not recognised as a loop at all, and comes back as the refusal that says
+	-- a loop has to start the command line.
+	local i = 1
+	while argv[i] == ";" do
+		i += 1
+	end
+	if argv[i] ~= "for" then
+		return nil, nil
+	end
+	local name = argv[i + 1]
+	if not name or not name:match("^[%a_][%w_]*$") then
+		return nil, string.format("for: %q is not a variable name — %s",
+			tostring(name), LOOP_SYNTAX)
+	end
+	if argv[i + 2] ~= "in" then
+		-- bash also has `for f; do`, which iterates the positional parameters.
+		-- There are none here, so it can only ever be a typo for the `in` form.
+		return nil, "for: expected `in` after the variable — " .. LOOP_SYNTAX
+	end
+
+	local words: { string } = {}
+	i += 3
+	while i <= #argv and argv[i] ~= ";" and argv[i] ~= "do" do
+		words[#words + 1] = argv[i]
+		i += 1
+	end
+	-- `; do`, or `do` on the next line, which tokenize has already turned into a
+	-- `;`. Several in a row is a blank line between them.
+	while argv[i] == ";" do
+		i += 1
+	end
+	if argv[i] ~= "do" then
+		return nil, "for: expected `do` after the word list — " .. LOOP_SYNTAX
+	end
+	i += 1
+
+	-- Depth-counted so a loop inside a loop takes its own `done` rather than the
+	-- outer one's. Nesting costs three lines here and mis-parses silently
+	-- without them: the inner body would become the outer's trailing statements.
+	local body: { string } = {}
+	local depth = 1
+	while i <= #argv do
+		local token = argv[i]
+		if token == "for" then
+			depth += 1
+		elseif token == "done" then
+			depth -= 1
+			if depth == 0 then
+				i += 1
+				break
+			end
+		end
+		body[#body + 1] = token
+		i += 1
+	end
+	if depth ~= 0 then
+		return nil, "for: missing `done` — " .. LOOP_SYNTAX
+	end
+
+	local rest: { string } = {}
+	table.move(argv, i, #argv, 1, rest)
+	return { name = name, words = words, body = body, rest = rest }, nil
+end
+
+-- $NAME and ${NAME} in the body tokens, replaced per iteration.
+--
+-- AFTER tokenizing, not before, so a word containing a space stays ONE argument.
+-- bash re-splits an expanded variable and needs "$f" to stop it; here a path
+-- with a space in it simply survives, which is the behaviour every caller wanted
+-- from the quotes anyway.
+--
+-- The frontier is what keeps `$f` out of `$file`: it requires the character
+-- after the name to be a non-word one, and end-of-token counts.
+local function expandVar(tokens: { string }, name: string, value: string): { string }
+	-- A `%` in the value is a capture reference in a gsub replacement, so a path
+	-- containing one would corrupt the substitution or throw.
+	local replacement = value:gsub("%%", "%%%%")
+	local braced = "%${" .. name .. "}"
+	local bare = "%$" .. name .. "%f[^%w_]"
+	local out: { string } = {}
+	for index, token in ipairs(tokens) do
+		out[index] = (token:gsub(braced, replacement):gsub(bare, replacement))
+	end
+	return out
+end
+
+-- Forward-declared: a loop body is run through the same entry point that
+-- detects a loop, which is what makes nesting work without a second parser.
+local runTokens: (any, { string }, boolean?, string?, boolean) -> (string, boolean)
+
+local function runLoop(self: any, loop: Loop, readOnly: boolean?, lastOk: boolean): (string, boolean)
+	-- Globbed, because `for f in *.luau` is the whole reason to have this.
+	local words = expandGlobs(self, loop.words)
+	local outputs: { string } = {}
+	local ok = lastOk
+	for _, word in ipairs(words) do
+		local output
+		output, ok = runTokens(self, expandVar(loop.body, loop.name, word), readOnly, nil, true)
+		if output ~= "" then
+			outputs[#outputs + 1] = output
+		end
+	end
+	-- Iterations run together, exactly as bash does, and NOT under a per-iteration
+	-- header: injecting one would corrupt `done | wc -l` and every other pipe.
+	-- The commands that need attribution already carry it — `head` prints
+	-- `==> path <==` per file, `grep` and `wc` name theirs — so a header here
+	-- would be a second, disagreeing one.
+	--
+	-- bash keeps going after a failing iteration, and so does this: covering the
+	-- list is the point, and one missing instance must not silently drop the rest.
+	return table.concat(outputs, "\n"), ok
+end
+
+function runTokens(self: any, argv: { string }, readOnly: boolean?, stdin: string?,
+	lastOk: boolean): (string, boolean)
+	local loop, loopErr = parseLoop(argv)
+	if loopErr then
+		return fail("bash", loopErr), false
+	end
+	if not loop then
+		return runStatements(self, parseStatements(argv), readOnly, stdin, lastOk)
+	end
+
+	-- `done | wc -l`: the loop is the first stage of a pipeline. Refused rather
+	-- than approximated past one pipeline, because the near miss is `wc` running
+	-- with no input at all and reporting 0, which reads as an empty result rather
+	-- than as a shape this shell does not parse.
+	--
+	-- Checked BEFORE the loop runs. A refusal issued afterwards would already
+	-- have made every write the body asked for.
+	local after = parseStatements(loop.rest)
+	local piped = loop.rest[1] == "|"
+	if piped and #after ~= 1 then
+		return fail("bash", "for: a loop can feed one pipeline and nothing after it — " ..
+			"run the rest as its own command"), false
+	end
+
+	local output, ok = runLoop(self, loop, readOnly, lastOk)
+	if #loop.rest == 0 then
+		return output, ok
+	end
+	if piped then
+		return runPipeline(self, after[1].stages, readOnly, output)
+	end
+	-- `done && echo ok` reads the loop's result, which is why runStatements takes
+	-- a seed rather than starting at true.
+	local tail, tailOk = runStatements(self, after, readOnly, stdin, ok)
+	if output == "" then return tail, tailOk end
+	if tail == "" then return output, tailOk end
+	return output .. "\n" .. tail, tailOk
+end
+
 -- Run a `bash` line. Split out from dispatch so the tokenizer and the command
 -- table can be tested without going through tool_use plumbing.
 --
@@ -4260,31 +4528,8 @@ function Shell.run(self: any, line: string?, readOnly: boolean?): string
 		end
 	end
 
-	local statements = parseStatements(argv)
-	if #statements == 0 then
-		return ""
-	end
-
-	local outputs: { string } = {}
-	local lastOk = true
-	for index, statement in ipairs(statements) do
-		local skip = (statement.joiner == "&&" and not lastOk)
-			or (statement.joiner == "||" and lastOk)
-		if not skip then
-			-- A heredoc body belongs to the last statement, the way a shell
-			-- attaches it to the command it followed.
-			local output, ok = runPipeline(self, statement.stages, readOnly,
-				index == #statements and stdin or nil)
-			lastOk = ok
-			if #statements == 1 then
-				return output
-			end
-			-- With several commands the outputs need labelling, or there is no
-			-- telling which block came from which.
-			outputs[#outputs + 1] = string.format("$ %s\n%s", label(statement), output)
-		end
-	end
-	return table.concat(outputs, "\n")
+	local output = runTokens(self, argv, readOnly, stdin, true)
+	return output
 end
 
 -- Self-test
@@ -4749,6 +4994,24 @@ function Shell.selfTest(probe: any): (boolean, string?)
 
 		-- Zero lines is a real request. `head -0` used to fall through to the
 		-- path list and report `no child named "-0"`, while -1 and up worked.
+		-- Loops. The word list is glob-expanded, $f and ${f} substitute into the
+		-- body AFTER tokenizing (so a value with a space stays one argument), and
+		-- iterations run together with no header of their own — the commands that
+		-- need attribution print their own, and an injected one would corrupt
+		-- every pipe the loop feeds.
+		{ line = "for f in a b c; do echo $f; done", want = "a\nb\nc",
+		  why = "for iterates its word list" },
+		{ line = "for f in Sample.luau; do wc -l $f; done", want = "5",
+		  why = "the loop variable reaches the body" },
+		{ line = "for f in *.luau; do echo $f; done | wc -l", want = "6",
+		  why = "the word list is globbed and the loop can feed a pipeline" },
+		-- `$ff` is a different variable, not `$f` with an `f` after it, which is
+		-- the one substitution mistake that silently mangles a path.
+		{ line = "for f in X; do echo ${f}.luau $ff; done", want = "X.luau $ff",
+		  why = "${f} substitutes and $ff is left alone" },
+		{ line = "for a in 1 2; do for b in x y; do echo $a$b; done; done",
+		  want = "1x\n1y\n2x\n2y", why = "loops nest, and the inner done is the inner loop's" },
+
 		{ line = "head -0 Sample.luau", want = "", why = "head -0 is a count, not a path" },
 		{ line = "tail -0 Sample.luau", want = "", why = "tail -0 is a count, not a path" },
 		{ line = "head -1 Sample.luau", want = "alpha", why = "head -1 still works" },
@@ -4819,6 +5082,16 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			-- success: invisible under -i, where the write lands and changes
 			-- nothing. The only silent failure on a path that writes.
 			{ line = "sed 's/[/x/' Sample.luau", want = "sed:" },
+			-- A malformed loop must name itself. Falling through to the statement
+			-- splitter runs `for` as a command, and "unknown command" points at
+			-- the word rather than at the missing `done`.
+			{ line = "for f in a; do echo $f", want = "missing `done`" },
+			{ line = "for f in a done", want = "expected `do`" },
+			{ line = "while true; do echo hi; done", want = "zero times or forever" },
+			{ line = "ls; for f in a; do echo $f; done", want = "start the command line" },
+			-- A loop feeds ONE pipeline. Anything after it would silently run the
+			-- pipe stage with no input, which reports 0 rather than a refusal.
+			{ line = "for f in a b; do echo $f; done | wc -l; ls", want = "one pipeline" },
 			{ line = "grep zzz Cased.luau", want = "no matches" },
 			-- The case-sensitivity change has exactly one regression shape: a
 			-- search that used to work now finds nothing. It has to say so.
@@ -4837,6 +5110,74 @@ function Shell.selfTest(probe: any): (boolean, string?)
 	textFixture:Destroy()
 	if failure then
 		return false, failure
+	end
+
+	-- find over SEVERAL roots, and depth bounds with no test beside them. Both
+	-- were wrong in the way that costs the most: a SHORT answer rather than an
+	-- error. `find /A /B -name x` searched only /A and turned /B into a name
+	-- test, which then AND-ed itself into the last -o clause and killed that too;
+	-- `-maxdepth` alone matched nothing at all. Either one reads as "the
+	-- instances are not there", and the next turn acts on that.
+	local findFixture = Instance.new("Folder")
+	local left = Instance.new("Folder")
+	left.Name = "Left"
+	left.Parent = findFixture
+	local right = Instance.new("Folder")
+	right.Name = "Right"
+	right.Parent = findFixture
+	for _, side in ipairs({ left, right }) do
+		local needle = Instance.new("Folder")
+		needle.Name = "Needle"
+		needle.Parent = side
+		local deep = Instance.new("Folder")
+		deep.Name = "Deep"
+		deep.Parent = needle
+	end
+	probe.cwd = findFixture
+	local findFailure: string? = nil
+	repeat
+		local function count(line: string): number
+			return #splitLines(Shell.run(probe, line))
+		end
+		-- Bare words are paths once the expression has a test, which is GNU's
+		-- rule; `find Handler` with no test is still the native pattern shape.
+		if count("find Left Right -name Needle") ~= 2 then
+			findFailure = "find over two roots returned: " ..
+				Shell.run(probe, "find Left Right -name Needle")
+			break
+		end
+		if count("find Left Right -name Needle -o -name Deep") ~= 4 then
+			findFailure = "find with -o over two roots returned: " ..
+				Shell.run(probe, "find Left Right -name Needle -o -name Deep")
+			break
+		end
+		-- Overlapping roots name the same instance twice. Listing it twice is a
+		-- miscount to read; under -delete it is a second Destroy on a dead one.
+		if count("find . Left -name Needle") ~= 2 then
+			findFailure = "overlapping roots duplicated a match"
+			break
+		end
+		if count("find Needle") ~= 2 then
+			findFailure = "the bare-pattern shape stopped working: " ..
+				Shell.run(probe, "find Needle")
+			break
+		end
+		-- Depth bounds on their own. `.` itself is depth 0, so -maxdepth 1 is the
+		-- fixture and its two children.
+		if count("find . -maxdepth 1") ~= 3 then
+			findFailure = "-maxdepth on its own returned: " ..
+				Shell.run(probe, "find . -maxdepth 1")
+			break
+		end
+		if count("find . -mindepth 2 -maxdepth 2") ~= 2 then
+			findFailure = "-mindepth/-maxdepth on their own did not bound the walk"
+			break
+		end
+	until true
+	probe.cwd = savedCwd
+	findFixture:Destroy()
+	if findFailure then
+		return false, findFailure
 	end
 
 	-- Editor-aware source access. `.Source` is no longer the whole truth. Roblox

@@ -335,6 +335,65 @@ local function withMessageCache(messages: { any }): { any }
 	return out
 end
 
+-- A tool call's arguments, decoded, or nil if they never became valid JSON.
+--
+-- The strict decode is the answer on every ordinary call. The repair below it
+-- exists because the model sometimes writes a LITERAL newline inside a JSON
+-- string instead of `\n`, most often in a long `write`/`multiedit` body
+-- carrying a block comment. The stop_reason on those turns is "tool_use", not
+-- "max_tokens": nothing was truncated, the JSON is complete and balanced and
+-- simply illegal, and JSONDecode refuses the whole thing over one byte.
+--
+-- Escaping it is a reading, not a guess. RFC 8259 forbids an unescaped control
+-- character inside a string, so one appearing there has exactly one possible
+-- intent, and the repair only ever runs after the strict parse has already
+-- failed. Everything outside a string is left exactly as it arrived, so a
+-- genuinely truncated call still fails, which is what makes the retry hint
+-- above it true.
+local UNESCAPED: { [string]: string } = {
+	["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t",
+	["\b"] = "\\b", ["\f"] = "\\f",
+}
+
+local function escapeControlChars(json: string): string
+	local out: { string } = {}
+	local inString, escaped = false, false
+	for i = 1, #json do
+		local c = json:sub(i, i)
+		if escaped then
+			escaped = false
+		elseif inString and c == "\\" then
+			escaped = true
+		elseif c == '"' then
+			inString = not inString
+		elseif inString and c:byte() < 32 then
+			c = UNESCAPED[c] or string.format("\\u%04x", c:byte())
+		end
+		out[#out + 1] = c
+	end
+	return table.concat(out)
+end
+
+-- Returns the arguments and whether the repair was needed. The caller warns
+-- rather than this function, so that selfTest can exercise the repair without
+-- printing a warning into every startup.
+local function decodeToolInput(json: string): (any?, boolean)
+	local parsed
+	-- JSONDecode("") throws; a no-arg tool call never emits any
+	-- input_json_delta, so `input` stays "".
+	if pcall(function()
+		parsed = HttpService:JSONDecode(json ~= "" and json or "{}")
+	end) then
+		return parsed, false
+	end
+	if not pcall(function()
+		parsed = HttpService:JSONDecode(escapeControlChars(json))
+	end) then
+		return nil, false
+	end
+	return parsed, true
+end
+
 -- streamMessage: streaming via CreateWebStreamClient (SSE)
 -- Sends a streaming request. Callbacks fire as deltas arrive:
 --   onText(text), called for each text_delta chunk
@@ -668,12 +727,15 @@ local function streamMessage(args: {
 					-- server_tool_use streams its input exactly like tool_use, so it
 					-- needs the same parse, even though WE never execute it.
 					if block and (block.type == "tool_use" or block.type == "server_tool_use") then
-						local inputParsed
-						pcall(function()
-							-- JSONDecode("") throws; a no-arg tool call never emits any
-							-- input_json_delta, so `input` stays "".
-							inputParsed = HttpService:JSONDecode(block.input ~= "" and block.input or "{}")
-						end)
+						local inputParsed, repaired = decodeToolInput(block.input)
+						-- Not silent: the model produced invalid JSON and the call
+						-- ran anyway. Worth seeing in the Output window on the day a
+						-- write lands looking slightly wrong.
+						if repaired then
+							warn(string.format(
+								"[agent] %s: repaired unescaped control characters in tool input",
+								tostring(block.name)))
+						end
 						-- nil on failure, and it stays nil: the caller uses it to decide
 						-- whether the tool may be dispatched at all. What must NOT reach
 						-- the wire is an empty table, which Roblox encodes as `[]`, see
@@ -1149,6 +1211,32 @@ local function selfTest(): (boolean, string?)
 	end
 	if retryAfterSeconds("content-type: application/json") ~= nil then
 		return false, "retry-after invented from headers that carry none"
+	end
+
+	-- Tool input. The strict path must stay strict, and the repair must only ever
+	-- rescue an unescaped control character INSIDE a string: a body that is
+	-- genuinely truncated has to keep failing, or the "retry with a smaller
+	-- input" the agent prints in its place becomes a lie.
+	local good = decodeToolInput('{"path":"/a","content":"one\\ntwo"}')
+	if not good or good.content ~= "one\ntwo" then
+		return false, "a valid tool input did not decode"
+	end
+	-- The reported failure: a literal newline where the model owed a \n. The one
+	-- BETWEEN values is legal whitespace and must survive untouched, which is the
+	-- half that says the repair tracks string boundaries rather than replacing
+	-- every newline in the document.
+	local repaired = decodeToolInput('{"path":"/a",\n"content":"one\ntwo"}')
+	if not repaired or repaired.content ~= "one\ntwo" then
+		return false, "a literal newline inside a JSON string was not repaired"
+	end
+	if decodeToolInput('{"path":"/a","content":"tail\\"}') ~= nil then
+		return false, "an escaped quote was miscounted, so the repair closed a string early"
+	end
+	if decodeToolInput('{"path":"/a","content":"cut off') ~= nil then
+		return false, "a truncated tool input was accepted; the retry hint would be wrong"
+	end
+	if decodeToolInput("") == nil then
+		return false, "a no-argument tool call did not decode as an empty object"
 	end
 
 	if not needsTokenRefresh(401, nil) then return false, "401 does not trigger a token refresh" end
