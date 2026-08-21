@@ -25,10 +25,16 @@ local Commands = {}
 
 local term: any = nil
 local openSettings: ((boolean?) -> ())? = nil
+local openFind: ((boolean?, string?) -> ())? = nil
 
-function Commands.Initialize(terminal: any, settingsToggle: ((boolean?) -> ())?)
+function Commands.Initialize(
+	terminal: any,
+	settingsToggle: ((boolean?) -> ())?,
+	findToggle: ((boolean?, string?) -> ())?
+)
 	term = terminal
 	openSettings = settingsToggle
+	openFind = findToggle
 end
 
 -- Handlers
@@ -167,6 +173,15 @@ handlers["/settings"] = function()
 	if openSettings then openSettings(true) end
 end
 
+-- The find panel has a button and a Ctrl+F, and neither can help you while the
+-- input box has focus: Studio hands a plugin widget no key events at all while
+-- one of its text boxes is taking them. This is the trigger that works from
+-- inside the box, which is where you already are.
+handlers["/find"] = function(_, raw)
+	local query = raw:match("^/find%s+(.+)$")
+	if openFind then openFind(true, query) end
+end
+
 -- Registry + dispatch
 Commands.SLASH_COMMANDS = {
 	{ cmd = "/login",    desc = "Start OAuth login flow" },
@@ -176,6 +191,7 @@ Commands.SLASH_COMMANDS = {
 	{ cmd = "/model",    desc = "Switch model" },
 	{ cmd = "/settings", desc = "Open the settings panel" },
 	{ cmd = "/sh",       desc = "Run a read-only terminal command" },
+	{ cmd = "/find",     desc = "Search this chat, thinking included" },
 	{ cmd = "/clear",    desc = "Clear output + conversation" },
 	{ cmd = "/help",     desc = "Show all commands" },
 }

@@ -508,7 +508,9 @@ end)
 -- Find in conversation
 -- Parented to the widget, not to root, so it floats over the console instead of
 -- pushing it down, and so the sessions drawer shifting root leaves it alone.
-local toggleFind = Find.mount(widget, Agent.conversation)
+local toggleFind = Find.mount(widget, Agent.conversation, Sessions.reveal, function()
+	return inputRow.AbsoluteSize.Y + 4
+end)
 findButton.MouseButton1Click:Connect(function() toggleFind(nil) end)
 
 -- Studio delivers no keystrokes to a plugin widget while one of its TextBoxes
@@ -520,6 +522,22 @@ local findAction = plugin:CreatePluginAction(
 	"AgentFindInChat", "Find in chat",
 	"Search this conversation, thinking and tool output included", "", true)
 findAction.Triggered:Connect(function() toggleFind(true) end)
+
+-- The one keyboard path that reaches inside the widget. GuiObject.InputBegan
+-- does fire for a PluginGui's children — PluginGui.WindowFocused is documented
+-- as firing "before any GuiObject.InputBegan events related to the PluginGui" —
+-- and it carries the modifier state on the InputObject, which is the only place
+-- to read it from: UserInputService:IsKeyDown answers for the game window, not
+-- for a focused widget.
+--
+-- What it still cannot see is a chord pressed while the input box holds focus:
+-- the box takes the keyboard and nothing downstream of it fires. That case has
+-- /find, which is typed into the box that is swallowing the keys anyway.
+root.InputBegan:Connect(function(input: InputObject)
+	if input.KeyCode == Enum.KeyCode.F and input:IsModifierKeyDown(Enum.ModifierKey.Ctrl) then
+		toggleFind(true)
+	end
+end)
 
 -- Model picker
 -- The same list the settings panel offers, in a popup over the input row, so
@@ -826,13 +844,17 @@ Agent.Initialize(term, function(busy: boolean)
 		Sessions.save()
 	end
 end, Sessions.save)
-Commands.Initialize(term, toggleSettings)
+Commands.Initialize(term, toggleSettings, toggleFind)
 
 local UserInputService = game:GetService("UserInputService")
 
 local function submit(text: string)
 	inputBox.Text = ""
 	if text:gsub("%s+", "") == "" then return end
+	-- Typing is the moment you are done reading someone else's session: put the
+	-- live one back on screen before anything is appended to it. A no-op unless a
+	-- peek is up.
+	Sessions.endPeek()
 	if not Commands.handle(text) then
 		Agent.send(text, Auth.isLoggedIn)
 	end
@@ -898,8 +920,7 @@ UserInputService.InputBegan:Connect(function(input: InputObject)
 	if input.KeyCode == Enum.KeyCode.Escape and Agent.isBusy() then
 		Agent.stop()
 	elseif input.KeyCode == Enum.KeyCode.F and widget.Enabled
-		and (UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
-			or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)) then
+		and input:IsModifierKeyDown(Enum.ModifierKey.Ctrl) then
 		toggleFind(true)
 	end
 end)
@@ -930,6 +951,13 @@ task.spawn(function()
 	local markdownOk, markdownErr = Markdown.selfTest()
 	if not markdownOk then
 		warn("[agent] Markdown self-test FAILED: " .. tostring(markdownErr))
+	end
+
+	-- Before the banner and before restoreLast, both of which put content on
+	-- screen: this one clears the console as part of what it checks.
+	local consoleOk, consoleErr = Console.selfTest()
+	if not consoleOk then
+		warn("[agent] Console self-test FAILED: " .. tostring(consoleErr))
 	end
 
 	Console.appendLine(NAME, "system")

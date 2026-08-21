@@ -312,6 +312,8 @@ end
 local function setBusy(value: boolean)
 	busy = value
 	if not value then
+		-- Nothing appended after a turn belongs to its message.
+		Console.setMessage(0)
 		stopCurrent = nil
 		-- The request is over, so anything still waiting on a result is never
 		-- getting one, a cancel or an error mid-search. Stop the spinners rather
@@ -523,6 +525,11 @@ local function runTurn(turn: number)
 			"system")
 	end
 
+	-- Every block this turn draws — the bubble, the ones a server tool splits off,
+	-- and each tool call — belongs to the assistant message it is about to
+	-- produce, which lands at the end of the conversation as it stands right now.
+	-- Left set for the whole turn deliberately; setBusy clears it at the end.
+	Console.setMessage(#conversation + 1)
 	local bubble = Console.createBubble()
 	local text = ""        -- every text delta of the turn; what the history gets
 	local bubbleText = ""  -- only the part belonging to the CURRENT bubble
@@ -1134,7 +1141,11 @@ function Agent.send(text: string, isLoggedIn: () -> boolean)
 	end
 
 	-- Shown to the model, not to the user: the console echoes what was typed.
+	-- Anchored to the message it is about to become, so Find can scroll back to
+	-- it later; the index is what the insert below lands on.
+	Console.setMessage(#conversation + 1)
 	Console.appendLine(text, "user")
+	Console.setMessage(0)
 	table.insert(conversation, { role = "user", content = text .. editorContext() })
 	-- Before the first request, not after it. Otherwise the whole of turn one is
 	-- unsaved, and a crash inside it puts the session back to before the message

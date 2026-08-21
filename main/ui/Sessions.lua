@@ -206,10 +206,11 @@ function Sessions.save()
 end
 
 -- Replay
--- Thinking blocks ARE in the history now, the tool-use protocol requires them
--- but nothing here matches their type, so a replay still shows prose and tool
--- calls only. Rendering a restored session's reasoning would mean a drawer per
--- block; the live view is where reasoning is worth reading.
+-- Thinking blocks are drawn, collapsed. They used to be skipped on the grounds
+-- that reasoning is worth reading live and not after the fact, which stopped
+-- being true the moment Find started searching it: a hit you can count but
+-- cannot open is worse than no hit. A collapsed drawer is a header button and a
+-- hidden label, and the tail cap below bounds how many of them exist.
 -- Only the tail is drawn. Every message is a handful of Instances and a Markdown
 -- parse, so rendering a long session in full froze Studio for about a second on
 -- every switch. The conversation Agent restored is still the WHOLE thing, this
@@ -227,15 +228,49 @@ end
 local REPLAY_MESSAGES = 25
 local shown = REPLAY_MESSAGES
 
--- Switching, clearing or paging mid-turn would leave the running turn appending
--- its results into a view nobody is looking at any more.
+-- Peeking
+-- Opening another session mid-turn does NOT switch: Agent keeps the conversation
+-- it is working on, `currentId` does not move, and the turn still lands in the
+-- session that asked for it. All that changes is what is on screen, and the
+-- running turn's blocks are parked in `previewHolder` rather than destroyed, so
+-- coming back shows everything that arrived while you were away.
+--
+-- Starting a session, deleting one or clearing still need Agent, so those stay
+-- blocked for the length of a turn.
+local previewHolder: Frame? = nil
+local previewId = ""
+
 local function blockedByTurn(): boolean
 	if not Agent.isBusy() then return false end
 	Console.appendLine("Finish or stop the current turn first.", "error")
 	return true
 end
 
-local function replay(conversation: { any })
+-- Drops the parked blocks instead of moving them back on screen. Every caller of
+-- this one is about to clear the console anyway.
+local function dropPeek()
+	local holder = previewHolder
+	if not holder then return end
+	previewHolder = nil
+	previewId = ""
+	Console.discard(holder)
+end
+
+-- Back to the session that is actually running.
+function Sessions.endPeek()
+	local holder = previewHolder
+	if not holder then return end
+	previewHolder = nil
+	previewId = ""
+	Console.reattach(holder)
+	if refreshList then refreshList() end
+end
+
+-- Forward-declared: replayInto's paging link calls back into the wrapper, and a
+-- local named after its own use site is a nil global, not that local.
+local replay: ({ any }) -> ()
+
+local function replayInto(conversation: { any })
 	-- Built from the FULL conversation: a tool_use in the tail can be paired with
 	-- a tool_result whose message was cut, and a call that renders without its
 	-- result is a call that looks like it never finished.
@@ -251,14 +286,17 @@ local function replay(conversation: { any })
 	end
 
 	local first = math.max(1, #conversation - shown + 1)
+	-- The link belongs to no message; only the loop below anchors anything.
+	Console.setMessage(0)
 	if first > 1 then
 		Console.appendLink(
 			string.format("↑ Load %d earlier messages (%d older)",
 				math.min(REPLAY_MESSAGES, first - 1), first - 1),
 			function()
-				-- Same guard as switching sessions: redrawing would destroy the
-				-- bubble a running turn is streaming into.
-				if blockedByTurn() then return end
+				-- Redrawing would destroy the bubble a running turn is streaming
+				-- into — unless there is a peek on, in which case that turn is
+				-- already parked off screen and the visible frame is ours to redraw.
+				if previewHolder == nil and blockedByTurn() then return end
 				shown += REPLAY_MESSAGES
 				Console.clear()
 				replay(conversation)
@@ -269,6 +307,9 @@ local function replay(conversation: { any })
 	end
 
 	for index = first, #conversation do
+		-- What Find scrolls back to. Set per message rather than per block: a
+		-- tool call and the reply above it are one message and one destination.
+		Console.setMessage(index)
 		local message = conversation[index]
 		local content = message.content
 		if message.role == "user" then
@@ -279,6 +320,17 @@ local function replay(conversation: { any })
 		elseif type(content) == "string" then
 			Console.createBubble().setText(content)
 		elseif type(content) == "table" then
+			-- Above the reply, which is where the live view puts it too.
+			for _, block in ipairs(content) do
+				if block.type == "thinking" and type(block.thinking) == "string"
+					and block.thinking ~= "" then
+					local drawer = Console.createThinking()
+					drawer.append(block.thinking)
+					-- Immediately: nothing is streaming, and an unfinished drawer
+					-- spins forever.
+					drawer.finish()
+				end
+			end
 			local text: { string } = {}
 			for _, block in ipairs(content) do
 				if block.type == "text" and block.text then
@@ -301,6 +353,11 @@ local function replay(conversation: { any })
 			end
 		end
 	end
+	Console.setMessage(0)
+end
+
+replay = function(conversation: { any })
+	Console.onScreen(function() replayInto(conversation) end)
 end
 
 -- JSON has no empty-object form that survives the round trip: an argument-less
@@ -321,13 +378,32 @@ local function repairInputs(conversation: { any })
 end
 
 function Sessions.load(id: string)
-	if blockedByTurn() then return end
 	local conversation = decode(pluginRef:GetSetting(KEY_PREFIX .. id))
 	if type(conversation) ~= "table" then
 		Console.appendLine("That session could not be loaded.", "error")
 		return
 	end
 	repairInputs(conversation)
+
+	if Agent.isBusy() then
+		if not previewHolder then previewHolder = Console.detach() end
+		previewId = id
+		Console.clear()
+		shown = REPLAY_MESSAGES
+		replay(conversation)
+		local running = entryFor(currentId)
+		Console.onScreen(function()
+			Console.appendLine(string.format(
+				"Viewing only — \"%s\" is still working. Click it to come back.",
+				running and running.title or "the running session"), "system")
+		end)
+		if refreshList then refreshList() end
+		return
+	end
+
+	-- Not a peek any more, and what it parked is about to be cleared off the
+	-- screen regardless.
+	dropPeek()
 
 	setCurrent(id)
 	Console.clear()
@@ -337,8 +413,38 @@ function Sessions.load(id: string)
 	Console.appendLine(string.format("Restored session — %d messages.", #conversation), "system")
 end
 
+-- Find asks for a message by its index and this makes sure it is on screen
+-- before the console scrolls to it. Only a REPLAY can be short: a live turn
+-- draws everything as it arrives, so the usual case is the first jump landing
+-- and nothing being redrawn at all.
+function Sessions.reveal(index: number)
+	-- You asked to be taken to a message in YOUR conversation, so come back from
+	-- whatever you were reading first.
+	Sessions.endPeek()
+	if Console.jumpToMessage(index) then return end
+
+	if Agent.isBusy() then
+		-- Redrawing would destroy the bubble the turn is streaming into.
+		Console.appendLine(
+			"That message is further back than the view — finish the turn to load it.", "system")
+		return
+	end
+	-- The same paging the link at the top of a truncated replay does, sized to
+	-- reach the message in one go rather than a page at a time, with a page of
+	-- lead-in above it so it does not land against the top edge.
+	local conversation = Agent.conversation()
+	shown = math.max(shown, #conversation - index + 1 + REPLAY_MESSAGES)
+	Console.clear()
+	replay(conversation)
+	Console.jumpToMessage(index)
+end
+
 function Sessions.new()
 	if blockedByTurn() then return end
+	-- Reachable with a peek still up: the turn ended while the reader was
+	-- looking elsewhere, and nothing has put the view back yet. Without this the
+	-- sink stays pointed at the holder and the fresh session draws off screen.
+	dropPeek()
 	-- The current session is already on disk: save() runs at the end of every
 	-- turn, so there is nothing to flush before letting go of it.
 	setCurrent(HttpService:GenerateGUID(false))
@@ -348,6 +454,9 @@ end
 
 function Sessions.delete(id: string)
 	if id == currentId and blockedByTurn() then return end
+	-- Deleting the one you are peeking at would leave a conversation on screen
+	-- that no longer exists anywhere.
+	if id == previewId then Sessions.endPeek() end
 	pluginRef:SetSetting(KEY_PREFIX .. id, nil)
 	for i, entry in ipairs(index) do
 		if entry.id == id then
@@ -548,7 +657,11 @@ function Sessions.mountSidebar(parent: Instance, openSettings: () -> ()): (boole
 			if entry.place == game.PlaceId
 				and (query == "" or entry.title:lower():find(query, 1, true) ~= nil) then
 				order += 1
-				local active = entry.id == currentId
+				-- The highlight follows what is on SCREEN, which during a peek is
+				-- the previewed session and not the one still running.
+				local viewing = if previewId ~= "" then previewId else currentId
+				local active = entry.id == viewing
+				local running = previewId ~= "" and entry.id == currentId
 				local row = make("TextButton", {
 					Parent = list,
 					BackgroundColor3 = Theme.BG_INPUT,
@@ -579,9 +692,14 @@ function Sessions.mountSidebar(parent: Instance, openSettings: () -> ()): (boole
 					Position = UDim2.new(0, 8, 0, 22),
 					FontFace = Theme.SANS,
 					TextSize = 11,
-					TextColor3 = Theme.TEXT_LO,
+					TextColor3 = if running then Theme.ACCENT else Theme.TEXT_LO,
 					TextXAlignment = Enum.TextXAlignment.Left,
-					Text = ago(entry.updated),
+					-- The peek outlives the turn: the reader is still looking
+					-- elsewhere after it lands, so the row stops claiming to be
+					-- working but keeps saying how to get back.
+					Text = if running
+						then (if Agent.isBusy() then "working — click to come back" else "click to come back")
+						else ago(entry.updated),
 				})
 				local remove = make("TextButton", {
 					Parent = row,
@@ -618,7 +736,11 @@ function Sessions.mountSidebar(parent: Instance, openSettings: () -> ()): (boole
 				-- The drawer stays open on a switch: picking the wrong session and
 				-- picking the next one should not cost two more clicks.
 				row.MouseButton1Click:Connect(function()
-					if id ~= currentId then Sessions.load(id) end
+					if id == currentId and previewHolder then
+						Sessions.endPeek()
+					elseif id ~= currentId and id ~= previewId then
+						Sessions.load(id)
+					end
 				end)
 				remove.MouseButton1Click:Connect(function()
 					Sessions.delete(id)

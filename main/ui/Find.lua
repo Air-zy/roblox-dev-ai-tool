@@ -17,12 +17,13 @@ local Find = {}
 -- One hit per matching BLOCK, not per occurrence: a grep result carrying forty
 -- copies of the word would otherwise be forty rows and a count nobody can act
 -- on. The snippet is cut at the first occurrence in that block.
-export type Hit = { kind: string, snippet: string, full: string }
+--
+-- `at` is the message the block belongs to. It is the whole point of the row:
+-- clicking one scrolls the console to that message, and the snippet is only
+-- there so you can tell the hits apart before you go.
+export type Hit = { kind: string, snippet: string, at: number }
 
 local CONTEXT = 70
--- A tool result runs to thousands of characters and the expanded row is a label,
--- which Roblox truncates at 16 KiB anyway. Cut it where it is still readable.
-local MAX_FULL = 2000
 local MIN_QUERY = 2
 local ROW_ESTIMATE = 46
 local LIST_HEIGHT = 220
@@ -68,33 +69,33 @@ function Find.scan(conversation: { any }, query: string): { Hit }
 	local needle = query:lower()
 	local hits: { Hit } = {}
 
-	local function try(kind: string, value: any)
+	local function try(kind: string, value: any, at: number)
 		if type(value) ~= "string" or value == "" then return end
-		local at = value:lower():find(needle, 1, true)
-		if not at then return end
+		local found = value:lower():find(needle, 1, true)
+		if not found then return end
 		hits[#hits + 1] = {
 			kind = kind,
-			snippet = snippetAt(value, at, #needle),
-			full = if #value > MAX_FULL then value:sub(1, MAX_FULL) .. "…" else value,
+			snippet = snippetAt(value, found, #needle),
+			at = at,
 		}
 	end
 
-	for _, message in ipairs(conversation) do
+	for at, message in ipairs(conversation) do
 		local who = if message.role == "user" then "you" else "claude"
 		local content = message.content
 		if type(content) == "string" then
-			try(who, content)
+			try(who, content, at)
 		elseif type(content) == "table" then
 			for _, block in ipairs(content) do
 				if type(block) ~= "table" then continue end
 				if block.type == "text" then
-					try(who, block.text)
+					try(who, block.text, at)
 				elseif block.type == "thinking" then
-					try("thinking", block.thinking)
+					try("thinking", block.thinking, at)
 				elseif block.type == "tool_use" or block.type == "server_tool_use" then
-					try(tostring(block.name), argText(block.input))
+					try(tostring(block.name), argText(block.input), at)
 				elseif block.type == "tool_result" then
-					try("result", resultText(block.content))
+					try("result", resultText(block.content), at)
 				end
 			end
 		end
@@ -110,21 +111,31 @@ local function kindColor(kind: string): Color3
 end
 
 -- Panel
--- Top right, over the console rather than in the layout: opening a find bar
--- should not reflow the conversation you are reading. The sessions drawer is on
--- the left and shifts `root` rather than the widget, so this never has to know
--- about it.
+-- Over the console rather than in the layout: opening a find bar should not
+-- reflow the conversation you are reading. The sessions drawer is on the left
+-- and shifts `root` rather than the widget, so this never has to know about it.
+--
+-- Bottom right, above the input row, the same corner the model picker uses. Not
+-- the top, which is where clicking a result scrolls the message TO: a panel
+-- there sits on top of the thing it just took you to. `liftBy` is how far up,
+-- since the input row grows with the draft in it and only the caller knows how
+-- tall it is right now.
 Find.WIDTH = 360
 
-function Find.mount(parent: Instance, getConversation: () -> { any }): (boolean?) -> boolean
+function Find.mount(
+	parent: Instance,
+	getConversation: () -> { any },
+	jumpTo: (index: number) -> (),
+	liftBy: () -> number
+): (boolean?, string?) -> boolean
 	local panel = make("Frame", {
 		Name = "FindPanel",
 		Parent = parent,
 		BackgroundColor3 = Theme.BG_SURFACE,
 		BorderColor3 = Theme.BORDER,
 		BorderSizePixel = 1,
-		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.new(1, -8, 0, 34),
+		AnchorPoint = Vector2.new(1, 1),
+		Position = UDim2.new(1, -8, 1, -40),
 		Size = UDim2.new(0, Find.WIDTH, 0, 32),
 		AutomaticSize = Enum.AutomaticSize.Y,
 		Visible = false,
@@ -247,7 +258,7 @@ function Find.mount(parent: Instance, getConversation: () -> { any }): (boolean?
 			})
 			-- RichText stays off: a snippet is arbitrary text out of the
 			-- conversation, and half of what is in there has angle brackets in it.
-			local body = make("TextLabel", {
+			make("TextLabel", {
 				Parent = row,
 				BackgroundTransparency = 1,
 				Size = UDim2.new(1, -62, 0, 0),
@@ -266,15 +277,9 @@ function Find.mount(parent: Instance, getConversation: () -> { any }): (boolean?
 
 			row.MouseEnter:Connect(function() row.BackgroundTransparency = 0 end)
 			row.MouseLeave:Connect(function() row.BackgroundTransparency = 1 end)
-			-- Finding the message is half of it, reading it is the other half, and
-			-- the whole block is already here. Cheaper than scrolling the console to
-			-- a bubble which, for a thinking block in a restored session, was never
-			-- drawn in the first place.
-			local expanded = false
-			row.MouseButton1Click:Connect(function()
-				expanded = not expanded
-				body.Text = if expanded then hit.full else hit.snippet
-			end)
+			-- The panel is a way to the message, not a place to read it. The panel
+			-- stays open so the next result is one more click.
+			row.MouseButton1Click:Connect(function() jumpTo(hit.at) end)
 		end
 		-- An estimate, and it is allowed to be wrong: the list scrolls, so a row
 		-- that wraps to three lines costs a scroll rather than being unreachable.
@@ -297,6 +302,7 @@ function Find.mount(parent: Instance, getConversation: () -> { any }): (boolean?
 	local function setVisible(visible: boolean): boolean
 		panel.Visible = visible
 		if visible then
+			panel.Position = UDim2.new(1, -8, 1, -liftBy())
 			-- Re-run rather than trust what is on screen: turns have landed since
 			-- this was last open.
 			search()
@@ -321,8 +327,13 @@ function Find.mount(parent: Instance, getConversation: () -> { any }): (boolean?
 		end
 	end)
 
-	return function(visible: boolean?): boolean
-		return setVisible(if visible == nil then not panel.Visible else visible)
+	-- `query` prefills the box, which is what /find passes: the one trigger that
+	-- works while you are typing, since that is exactly when no key event reaches
+	-- the widget at all.
+	return function(visible: boolean?, query: string?): boolean
+		local show = if visible == nil then not panel.Visible else visible
+		if show and query and query ~= "" then queryBox.Text = query end
+		return setVisible(show)
 	end
 end
 
@@ -348,14 +359,20 @@ function Find.selfTest(): (boolean, string?)
 	if #think ~= 1 or think[1].kind ~= "thinking" then
 		return false, "scan missed a thinking block, or mislabelled it"
 	end
-
-	local kinds: { [string]: boolean } = {}
-	for _, hit in ipairs(Find.scan(conversation, "baseplate")) do
-		kinds[hit.kind] = true
+	-- The index is what a click navigates by; a hit that reports the wrong one
+	-- scrolls to the wrong place, which looks like the search being wrong.
+	if think[1].at ~= 2 then
+		return false, "scan reported the wrong message index for a thinking block"
 	end
-	for _, kind in ipairs({ "you", "thinking", "bash", "result" }) do
-		if not kinds[kind] then
-			return false, "scan skipped " .. kind
+
+	local kinds: { [string]: number } = {}
+	for _, hit in ipairs(Find.scan(conversation, "baseplate")) do
+		kinds[hit.kind] = hit.at
+	end
+	for kind, at in pairs({ you = 1, thinking = 2, bash = 2, result = 3 }) do
+		if kinds[kind] ~= at then
+			return false, string.format("scan put %s at message %s, expected %d",
+				kind, tostring(kinds[kind]), at)
 		end
 	end
 

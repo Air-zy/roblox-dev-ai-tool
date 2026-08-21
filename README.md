@@ -26,16 +26,29 @@ The button at the top left opens the sessions drawer. Conversations are saved as
 you go and the last one for the place you are in comes back when you reopen the
 plugin, so a Studio crash costs you the turn that was running and nothing else.
 Switch between them from the list, start a new one with +, and delete one with
-the bin. The box at the top of the drawer filters the list by title as you type. /clear wipes the session you are in rather than parking it. The drawer
+the bin. The box at the top of the drawer filters the list by title as you type.
+
+Clicking a session while a turn is running opens it read-only rather than
+refusing. Nothing switches: the turn keeps its own conversation and still saves
+into the session that asked for it, and its output is parked off screen rather
+than thrown away, so clicking that session again — its row says how — brings the
+whole thing back including whatever landed while you were reading. Typing does
+the same. Starting, deleting and clearing a session still wait for the turn to
+finish, because those do need the agent. /clear wipes the session you are in rather than parking it. The drawer
 stays open and moves the console aside, so you can read the list and keep going.
 
 The magnifier next to it searches the conversation you are in: everything the
 model said, everything you said, its reasoning and its tool calls and their
 output, since all of that is in the conversation whether or not it is still on
-screen. Click a result to read the whole block. Ctrl+F opens it too, but only
-while you are not typing — Studio hands a plugin widget no keystrokes at all
-while one of its text boxes has focus. For a shortcut that always works, bind
-one to "Find in chat" under File > Advanced > Customize Shortcuts.
+screen. Click a result and the console scrolls to that message and flashes it,
+loading more of the history first if the message is further back than the part
+being drawn. Ctrl+F opens it too, but only
+while the input box does not have focus: Studio hands a plugin widget no
+keystrokes at all while one of its text boxes is taking them, so a chord pressed
+mid-sentence reaches nothing. From inside the box, `/find` is the trigger that
+always works, and it takes the query with it — `/find cache breakpoint`. For a
+real keyboard shortcut, bind one to "Find in chat" under File > Advanced >
+Customize Shortcuts, where Studio dispatches it before the box ever sees it.
 
 Settings is at the bottom of that drawer: effort, web search, run code and system
 prompt, plus your plan usage for the 5 hour and weekly windows. The model has its

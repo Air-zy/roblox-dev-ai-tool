@@ -20,6 +20,16 @@ local make = Theme.make
 
 local Console = {}
 local output: ScrollingFrame = nil :: any
+-- Where NEW blocks are parented. Normally `output` itself; while a session is
+-- being peeked at mid-turn it is a detached holder, so the turn that is still
+-- streaming keeps rendering into its own blocks off screen instead of into the
+-- conversation the reader has opened on top of it. See Console.detach.
+--
+-- Every appender numbers its block from #sink:GetChildren(), so the holder has
+-- to be the SAME set of children the output frame had, not an empty frame:
+-- moved, not copied, or the count restarts and a new block reuses a LayoutOrder
+-- that is already taken.
+local sink: Instance = nil :: any
 -- The "Working..." row, see Console.setWorking.
 local workingRow: TextLabel = nil :: any
 
@@ -137,12 +147,16 @@ function Console.mount(parent: Instance, layoutOrder: number): ScrollingFrame
 		end
 		lastPos = pos
 	end)
+	sink = output
 	return output
 end
 
 -- `force` re-arms following even if the reader had scrolled up, for things they
 -- just did themselves, like sending a message.
 function Console.scrollToBottom(force: boolean?)
+	-- A detached turn is drawing off screen. Following it would drag the session
+	-- the reader is peeking at down to a bottom that is not theirs.
+	if sink ~= output then return end
 	if force then stickToBottom = true end
 	if not stickToBottom then return end
 	-- Deliberately math.huge rather than the measured canvas: the engine clamps,
@@ -155,6 +169,8 @@ function Console.scrollToTop()
 	output.CanvasPosition = Vector2.new(0, 0)
 end
 
+-- Clears what is ON SCREEN, which during a peek is the session being previewed
+-- and not the turn still running behind it.
 function Console.clear()
 	stickToBottom = true  -- an empty console is at its bottom by definition
 	for _, child in ipairs(output:GetChildren()) do
@@ -162,6 +178,126 @@ function Console.clear()
 			child:Destroy()
 		end
 	end
+end
+
+-- Jumping to a message
+-- Anchors are attributes on the blocks themselves rather than a registry: the
+-- blocks already ARE the record of what is on screen, and a side table would
+-- have to be kept in step with every clear, every peek and every re-replay.
+local MESSAGE_ATTR = "msg"
+local FLASH_SECONDS = 1.2
+local messageIndex = 0
+
+-- Everything appended from here on belongs to message `index` of the
+-- conversation. 0 for anything that belongs to no message: banners, errors, the
+-- "load earlier" link.
+function Console.setMessage(index: number)
+	messageIndex = index
+end
+
+local function anchor(node: GuiObject)
+	if messageIndex > 0 then node:SetAttribute(MESSAGE_ATTR, messageIndex) end
+end
+
+-- Nearest anchor at or BELOW the index asked for. Below, because a tool_result
+-- lives in the user message after the assistant message whose tool-call block is
+-- what actually draws it: the result is on screen one message earlier than the
+-- message it is stored in.
+local function anchorFor(index: number): GuiObject?
+	local best: GuiObject? = nil
+	local bestAt = 0
+	for _, child in ipairs(output:GetChildren()) do
+		if child:IsA("GuiObject") then
+			local at = child:GetAttribute(MESSAGE_ATTR)
+			if type(at) == "number" and at <= index and at > bestAt then
+				best = child
+				bestAt = at
+			end
+		end
+	end
+	return best
+end
+
+-- False when that message is not drawn — a replay only renders its tail, and the
+-- caller is the one that can do something about it.
+function Console.jumpToMessage(index: number): boolean
+	local node = anchorFor(index)
+	if not node then return false end
+	-- Let go of the bottom first, or the Heartbeat pin drags the view straight
+	-- back down over the top of the jump.
+	stickToBottom = false
+	-- Deferred: a jump can follow a redraw, and AbsolutePosition is a frame
+	-- behind a layout pass that has not run yet.
+	task.defer(function()
+		if not node.Parent then return end
+		local offset = node.AbsolutePosition.Y - output.AbsolutePosition.Y + output.CanvasPosition.Y
+		output.CanvasPosition = Vector2.new(0, math.max(0, offset - 8))
+		stickToBottom = false
+		-- A flash rather than a permanent highlight: it says which block without
+		-- leaving the console marked up afterwards.
+		local was = node.BackgroundTransparency
+		node.BackgroundColor3 = Theme.ACCENT
+		node.BackgroundTransparency = 0.85
+		task.delay(FLASH_SECONDS, function()
+			if node.Parent then node.BackgroundTransparency = was end
+		end)
+	end)
+	return true
+end
+
+-- Peeking at another session mid-turn
+-- Moves everything on screen into a holder with no parent and points the sink at
+-- it. The blocks stay live Instances, so the running turn goes on writing into
+-- the same bubbles and tool-call rows it already holds references to; they are
+-- simply not in the DataModel tree, so nothing renders. Reattach puts them back.
+--
+-- Nil-parented and not just Visible = false, because the console is a
+-- ScrollingFrame with AutomaticCanvasSize: an invisible child still costs the
+-- layout pass, and a long conversation is thousands of Instances.
+--
+-- workingRow stays where it is. It is the one thing that SHOULD still be on
+-- screen during a peek: it is what says the turn you walked away from is still
+-- running.
+function Console.detach(): Frame
+	local holder = Instance.new("Frame")
+	holder.Name = "Detached"
+	for _, child in ipairs(output:GetChildren()) do
+		if child:IsA("GuiObject") and child ~= workingRow then
+			child.Parent = holder
+		end
+	end
+	sink = holder
+	return holder
+end
+
+function Console.reattach(holder: Frame)
+	Console.clear()
+	for _, child in ipairs(holder:GetChildren()) do
+		child.Parent = output
+	end
+	holder:Destroy()
+	sink = output
+	stickToBottom = true
+end
+
+-- Draws whatever fn appends into the VISIBLE frame, even while a detached turn
+-- owns the sink. Everything the reader asked to see goes through here; the
+-- running turn keeps the sink. pcall so a throw cannot leave the sink pointing
+-- at the wrong frame for the rest of the session.
+-- The peeked-at view is about to be replaced wholesale, so the parked blocks are
+-- only going to be destroyed a moment later. Drop them rather than pay to move
+-- them back first.
+function Console.discard(holder: Frame)
+	holder:Destroy()
+	sink = output
+end
+
+function Console.onScreen(fn: () -> ())
+	local previous = sink
+	sink = output
+	local ok, err = pcall(fn)
+	sink = previous
+	if not ok then error(err, 0) end
 end
 
 -- TextEditable stays TRUE. Setting it false is the obvious way to make a
@@ -258,15 +394,16 @@ function Console.appendLine(text: string, kind: string?): TextBox
 	-- creation and a count taken afterwards includes the new child. Bubbles
 	-- number themselves the same way, so an off-by-one here would let a line and
 	-- a bubble share a LayoutOrder and swap places.
-	local order = #output:GetChildren() + 1
+	local order = #sink:GetChildren() + 1
 	local line, setLine = readOnlyBox(
-		output,
+		sink,
 		(kind == "user") and Theme.SANS or Theme.MONO,
 		Theme.TEXT_SIZE,
 		KIND_COLOR[kind or ""] or Theme.TEXT_HI
 	)
 	line.Name = "Line"
 	line.LayoutOrder = order
+	anchor(line)
 
 	-- What you typed sits on the right, everything the plugin says on the left.
 	-- The console is one long column of monospace and a user turn used to be
@@ -290,7 +427,7 @@ end
 function Console.appendLink(text: string, onClick: () -> ()): TextButton
 	local button = make("TextButton", {
 		Name = "Link",
-		Parent = output,
+		Parent = sink,
 		BackgroundTransparency = 1,
 		Size = UDim2.new(1, 0, 0, 20),
 		FontFace = Theme.MONO,
@@ -299,7 +436,7 @@ function Console.appendLink(text: string, onClick: () -> ()): TextButton
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Text = text,
 		AutoButtonColor = false,
-		LayoutOrder = #output:GetChildren() + 1,
+		LayoutOrder = #sink:GetChildren() + 1,
 	})
 	button.MouseButton1Click:Connect(onClick)
 	return button
@@ -624,12 +761,13 @@ local RENDER_INTERVAL = 0.05
 function Console.createBubble(): Bubble
 	local container = make("Frame", {
 		Name = "Assistant",
-		Parent = output,
+		Parent = sink,
 		BackgroundTransparency = 1,
 		Size = UDim2.new(1, 0, 0, 0),
 		AutomaticSize = Enum.AutomaticSize.Y,
-		LayoutOrder = #output:GetChildren() + 1,
+		LayoutOrder = #sink:GetChildren() + 1,
 	})
+	anchor(container)
 	make("UIListLayout", {
 		Parent = container,
 		Padding = UDim.new(0, 2),
@@ -783,7 +921,7 @@ end
 
 -- Collapsible thinking block
 function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinking
-	local host = parent or output
+	local host = parent or sink
 	local container = make("Frame", {
 		Name = "ThinkingBlock",
 		Parent = host,
@@ -792,6 +930,10 @@ function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinki
 		AutomaticSize = Enum.AutomaticSize.Y,
 		LayoutOrder = layoutOrder or (#host:GetChildren() + 1),
 	})
+	-- Only reachable when the drawer is a block of its own, which is how a replay
+	-- draws it; a live one is nested inside its bubble and the bubble is the
+	-- anchor. Either way a thinking hit has somewhere to land.
+	anchor(container)
 	make("UIListLayout", { Parent = container, SortOrder = Enum.SortOrder.LayoutOrder })
 
 	-- MONO, matching a tool call's header and detail box. The two are the same
@@ -952,15 +1094,16 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 	end
 	readInput(input)
 
-	local order = #output:GetChildren() + 1
+	local order = #sink:GetChildren() + 1
 	local container = make("Frame", {
 		Name = "ToolCall",
-		Parent = output,
+		Parent = sink,
 		BackgroundTransparency = 1,
 		Size = UDim2.new(1, 0, 0, 0),
 		AutomaticSize = Enum.AutomaticSize.Y,
 		LayoutOrder = order,
 	})
+	anchor(container)
 	make("UIListLayout", { Parent = container, SortOrder = Enum.SortOrder.LayoutOrder })
 
 	local header = make("TextButton", {
@@ -1111,6 +1254,73 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 			renderHeader()
 		end,
 	}
+end
+
+-- Self-test
+-- The peek is bookkeeping across two frames and every way it breaks is silent:
+-- blocks that never come back, a sink left pointing at a destroyed holder, a
+-- LayoutOrder that restarts and drops a new block into the middle of an old
+-- conversation. Runs before anything is on screen, because it clears.
+function Console.selfTest(): (boolean, string?)
+	Console.clear()
+	local first = Console.appendLine("selftest", "info")
+	if first.Parent ~= output then return false, "appendLine did not draw into the console" end
+	local order = first.LayoutOrder
+
+	local holder = Console.detach()
+	if first.Parent ~= holder then return false, "detach left a block on screen" end
+	if workingRow.Parent ~= output then return false, "detach parked the Working row" end
+
+	-- What the running turn appends while the reader is elsewhere: off screen,
+	-- and numbered PAST what is parked rather than on top of it.
+	local during = Console.appendLine("selftest", "info")
+	if during.Parent ~= holder then return false, "a detached turn drew on screen" end
+	if during.LayoutOrder <= order then
+		return false, "a detached block reused a LayoutOrder already in the conversation"
+	end
+
+	-- What the reader opened goes the other way, and the sink goes back after.
+	local peeked: TextBox = nil :: any
+	Console.onScreen(function() peeked = Console.appendLine("selftest", "info") end)
+	if peeked.Parent ~= output then return false, "onScreen drew into the detached holder" end
+	if Console.appendLine("selftest", "info").Parent ~= holder then
+		return false, "onScreen did not put the sink back"
+	end
+
+	Console.reattach(holder)
+	if first.Parent ~= output or during.Parent ~= output then
+		return false, "reattach did not bring the running turn back"
+	end
+	if peeked.Parent ~= nil then return false, "reattach kept the peeked session on screen" end
+	if Console.appendLine("selftest", "info").Parent ~= output then
+		return false, "reattach did not put the sink back"
+	end
+
+	-- Anchors. A jump asks for a message index and has to land on the block that
+	-- DRAWS it, which for a tool result is one message earlier than the message
+	-- the result is stored in — hence at-or-below rather than exact.
+	Console.clear()
+	Console.setMessage(4)
+	local four = Console.appendLine("selftest", "info")
+	Console.setMessage(7)
+	local seven = Console.appendLine("selftest", "info")
+	Console.setMessage(0)
+	if Console.appendLine("selftest", "info"):GetAttribute(MESSAGE_ATTR) ~= nil then
+		return false, "setMessage(0) anchored a block that belongs to no message"
+	end
+	if anchorFor(4) ~= four then return false, "anchorFor missed an exact match" end
+	if anchorFor(6) ~= four then return false, "anchorFor did not fall back to the message below" end
+	if anchorFor(9) ~= seven then return false, "anchorFor did not take the highest below" end
+	if anchorFor(3) ~= nil then return false, "anchorFor reached above the index it was asked for" end
+	if Console.jumpToMessage(1) then
+		return false, "jumpToMessage claimed a message that is not drawn"
+	end
+	if not Console.jumpToMessage(7) then
+		return false, "jumpToMessage could not reach an anchored message"
+	end
+
+	Console.clear()
+	return true
 end
 
 return Console
