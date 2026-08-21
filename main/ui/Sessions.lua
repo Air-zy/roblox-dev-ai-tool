@@ -481,14 +481,55 @@ function Sessions.mountSidebar(parent: Instance, openSettings: () -> ()): (boole
 	})
 	settingsRow.MouseButton1Click:Connect(openSettings)
 
+	-- Filters on TITLE only, which is the first 40 characters of the first message
+	-- you sent. That is what you remember a session by, and it costs one string
+	-- find per row, so the list narrows on the keystroke. Searching the bodies
+	-- would mean reading and decoding twenty stored conversations, up to 400 KB
+	-- each, on a keystroke; Ctrl+F searches a conversation once it is open.
+	local query = ""
+	local searchRow = make("Frame", {
+		Parent = panel,
+		BackgroundColor3 = Theme.BG_INPUT,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, -17, 0, 24),
+		Position = UDim2.new(0, 8, 0, 34),
+	})
+	make("UICorner", { Parent = searchRow, CornerRadius = UDim.new(0, 4) })
+	make("TextLabel", {
+		Parent = searchRow,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(0, 14, 1, 0),
+		Position = UDim2.new(0, 6, 0, 0),
+		FontFace = Theme.ICON,
+		TextSize = 12,
+		TextColor3 = Theme.TEXT_LO,
+		Text = "magnifying-glass",
+	})
+	local searchBox = make("TextBox", {
+		Parent = searchRow,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, -32, 1, 0),
+		Position = UDim2.new(0, 26, 0, 0),
+		FontFace = Theme.SANS,
+		TextSize = 12,
+		TextColor3 = Theme.TEXT_HI,
+		ClearTextOnFocus = false,
+		MultiLine = false,
+		Text = "",
+		PlaceholderText = "Search sessions…",
+		PlaceholderColor3 = Theme.TEXT_LO,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	})
+
 	local list = make("ScrollingFrame", {
 		Parent = panel,
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
-		-- 32 of header above, 32 of settings row below, both the same height as
-		-- the console's header and input row.
-		Size = UDim2.new(1, -1, 1, -64),
-		Position = UDim2.new(0, 0, 0, 32),
+		-- 32 of header plus the 26 the search row occupies above, 32 of settings
+		-- row below; the header and the settings row are the same height as the
+		-- console's header and input row.
+		Size = UDim2.new(1, -1, 1, -94),
+		Position = UDim2.new(0, 0, 0, 62),
 		CanvasSize = UDim2.new(0, 0, 0, 0),
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
 		ScrollingDirection = Enum.ScrollingDirection.Y,
@@ -504,7 +545,8 @@ function Sessions.mountSidebar(parent: Instance, openSettings: () -> ()): (boole
 		end
 		local order = 0
 		for _, entry in ipairs(index) do
-			if entry.place == game.PlaceId then
+			if entry.place == game.PlaceId
+				and (query == "" or entry.title:lower():find(query, 1, true) ~= nil) then
 				order += 1
 				local active = entry.id == currentId
 				local row = make("TextButton", {
@@ -592,7 +634,7 @@ function Sessions.mountSidebar(parent: Instance, openSettings: () -> ()): (boole
 				TextSize = 12,
 				TextColor3 = Theme.TEXT_LO,
 				TextXAlignment = Enum.TextXAlignment.Left,
-				Text = "No saved sessions yet.",
+				Text = if query == "" then "No saved sessions yet." else "Nothing matches that.",
 			})
 		end
 	end
@@ -601,6 +643,11 @@ function Sessions.mountSidebar(parent: Instance, openSettings: () -> ()): (boole
 	refreshList = function()
 		if panel.Visible then draw() end
 	end
+
+	searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+		query = searchBox.Text:lower()
+		draw()
+	end)
 
 	newButton.MouseButton1Click:Connect(Sessions.new)
 

@@ -40,6 +40,7 @@ local Terminal = require(fs:WaitForChild("Terminal"))   :: any
 local Theme    = require(ui:WaitForChild("Theme"))
 local Markdown = require(ui:WaitForChild("Markdown"))
 local Console  = require(ui:WaitForChild("Console"))
+local Find     = require(ui:WaitForChild("Find"))
 local Settings = require(ui:WaitForChild("Settings"))
 local Sessions = require(ui:WaitForChild("Sessions"))
 local Agent    = require(agent:WaitForChild("Agent"))
@@ -157,6 +158,18 @@ local sessionsButton = make("TextButton", {
 	TextSize = 18,
 	TextColor3 = Theme.TEXT_MED,
 	Text = "three-bars-horizontal",
+	AutoButtonColor = false,
+})
+local findButton = make("TextButton", {
+	Name = "FindButton",
+	Parent = headerBar,
+	BackgroundTransparency = 1,
+	Size = UDim2.new(0, 28, 1, 0),
+	Position = UDim2.new(0, 32, 0, 0),
+	FontFace = Theme.ICON,
+	TextSize = 15,
+	TextColor3 = Theme.TEXT_MED,
+	Text = "magnifying-glass",
 	AutoButtonColor = false,
 })
 -- No title label here: the widget's own title bar already carries NAME, and a
@@ -491,6 +504,22 @@ sessionsButton.MouseButton1Click:Connect(function()
 	root.Position = UDim2.new(0, sidebarOffset, 0, 0)
 	root.Size = UDim2.new(1, -sidebarOffset, 1, 0)
 end)
+
+-- Find in conversation
+-- Parented to the widget, not to root, so it floats over the console instead of
+-- pushing it down, and so the sessions drawer shifting root leaves it alone.
+local toggleFind = Find.mount(widget, Agent.conversation)
+findButton.MouseButton1Click:Connect(function() toggleFind(nil) end)
+
+-- Studio delivers no keystrokes to a plugin widget while one of its TextBoxes
+-- holds focus (measured, see the FocusLost comment at the bottom of this file),
+-- so the Ctrl+F below only lands while you are not typing. This is the way in
+-- that always works: File > Advanced > Customize Shortcuts, bind whatever you
+-- like to it.
+local findAction = plugin:CreatePluginAction(
+	"AgentFindInChat", "Find in chat",
+	"Search this conversation, thinking and tool output included", "", true)
+findAction.Triggered:Connect(function() toggleFind(true) end)
 
 -- Model picker
 -- The same list the settings panel offers, in a popup over the input row, so
@@ -861,9 +890,17 @@ inputBox.FocusLost:Connect(function(enterPressed: boolean, cause: InputObject?)
 end)
 
 -- Esc from the viewport too, the one place UserInputService does report input.
+-- Ctrl+F rides along here: same limitation, it arrives whenever the input box is
+-- not the thing with focus, which is exactly when you are reading rather than
+-- typing. Ignored while the widget is closed, so it stays out of the way of
+-- whatever Studio does with the same chord.
 UserInputService.InputBegan:Connect(function(input: InputObject)
 	if input.KeyCode == Enum.KeyCode.Escape and Agent.isBusy() then
 		Agent.stop()
+	elseif input.KeyCode == Enum.KeyCode.F and widget.Enabled
+		and (UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+			or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)) then
+		toggleFind(true)
 	end
 end)
 
@@ -936,6 +973,10 @@ task.spawn(function()
 	local sessionsOk, sessionsErr = Sessions.selfTest()
 	if not sessionsOk then
 		warn("[agent] Session storage self-test FAILED: " .. tostring(sessionsErr))
+	end
+	local findOk, findErr = Find.selfTest()
+	if not findOk then
+		warn("[agent] Conversation search self-test FAILED: " .. tostring(findErr))
 	end
 end)
 

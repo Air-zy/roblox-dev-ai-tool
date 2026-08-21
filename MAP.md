@@ -20,6 +20,7 @@ main.lua                        window, toolbar, popups, usage panel
           providers/AnthropicAuth   PKCE, refresh, usage
         agent/Tools             registry; tools/ is one file per tool
     ui/Console -> ui/Markdown -> ui/Theme
+    ui/Find                     search the open conversation
     ui/Settings
     fs/Terminal                 commands as DataModel operations
       fs/Shell                  command line: tokens, flags, pipes, HANDLERS
@@ -45,7 +46,7 @@ main.lua                        window, toolbar, popups, usage panel
 | the turn loop | `Agent.lua:513` `runTurn` |
 | Stop | `Agent.lua:631` `stopCurrent`, reached through `Agent.stop`. The queued continuation re-checks `cancelRequested` after its wait (`continueTurn:612`), and `committed:591` is what keeps Stop from rolling back a turn already in the history |
 | a turn's result is handled | `Agent.lua:751` `onComplete` -> assemble -> dispatch tools -> `continueTurn:590` |
-| the user hits enter | `main.lua:804` `submit` -> `Commands.handle:184` -> `Agent.send:1102` |
+| the user hits enter | `main.lua:833` `submit` -> `Commands.handle:184` -> `Agent.send:1102` |
 | a tool runs | `Tools.lua:106` `dispatch` — never throws |
 | tool definitions on the wire | `Tools.lua:78` `definitions` + `Agent.lua:219` `buildTools` |
 | model / thinking / effort / search per model | `providers/Anthropic.lua:76` `MODEL_CAPS`; UI list at `:224` |
@@ -79,7 +80,10 @@ main.lua                        window, toolbar, popups, usage panel
 | sed parsed / applied | `text/Sed.lua:195` `parseSedCommand`, `:102` `substitute` |
 | property names / defaults | `studio/Props.lua:90` `names`, `:137` `default` |
 | sessions | `Sessions.lua:172` `save`, `:323` `load`, `:375` `restoreLast` |
-| a session is written to disk | the busy -> idle edge in `main.lua:790`, plus `onCheckpoint:241` — fired by `Agent.send` as the message goes in, and by `continueTurn(true):590` after each batch of tool results |
+| the session list is filtered | `Sessions.lua:489` `query`, box at `:508`, applied in `draw` |
+| a conversation is searched | `Find.lua:67` `Find.scan` — every block type, thinking and tool output included; the panel is `:119` `Find.mount` |
+| Ctrl+F reaches the plugin | `main.lua:511` mount, `:519` the bindable PluginAction, `:902` the viewport-side key |
+| a session is written to disk | the busy -> idle edge in `main.lua:819`, plus `onCheckpoint:241` — fired by `Agent.send` as the message goes in, and by `continueTurn(true):590` after each batch of tool results |
 | text on screen | `Console.lua:256` `appendLine`, `:624` `createBubble`, `:931` `appendToolCall` |
 
 ## Per file
@@ -90,15 +94,16 @@ main.lua                        window, toolbar, popups, usage panel
 | `agent/Agent.lua` | 1338 | Turn loop, conversation state, trimming, stop. |
 | `ui/Console.lua` | 1117 | Bubbles, thinking drawers, tool-call blocks. |
 | `text/Regex.lua` | 958 | BRE/ERE engine. Requires nothing. |
-| `main.lua` | 943 | Widget, toolbar, popups. Owns `plugin`, hands it to Provider / Sessions / Settings — the only four that touch it. |
+| `main.lua` | 982 | Widget, toolbar, popups. Owns `plugin`, hands it to Provider / Sessions / Settings — the only four that touch it. |
 | `fs/Terminal.lua` | 811 | Commands as tree operations. No parsing. |
 | `fs/Fs.lua` | 791 | Paths, `.Source`, undo, mtime, globs, mode bits. |
 | `agent/providers/Anthropic.lua` | 1278 | One request. Knows nothing about turns. |
-| `ui/Sessions.lua` | 687 | Session list and persistence. |
+| `ui/Sessions.lua` | 733 | Session list, filter and persistence. |
 | `ui/Settings.lua` | 578 | Preferences + panel. |
 | `studio/Exec.lua` | 565 | Luau execution. Tool-only. |
 | `agent/providers/AnthropicAuth.lua` | 514 | PKCE login, refresh, usage. |
 | `studio/Catalog.lua` | 402 | Free model search / insert. Tool-only. |
+| `ui/Find.lua` | 368 | Conversation search + the find panel. |
 | `ui/Markdown.lua` | 346 | Markdown to labels. |
 | `text/Sed.lua` | 330 | sed engine. Pure text. |
 | `main/Commands.lua` | 205 | Slash commands. |

@@ -26,8 +26,16 @@ The button at the top left opens the sessions drawer. Conversations are saved as
 you go and the last one for the place you are in comes back when you reopen the
 plugin, so a Studio crash costs you the turn that was running and nothing else.
 Switch between them from the list, start a new one with +, and delete one with
-the bin. /clear wipes the session you are in rather than parking it. The drawer
+the bin. The box at the top of the drawer filters the list by title as you type. /clear wipes the session you are in rather than parking it. The drawer
 stays open and moves the console aside, so you can read the list and keep going.
+
+The magnifier next to it searches the conversation you are in: everything the
+model said, everything you said, its reasoning and its tool calls and their
+output, since all of that is in the conversation whether or not it is still on
+screen. Click a result to read the whole block. Ctrl+F opens it too, but only
+while you are not typing — Studio hands a plugin widget no keystrokes at all
+while one of its text boxes has focus. For a shortcut that always works, bind
+one to "Find in chat" under File > Advanced > Customize Shortcuts.
 
 Settings is at the bottom of that drawer: effort, web search, run code and system
 prompt, plus your plan usage for the 5 hour and weekly windows. The model has its
