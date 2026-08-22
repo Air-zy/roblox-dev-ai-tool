@@ -81,11 +81,13 @@ main.lua                        window, toolbar, popups, usage panel
 | property names / defaults | `studio/Props.lua:90` `names`, `:137` `default` |
 | sessions | `Sessions.lua:172` `save`, `:380` `load`, `:484` `restoreLast` |
 | another session is read mid-turn | `Sessions.lua:388` the peek branch of `load` — no `Agent.restore`, `currentId` never moves. Parked blocks in `previewHolder:239`, put back by `endPeek:259` or dropped by `dropPeek:250` |
-| where a new console block is parented | `Console.lua:32` `sink` — `output` normally, a detached holder during a peek. `detach:196` / `reattach:208` / `discard:225`, and `onScreen:230` for anything the reader asked to see |
+| where a new console block is parented | `Console.lua:32` `sink` — `output` normally, a detached holder during a peek. `detach:273` / `reattach:285` / `discard:302`, and `onScreen:307` for anything the reader asked to see |
+| a block gets its LayoutOrder | `Console.lua:42` `takeOrder` — a counter, never a child count. The holder a peek detaches holds three fewer children than the frame it came from, so counting numbered a block below ones already on screen |
 | the session list is filtered | `Sessions.lua:489` `query`, box at `:508`, applied in `draw` |
-| a conversation is searched | `Find.lua:66` `Find.scan` — every block type, thinking and tool output included. Each hit carries the message it is in; the panel is `:126` `Find.mount` |
-| clicking a result reaches the message | `Find` hands the index to `Sessions.reveal:420`, which grows a short replay until the message is drawn, then `Console.jumpToMessage:223`. Anchors are a `msg` attribute set by `Console.setMessage:194` and resolved at-or-below by `anchorFor:206` |
-| Ctrl+F reaches the plugin | three ways in, because no single one covers every focus state: `main.lua:534` `root.InputBegan` (widget focused), `:519` the bindable PluginAction (anywhere), `:916` UserInputService (viewport). None sees a chord typed into the input box — that is what `/find` in `Commands.lua:180` is for |
+| a conversation is searched | `Find.lua:69` `Find.scan` — every block type, thinking and tool output included. Each hit carries the message it is in; the panel is `:126` `Find.mount` |
+| clicking a result reaches the message | `Find` hands the index to `Sessions.reveal:420`, which grows a short replay until the message is drawn, then `Console.jumpToMessage:235`. Anchors are a `msg` attribute set by `Console.setMessage:206` and resolved at-or-below by `anchorFor:218` |
+| a key reaches the plugin | it mostly does not — read the comment at `main.lua:517` before adding a shortcut, it carries the doc citations and the three rounds of trying already spent. UIS is client-window-only, ContextActionService likewise, `GuiObject.InputBegan` is the only in-widget event and a focused TextBox beats it, and a focused TextBox is the normal state here. What works: Shift+Esc, read off the `cause` of `inputBox.FocusLost:875`, and the bindable `PluginAction:531` |
+| an icon renders as a tofu box | the name has no ligature in `BuilderIcons-Regular.ttf`. The font has NO single-character ligatures, which is what made a plain `x` a square for as long as the settings panel has had a close button. See the note at `Theme.lua:39` |
 | a session is written to disk | the busy -> idle edge in `main.lua:819`, plus `onCheckpoint:241` — fired by `Agent.send` as the message goes in, and by `continueTurn(true):590` after each batch of tool results |
 | text on screen | `Console.lua:256` `appendLine`, `:624` `createBubble`, `:931` `appendToolCall` |
 
@@ -95,9 +97,9 @@ main.lua                        window, toolbar, popups, usage panel
 |---|---:|---|
 | `fs/Shell.lua` | 5557 | The command line. Still the biggest — see below. |
 | `agent/Agent.lua` | 1354 | Turn loop, conversation state, trimming, stop. |
-| `ui/Console.lua` | 1326 | Bubbles, thinking drawers, tool-call blocks, the detached sink. |
+| `ui/Console.lua` | 1355 | Bubbles, thinking drawers, tool-call blocks, the detached sink. |
 | `text/Regex.lua` | 958 | BRE/ERE engine. Requires nothing. |
-| `main.lua` | 1011 | Widget, toolbar, popups. Owns `plugin`, hands it to Provider / Sessions / Settings — the only four that touch it. |
+| `main.lua` | 1009 | Widget, toolbar, popups. Owns `plugin`, hands it to Provider / Sessions / Settings — the only four that touch it. |
 | `fs/Terminal.lua` | 811 | Commands as tree operations. No parsing. |
 | `fs/Fs.lua` | 791 | Paths, `.Source`, undo, mtime, globs, mode bits. |
 | `agent/providers/Anthropic.lua` | 1278 | One request. Knows nothing about turns. |
@@ -106,7 +108,7 @@ main.lua                        window, toolbar, popups, usage panel
 | `studio/Exec.lua` | 565 | Luau execution. Tool-only. |
 | `agent/providers/AnthropicAuth.lua` | 514 | PKCE login, refresh, usage. |
 | `studio/Catalog.lua` | 402 | Free model search / insert. Tool-only. |
-| `ui/Find.lua` | 385 | Conversation search + the find panel. |
+| `ui/Find.lua` | 423 | Conversation search + the find panel. |
 | `ui/Markdown.lua` | 346 | Markdown to labels. |
 | `text/Sed.lua` | 330 | sed engine. Pure text. |
 | `main/Commands.lua` | 205 | Slash commands. |

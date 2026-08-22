@@ -20,6 +20,7 @@ assert(plugin ~= nil, "This script must run as a Roblox Studio plugin (the `plug
 local NAME = "Agent"
 
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 
 -- Modules are grouped by what they are, not listed flat. A module only ever
 -- reaches for a folder it does not live in when it genuinely crosses layers,
@@ -310,7 +311,7 @@ local inputBox = make("TextBox", {
 	MultiLine = false,
 	ClearTextOnFocus = false,
 	Text = "",
-	PlaceholderText = "Message " .. NAME .. "…  ( / for commands · shift+enter for a new line )",
+	PlaceholderText = "Message " .. NAME .. "…  ( / commands · shift+enter newline · shift+esc find )",
 	PlaceholderColor3 = Theme.TEXT_LO,
 	TextXAlignment = Enum.TextXAlignment.Left,
 	TextYAlignment = Enum.TextYAlignment.Top,
@@ -513,31 +514,24 @@ local toggleFind = Find.mount(widget, Agent.conversation, Sessions.reveal, funct
 end)
 findButton.MouseButton1Click:Connect(function() toggleFind(nil) end)
 
--- Studio delivers no keystrokes to a plugin widget while one of its TextBoxes
--- holds focus (measured, see the FocusLost comment at the bottom of this file),
--- so the Ctrl+F below only lands while you are not typing. This is the way in
--- that always works: File > Advanced > Customize Shortcuts, bind whatever you
--- like to it.
+-- The only keyboard route Studio dispatches ahead of a focused text box, and the
+-- documented way a plugin gets a shortcut at all. It cannot ship with a chord:
+-- File > Advanced > Customize Shortcuts, bind whatever you like to it.
+--
+-- There is deliberately no Ctrl+F here. Nothing in the plugin API can see it:
+-- UserInputService.InputBegan is documented to fire "only when the Roblox client
+-- window is in focus", which is the 3D view and never this widget;
+-- ContextActionService is client-LocalScript only; and GuiObject.InputBegan, the
+-- one event that does reach a PluginGui's children, loses to a focused TextBox —
+-- which in this panel is nearly always one, since submit recaptures the input box
+-- and every console line is editable so it can be selected and copied. Three
+-- rounds of trying is enough. Shift+Esc is the shortcut that works, and it works
+-- because Esc is the one key a focused TextBox hands back; see the FocusLost
+-- handler further down.
 local findAction = plugin:CreatePluginAction(
 	"AgentFindInChat", "Find in chat",
 	"Search this conversation, thinking and tool output included", "", true)
 findAction.Triggered:Connect(function() toggleFind(true) end)
-
--- The one keyboard path that reaches inside the widget. GuiObject.InputBegan
--- does fire for a PluginGui's children — PluginGui.WindowFocused is documented
--- as firing "before any GuiObject.InputBegan events related to the PluginGui" —
--- and it carries the modifier state on the InputObject, which is the only place
--- to read it from: UserInputService:IsKeyDown answers for the game window, not
--- for a focused widget.
---
--- What it still cannot see is a chord pressed while the input box holds focus:
--- the box takes the keyboard and nothing downstream of it fires. That case has
--- /find, which is typed into the box that is swallowing the keys anyway.
-root.InputBegan:Connect(function(input: InputObject)
-	if input.KeyCode == Enum.KeyCode.F and input:IsModifierKeyDown(Enum.ModifierKey.Ctrl) then
-		toggleFind(true)
-	end
-end)
 
 -- Model picker
 -- The same list the settings panel offers, in a popup over the input row, so
@@ -846,8 +840,6 @@ Agent.Initialize(term, function(busy: boolean)
 end, Sessions.save)
 Commands.Initialize(term, toggleSettings, toggleFind)
 
-local UserInputService = game:GetService("UserInputService")
-
 local function submit(text: string)
 	inputBox.Text = ""
 	if text:gsub("%s+", "") == "" then return end
@@ -881,10 +873,20 @@ inputBox:GetPropertyChangedSignal("CursorPosition"):Connect(function()
 end)
 
 inputBox.FocusLost:Connect(function(enterPressed: boolean, cause: InputObject?)
-	-- Esc gives up focus and hands over the key that did it, the only way a
-	-- cancel from the keyboard reaches this plugin while you are typing.
+	-- Esc gives up focus and hands over the key that did it, which is the only
+	-- way ANY key reaches this plugin while you are typing — and the modifiers
+	-- come with it, exactly as they do for the Shift+Enter branch below. That
+	-- makes a modified Esc the one keyboard shortcut that can work from inside
+	-- the message box, so Shift+Esc is what opens the find panel. Nothing else
+	-- can; see the PluginAction comment above for what was tried.
+	--
+	-- Shift and not Ctrl: Ctrl+Esc is the Windows Start menu.
 	if cause and cause.KeyCode == Enum.KeyCode.Escape then
-		if Agent.isBusy() then Agent.stop() end
+		if cause:IsModifierKeyDown(Enum.ModifierKey.Shift) then
+			toggleFind(true)
+		elseif Agent.isBusy() then
+			Agent.stop()
+		end
 		return
 	end
 	if not enterPressed then return end
@@ -911,17 +913,13 @@ inputBox.FocusLost:Connect(function(enterPressed: boolean, cause: InputObject?)
 	end
 end)
 
--- Esc from the viewport too, the one place UserInputService does report input.
--- Ctrl+F rides along here: same limitation, it arrives whenever the input box is
--- not the thing with focus, which is exactly when you are reading rather than
--- typing. Ignored while the widget is closed, so it stays out of the way of
--- whatever Studio does with the same chord.
+-- Esc from the viewport, the one place UserInputService does report input: its
+-- docs say it fires only while the client window has focus, which is precisely
+-- the 3D view and never this widget. Nothing else is hung off it: a key pressed
+-- while working in the viewport is meant for Studio, not for us.
 UserInputService.InputBegan:Connect(function(input: InputObject)
 	if input.KeyCode == Enum.KeyCode.Escape and Agent.isBusy() then
 		Agent.stop()
-	elseif input.KeyCode == Enum.KeyCode.F and widget.Enabled
-		and input:IsModifierKeyDown(Enum.ModifierKey.Ctrl) then
-		toggleFind(true)
 	end
 end)
 

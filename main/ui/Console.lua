@@ -25,11 +25,24 @@ local output: ScrollingFrame = nil :: any
 -- streaming keeps rendering into its own blocks off screen instead of into the
 -- conversation the reader has opened on top of it. See Console.detach.
 --
--- Every appender numbers its block from #sink:GetChildren(), so the holder has
--- to be the SAME set of children the output frame had, not an empty frame:
--- moved, not copied, or the count restarts and a new block reuses a LayoutOrder
--- that is already taken.
+-- The blocks are MOVED into the holder, not copied: the running turn holds
+-- references to them and goes on writing into the same Instances.
 local sink: Instance = nil :: any
+
+-- LayoutOrder comes from a counter, not from counting the parent's children.
+-- Counting was wrong on both sides of a peek: the output frame also holds a
+-- UIListLayout, a UIPadding and the Working row, and the detached holder holds
+-- none of the three, so a block appended while the reader was away was numbered
+-- three below where it belonged and sorted itself into the middle of the
+-- conversation on the way back.
+--
+-- Never reset. It only has to increase; the Working row sits at the int32
+-- ceiling so it stays last however long this runs.
+local nextOrder = 0
+local function takeOrder(): number
+	nextOrder += 1
+	return nextOrder
+end
 -- The "Working..." row, see Console.setWorking.
 local workingRow: TextLabel = nil :: any
 
@@ -101,11 +114,10 @@ function Console.mount(parent: Instance, layoutOrder: number): ScrollingFrame
 	})
 
 	-- Made once here and hidden, rather than appended and destroyed each turn:
-	-- every appender numbers its block from #output:GetChildren(), so a child that
-	-- comes and goes makes that count shrink and lets a later block reuse a
-	-- LayoutOrder that is still on screen. A permanent child is just another
-	-- constant in the count, like the layout and padding objects. UIListLayout
-	-- skips invisible children, so it takes no space while idle.
+	-- one permanent Instance is less to get wrong than one that comes and goes,
+	-- and UIListLayout skips invisible children, so it takes no space while idle.
+	-- It also has to stay OUT of the holder a peek detaches, since a running turn
+	-- is exactly when it should still be on screen.
 	--
 	-- LayoutOrder is the int32 ceiling so the row stays last however long the
 	-- conversation runs.
@@ -390,11 +402,7 @@ end
 -- makes that safe; a selection copies the characters you can see, with no markup
 -- to leak into it.
 function Console.appendLine(text: string, kind: string?): TextBox
-	-- Counted BEFORE the box is made, because readOnlyBox parents it on
-	-- creation and a count taken afterwards includes the new child. Bubbles
-	-- number themselves the same way, so an off-by-one here would let a line and
-	-- a bubble share a LayoutOrder and swap places.
-	local order = #sink:GetChildren() + 1
+	local order = takeOrder()
 	local line, setLine = readOnlyBox(
 		sink,
 		(kind == "user") and Theme.SANS or Theme.MONO,
@@ -436,7 +444,7 @@ function Console.appendLink(text: string, onClick: () -> ()): TextButton
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Text = text,
 		AutoButtonColor = false,
-		LayoutOrder = #sink:GetChildren() + 1,
+		LayoutOrder = takeOrder(),
 	})
 	button.MouseButton1Click:Connect(onClick)
 	return button
@@ -765,7 +773,7 @@ function Console.createBubble(): Bubble
 		BackgroundTransparency = 1,
 		Size = UDim2.new(1, 0, 0, 0),
 		AutomaticSize = Enum.AutomaticSize.Y,
-		LayoutOrder = #sink:GetChildren() + 1,
+		LayoutOrder = takeOrder(),
 	})
 	anchor(container)
 	make("UIListLayout", {
@@ -928,7 +936,7 @@ function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinki
 		BackgroundTransparency = 1,
 		Size = UDim2.new(1, 0, 0, 0),
 		AutomaticSize = Enum.AutomaticSize.Y,
-		LayoutOrder = layoutOrder or (#host:GetChildren() + 1),
+		LayoutOrder = layoutOrder or takeOrder(),
 	})
 	-- Only reachable when the drawer is a block of its own, which is how a replay
 	-- draws it; a live one is nested inside its bubble and the bubble is the
@@ -1094,7 +1102,7 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 	end
 	readInput(input)
 
-	local order = #sink:GetChildren() + 1
+	local order = takeOrder()
 	local container = make("Frame", {
 		Name = "ToolCall",
 		Parent = sink,
@@ -1259,68 +1267,89 @@ end
 -- Self-test
 -- The peek is bookkeeping across two frames and every way it breaks is silent:
 -- blocks that never come back, a sink left pointing at a destroyed holder, a
--- LayoutOrder that restarts and drops a new block into the middle of an old
--- conversation. Runs before anything is on screen, because it clears.
+-- LayoutOrder that goes backwards and drops a new block into the middle of an
+-- old conversation.
+--
+-- The checks run inside a pcall with the teardown OUTSIDE it, because the first
+-- version of this could fail the console it was testing: it returned early on a
+-- failed assertion while the sink was still detached, and every append for the
+-- rest of the session went into a frame nobody could see. A self-test that
+-- breaks the thing it is checking is worse than no self-test.
 function Console.selfTest(): (boolean, string?)
+	local holder: Frame? = nil
+
+	local function check(): (boolean, string?)
+		Console.clear()
+		local first = Console.appendLine("selftest", "info")
+		if first.Parent ~= output then return false, "appendLine did not draw into the console" end
+		local order = first.LayoutOrder
+
+		holder = Console.detach()
+		if first.Parent ~= holder then return false, "detach left a block on screen" end
+		if workingRow.Parent ~= output then return false, "detach parked the Working row" end
+
+		-- What the running turn appends while the reader is elsewhere: off screen,
+		-- and numbered PAST what is parked rather than into the middle of it. The
+		-- holder holds fewer children than the frame it came from, which is exactly
+		-- what made counting them wrong.
+		local during = Console.appendLine("selftest", "info")
+		if during.Parent ~= holder then return false, "a detached turn drew on screen" end
+		if during.LayoutOrder <= order then
+			return false, "a detached block reused a LayoutOrder already in the conversation"
+		end
+
+		-- What the reader opened goes the other way, and the sink goes back after.
+		local peeked: TextBox = nil :: any
+		Console.onScreen(function() peeked = Console.appendLine("selftest", "info") end)
+		if peeked.Parent ~= output then return false, "onScreen drew into the detached holder" end
+		if Console.appendLine("selftest", "info").Parent ~= holder then
+			return false, "onScreen did not put the sink back"
+		end
+
+		Console.reattach(holder :: Frame)
+		holder = nil
+		if first.Parent ~= output or during.Parent ~= output then
+			return false, "reattach did not bring the running turn back"
+		end
+		if peeked.Parent ~= nil then return false, "reattach kept the peeked session on screen" end
+		if Console.appendLine("selftest", "info").Parent ~= output then
+			return false, "reattach did not put the sink back"
+		end
+
+		-- Anchors. A jump asks for a message index and has to land on the block
+		-- that DRAWS it, which for a tool result is one message earlier than the
+		-- message the result is stored in — hence at-or-below rather than exact.
+		Console.clear()
+		Console.setMessage(4)
+		local four = Console.appendLine("selftest", "info")
+		Console.setMessage(7)
+		local seven = Console.appendLine("selftest", "info")
+		Console.setMessage(0)
+		if Console.appendLine("selftest", "info"):GetAttribute(MESSAGE_ATTR) ~= nil then
+			return false, "setMessage(0) anchored a block that belongs to no message"
+		end
+		if anchorFor(4) ~= four then return false, "anchorFor missed an exact match" end
+		if anchorFor(6) ~= four then return false, "anchorFor did not fall back to the message below" end
+		if anchorFor(9) ~= seven then return false, "anchorFor did not take the highest below" end
+		if anchorFor(3) ~= nil then return false, "anchorFor reached above the index it was asked for" end
+		if Console.jumpToMessage(1) then
+			return false, "jumpToMessage claimed a message that is not drawn"
+		end
+		if not Console.jumpToMessage(7) then
+			return false, "jumpToMessage could not reach an anchored message"
+		end
+		return true
+	end
+
+	local ran, passed, err = pcall(check)
+	-- However that went, the console has to be left drawing on screen.
+	if holder then (holder :: Frame):Destroy() end
+	sink = output
+	messageIndex = 0
+	stickToBottom = true
 	Console.clear()
-	local first = Console.appendLine("selftest", "info")
-	if first.Parent ~= output then return false, "appendLine did not draw into the console" end
-	local order = first.LayoutOrder
-
-	local holder = Console.detach()
-	if first.Parent ~= holder then return false, "detach left a block on screen" end
-	if workingRow.Parent ~= output then return false, "detach parked the Working row" end
-
-	-- What the running turn appends while the reader is elsewhere: off screen,
-	-- and numbered PAST what is parked rather than on top of it.
-	local during = Console.appendLine("selftest", "info")
-	if during.Parent ~= holder then return false, "a detached turn drew on screen" end
-	if during.LayoutOrder <= order then
-		return false, "a detached block reused a LayoutOrder already in the conversation"
-	end
-
-	-- What the reader opened goes the other way, and the sink goes back after.
-	local peeked: TextBox = nil :: any
-	Console.onScreen(function() peeked = Console.appendLine("selftest", "info") end)
-	if peeked.Parent ~= output then return false, "onScreen drew into the detached holder" end
-	if Console.appendLine("selftest", "info").Parent ~= holder then
-		return false, "onScreen did not put the sink back"
-	end
-
-	Console.reattach(holder)
-	if first.Parent ~= output or during.Parent ~= output then
-		return false, "reattach did not bring the running turn back"
-	end
-	if peeked.Parent ~= nil then return false, "reattach kept the peeked session on screen" end
-	if Console.appendLine("selftest", "info").Parent ~= output then
-		return false, "reattach did not put the sink back"
-	end
-
-	-- Anchors. A jump asks for a message index and has to land on the block that
-	-- DRAWS it, which for a tool result is one message earlier than the message
-	-- the result is stored in — hence at-or-below rather than exact.
-	Console.clear()
-	Console.setMessage(4)
-	local four = Console.appendLine("selftest", "info")
-	Console.setMessage(7)
-	local seven = Console.appendLine("selftest", "info")
-	Console.setMessage(0)
-	if Console.appendLine("selftest", "info"):GetAttribute(MESSAGE_ATTR) ~= nil then
-		return false, "setMessage(0) anchored a block that belongs to no message"
-	end
-	if anchorFor(4) ~= four then return false, "anchorFor missed an exact match" end
-	if anchorFor(6) ~= four then return false, "anchorFor did not fall back to the message below" end
-	if anchorFor(9) ~= seven then return false, "anchorFor did not take the highest below" end
-	if anchorFor(3) ~= nil then return false, "anchorFor reached above the index it was asked for" end
-	if Console.jumpToMessage(1) then
-		return false, "jumpToMessage claimed a message that is not drawn"
-	end
-	if not Console.jumpToMessage(7) then
-		return false, "jumpToMessage could not reach an anchored message"
-	end
-
-	Console.clear()
-	return true
+	if not ran then return false, tostring(passed) end
+	return passed, err
 end
 
 return Console

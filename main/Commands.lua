@@ -173,10 +173,10 @@ handlers["/settings"] = function()
 	if openSettings then openSettings(true) end
 end
 
--- The find panel has a button and a Ctrl+F, and neither can help you while the
--- input box has focus: Studio hands a plugin widget no key events at all while
--- one of its text boxes is taking them. This is the trigger that works from
--- inside the box, which is where you already are.
+-- The find panel has a button and Shift+Esc; this is the third way in, and the
+-- only one that carries the query with it. Studio hands a plugin widget no key
+-- events at all while one of its text boxes is taking them, so a command typed
+-- into that box is the most reliable trigger there is.
 handlers["/find"] = function(_, raw)
 	local query = raw:match("^/find%s+(.+)$")
 	if openFind then openFind(true, query) end

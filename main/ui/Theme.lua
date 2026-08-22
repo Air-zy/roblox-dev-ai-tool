@@ -39,7 +39,14 @@ Theme.MONO_FACE = "RobotoMono"
 -- Builder Icons, the icon set Studio's own UI is drawn with. It is a LIGATURE
 -- font, not a spritesheet: the icon's name IS the text, so a TextLabel with this
 -- face and Text = "gear" draws the gear. Names are the kebab-case ones from the
--- BuilderIcons package: three-bars-horizontal, x, plus-large, trash-can, clock...
+-- BuilderIcons package: three-bars-horizontal, plus-large, trash-can, clock...
+--
+-- A name the font has no ligature for renders as the notdef box, silently, and
+-- it looks like the font failed rather than the name being wrong. The font
+-- carries no SINGLE-character ligatures at all, so the plain "x" that used to
+-- close the settings panel was always a tofu square — it is "x-small". The
+-- authoritative list is the ligature table inside the .ttf below; the mapping in
+-- BuilderIcons/Icon.lua on the client tracker is the readable form of it.
 --
 -- The family is an rbxasset path into Studio's own LuaPackages rather than an
 -- upload, so it costs nothing, needs no asset id, and always matches the Studio

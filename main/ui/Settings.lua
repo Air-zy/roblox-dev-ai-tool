@@ -344,7 +344,7 @@ function Settings.mountPanel(
 		FontFace = Theme.ICON,
 		TextSize = 16,
 		TextColor3 = Theme.TEXT_MED,
-		Text = "x",
+		Text = "x-small",
 	})
 	make("Frame", {
 		Parent = header,

@@ -594,7 +594,7 @@ function Sessions.mountSidebar(parent: Instance, openSettings: () -> ()): (boole
 	-- you sent. That is what you remember a session by, and it costs one string
 	-- find per row, so the list narrows on the keystroke. Searching the bodies
 	-- would mean reading and decoding twenty stored conversations, up to 400 KB
-	-- each, on a keystroke; Ctrl+F searches a conversation once it is open.
+	-- each, on a keystroke; the find panel searches one once it is open.
 	local query = ""
 	local searchRow = make("Frame", {
 		Parent = panel,

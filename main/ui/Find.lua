@@ -27,6 +27,7 @@ local CONTEXT = 70
 local MIN_QUERY = 2
 local ROW_ESTIMATE = 46
 local LIST_HEIGHT = 220
+local HINT_HEIGHT = 76
 
 local function snippetAt(text: string, at: number, len: number): string
 	local from = math.max(1, at - CONTEXT)
@@ -199,7 +200,7 @@ function Find.mount(
 		FontFace = Theme.ICON,
 		TextSize = 14,
 		TextColor3 = Theme.TEXT_LO,
-		Text = "x",
+		Text = "x-small",
 		AutoButtonColor = false,
 		ZIndex = 51,
 	})
@@ -221,6 +222,38 @@ function Find.mount(
 	make("UIPadding", { Parent = results, PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6) })
 
 	local hits: { Hit } = {}
+
+	-- Shown with the box empty, which is where someone looking for the shortcut
+	-- ends up. A focused text box takes the keyboard before any plugin event
+	-- fires, and one nearly always has focus here, so these are the three ways
+	-- in — there is no Ctrl+F to list.
+	local HINT = table.concat({
+		"Shift+Esc opens this while you are typing — Esc is the only key a",
+		"focused text box hands back.",
+		"· /find <text> searches straight from the message box.",
+		"· Bind your own chord: File ▸ Advanced ▸ Customize Shortcuts ▸",
+		"  \"Find in chat\".",
+	}, "\n")
+
+	local function hint()
+		local row = make("TextLabel", {
+			Parent = results,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, -6, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			FontFace = Theme.SANS,
+			TextSize = Theme.SMALL_SIZE,
+			TextColor3 = Theme.TEXT_LO,
+			TextWrapped = true,
+			RichText = false,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Top,
+			Text = HINT,
+			LayoutOrder = 1,
+			ZIndex = 52,
+		})
+		make("UIPadding", { Parent = row, PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 6) })
+	end
 
 	local function draw()
 		for _, child in ipairs(results:GetChildren()) do
@@ -291,10 +324,15 @@ function Find.mount(
 		if #query < MIN_QUERY then
 			hits = {}
 			count.Text = ""
-		else
-			hits = Find.scan(getConversation(), query)
-			count.Text = if #hits == 0 then "no matches" else string.format("%d found", #hits)
+			draw()
+			-- draw sizes the list off the hit count, which is zero here, so the
+			-- hint gets its own height.
+			hint()
+			results.Size = UDim2.new(1, 0, 0, HINT_HEIGHT)
+			return
 		end
+		hits = Find.scan(getConversation(), query)
+		count.Text = if #hits == 0 then "no matches" else string.format("%d found", #hits)
 		draw()
 	end
 	queryBox:GetPropertyChangedSignal("Text"):Connect(search)
