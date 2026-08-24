@@ -143,11 +143,25 @@ end
 -- happens when the server is still reading an uncached prefix and has sent
 -- nothing yet. Retrying is the right move precisely because the failed attempt
 -- still warmed that prefix, so the second one starts talking sooner.
+--
+-- It was also the ONLY transport failure matched here, and the rest arrive the
+-- same way: no HTTP status at all (the Error signal reports -1) and the
+-- HttpError name in the message. So `HttpError: NetFail` before the first byte
+-- — the same stall one layer lower — fell straight through as fatal and ended
+-- the turn without a single retry. The names left out are the ones a second
+-- attempt cannot fix: InvalidUrl, TooManyRedirects, InvalidRedirect,
+-- SslVerificationFail and OutOfMemory answer the same way every time, and
+-- Aborted is what a stream someone closed reports.
 -- Anthropic publishes which statuses are worth retrying, and the table ships
 -- inside Claude Code's own bundle: 400, 401, 403, 404 and 413 are No; 429
 -- (rate_limit_error), 500 (api_error) and 529 (overloaded_error) are Yes. The
 -- 5xx range is included rather than 500 alone because 502 and 503 come from
 -- infrastructure in front of the API and mean the same thing to a client.
+local RETRYABLE_TRANSPORT = {
+	"InactivityTimeout", "NetFail", "ConnectFail", "DnsResolve", "TimedOut",
+	"SslConnectFail",
+}
+
 local function isRetryable(status: number?, body: string?): boolean
 	if status == 429 then return true end
 	if status and status >= 500 and status < 600 then return true end
@@ -156,9 +170,16 @@ local function isRetryable(status: number?, body: string?): boolean
 	-- status is not always the thing that arrives. rate_limit_error is included
 	-- alongside overloaded_error because both can reach us through a path that
 	-- carried no usable status at all.
-	return string.find(body, '"type":"overloaded_error"', 1, true) ~= nil
-		or string.find(body, '"type":"rate_limit_error"', 1, true) ~= nil
-		or string.find(body, "InactivityTimeout", 1, true) ~= nil
+	if string.find(body, '"type":"overloaded_error"', 1, true)
+		or string.find(body, '"type":"rate_limit_error"', 1, true) then
+		return true
+	end
+	for _, name in ipairs(RETRYABLE_TRANSPORT) do
+		if string.find(body, name, 1, true) then
+			return true
+		end
+	end
+	return false
 end
 
 local function isOverload(status: number?, body: string?): boolean
@@ -1173,6 +1194,15 @@ local function selfTest(): (boolean, string?)
 	end
 	if not isRetryable(200, "HttpError: InactivityTimeout") then
 		return false, "InactivityTimeout is not being retried"
+	end
+	-- A transport failure carries no status at all, so the -1 is the whole test:
+	-- NetFail before the first byte used to fall through as fatal and end the
+	-- turn without one retry, because InactivityTimeout was the only name matched.
+	if not isRetryable(-1, "HttpError: NetFail") then
+		return false, "a transport failure with no status is not being retried"
+	end
+	if isRetryable(-1, "HttpError: SslVerificationFail") then
+		return false, "a certificate failure is being retried; it cannot succeed"
 	end
 	if isRetryable(400, "invalid_request_error") then
 		return false, "a 400 is being retried; it cannot succeed"

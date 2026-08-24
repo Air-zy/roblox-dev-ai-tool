@@ -5,15 +5,18 @@
 -- do things to the DataModel, list a container, read a script's source, clone
 -- an instance. This file knows how to read a line someone typed and work out
 -- which of those to call, in what order, with what plumbed into what: quoting,
--- heredocs, `|` pipelines, `;` `&&` `||` chaining, `>` redirection.
+-- heredocs, `|` pipelines, `;` `&&` `||` chaining, `>` redirection, globs,
+-- `for f in WORDS; do ... ; done` and `$(...)`.
 --
 -- The two halves change for unrelated reasons, which is why they are two files.
 -- A new command is a HANDLERS entry; a new piece of syntax is a change here and
 -- nowhere else.
 --
--- It is deliberately NOT a shell interpreter. No variables, no control flow, no
--- `$?`, no command substitution, no environment. Anything that needs real
--- composition should use the `run` tool instead of growing a language here.
+-- It is still not a general shell interpreter, and the line is worth stating
+-- because it has moved twice: there is no `if`, no `while`, no assignment, no
+-- `$?`, no environment and no arithmetic, and the only variable is a loop's own.
+-- Anything that needs more than that should use the `run` tool instead of
+-- growing a language here.
 
 local Fs = require(script.Parent:WaitForChild("Fs"))
 -- Only for find's -type, which has to reject a name that is not a class BEFORE
@@ -76,10 +79,11 @@ local DOUBLE_QUOTE_ESCAPES: { [string]: boolean } = {
 -- spaces survive: `cd "My Model"` is the common case, and a plain split on
 -- whitespace gets it wrong on day one.
 --
--- ponytail: not a shell. No variables, command substitution or control flow, and
--- no reason to add them, anything that needs those should use `run`. Ceiling:
--- the quote/escape rules are bash's, the composition is `| ; && ||` and nothing
--- more, and a real grammar is the upgrade path if that ever stops being enough.
+-- ponytail: no assignment, no `$?`, no arithmetic and no backticks, and no
+-- reason to add them — anything that needs those should use `run`. Ceiling: the
+-- quote/escape rules are bash's, but the grammar is hand-rolled rather than
+-- parsed, and both `for` and `$(...)` were fitted onto it a pass at a time. A
+-- real grammar is the upgrade path if a third one comes along.
 --
 -- Returns a third value: which argv POSITIONS came out of quotes, so the
 -- metacharacter check can tell `grep "<" f` from an input redirection.
@@ -508,14 +512,11 @@ local UNSUPPORTED: { [string]: string } = {
 	-- sends a read-only session into a write-capable one. curl and wget were on
 	-- this list for exactly that reason until they became commands.
 	awk = "no awk; `sed -n '10,40p'` prints a line range and `grep -A/-B/-C` gives context",
-	xargs = "no xargs; pipe into grep/head/tail/wc/sort/uniq/sed/tr instead",
-	-- A `for` loop IS supported, but only as the whole line: the parser claims it
-	-- before statements are split, so one reached as a command means it was
-	-- written after a `;`. Three entries rather than one, because a mis-placed
-	-- loop leaves all three of its keywords stranded, and "unknown command"
-	-- prints the entire command list beside each.
-	["for"] = "a `for` loop has to start the command line, not follow a `;` — " ..
-		"`for f in *.luau; do head -5 $f; done`",
+	xargs = "no xargs; `for f in $(grep -rl Foo); do ... $f; done` runs a command " ..
+		"per item, and a filter can be piped straight into grep/head/tail/wc/sort/uniq/sed/tr",
+	-- A loop is claimed as a whole pipeline stage, so `for` never reaches here as
+	-- a command. `do` and `done` still can, stranded by a loop with no `for`, and
+	-- "unknown command" would print the entire command list beside each.
 	["do"] = "only appears inside a loop — `for f in *.luau; do head -5 $f; done`",
 	["done"] = "only appears inside a loop — `for f in *.luau; do head -5 $f; done`",
 	["while"] = "no `while`: nothing here changes between two iterations, so it " ..
@@ -3044,6 +3045,105 @@ HANDLERS.ln = function(self, argv)
 		instancePath(link :: Instance), instancePath(target))
 end
 
+-- One file's worth of sed. Split out because sed takes SEVERAL file operands and
+-- the handler used to read only operands[1]: `sed -i 's/a/b/' f1 f2 f3` rewrote
+-- f1, said nothing about f2 or f3, and returned a success message — a partial
+-- answer shaped exactly like a complete one, on the one command that writes.
+--
+-- Range state (`active`) is per file, which is why it is built here rather than
+-- threaded in: a `/start/,/end/` range left open at the end of one file must not
+-- select the beginning of the next.
+--
+-- Returns nil plus a message on failure. The third value is `q`, which quits sed
+-- entirely rather than just the file it fired in.
+local function applySed(commands: { SedCommand }, lines: { string }, quiet: boolean):
+	(string?, string?, boolean)
+	local quitAll = false
+	local out: { string } = {}
+	local active: { [number]: boolean } = {}
+
+	for index, line in ipairs(lines) do
+		local text = line
+		local deleted = false
+		local before: { string } = {}
+		local after: { string } = {}
+		local quit = false
+
+		for slot, command in ipairs(commands) do
+			if not sedSelects(command, index, text, #lines, active, slot) then
+				continue
+			end
+			local name = command.name
+			if name == "s" then
+				local args = command.args
+				-- The pattern compiled at parse time, so a bad one was refused
+				-- before any line ran. What is left to go wrong is the step
+				-- budget, which aborts the whole substitution rather than leaving
+				-- the file half-rewritten.
+				local ok, res, changed = pcall(substitute, args.program, text,
+					args.replacement, args.global, args.occurrence)
+				if not ok then
+					return nil, Regex.isBudget(res)
+						and "that pattern is too expensive to run — anchor it, or replace a " ..
+							"nested quantifier like (a+)+ with a single one"
+						or tostring(res)
+				end
+				text = res
+				-- `p` prints the line only when the substitution actually fired.
+				-- With -n that is the whole output, which is what makes
+				-- `sed -n 's/x/y/p'` mean "show me just the changed lines".
+				if args.print and (changed :: number) > 0 then
+					after[#after + 1] = text
+				end
+			elseif name == "y" then
+				local args = command.args
+				local from = expandTrSet(args.pattern)
+				local to = expandTrSet(args.replacement)
+				if #from ~= #to then
+					return nil, "y/// needs both sets to be the same length"
+				end
+				text = text:gsub(".", function(c)
+					local at = from:find(c, 1, true)
+					return at and to:sub(at, at) or c
+				end)
+			elseif name == "d" then
+				deleted = true
+				break
+			elseif name == "p" then
+				-- Without -n every line prints anyway, so an explicit p doubles it
+				-- which is exactly what `sed p` does.
+				after[#after + 1] = text
+			elseif name == "=" then
+				before[#before + 1] = tostring(index)
+			elseif name == "a" then
+				after[#after + 1] = command.args
+			elseif name == "i" then
+				before[#before + 1] = command.args
+			elseif name == "c" then
+				text = command.args
+			elseif name == "q" then
+				quit = true
+				break
+			end
+		end
+
+		for _, extra in ipairs(before) do
+			out[#out + 1] = extra
+		end
+		if not deleted and not quiet then
+			out[#out + 1] = text
+		end
+		for _, extra in ipairs(after) do
+			out[#out + 1] = extra
+		end
+		if quit then
+			quitAll = true
+			break
+		end
+	end
+	return table.concat(out, "\n"), nil, quitAll
+end
+
 HANDLERS.sed = function(self, argv, stdin)
 	local flags, values, operands = parse(argv)
 
@@ -3082,13 +3182,10 @@ HANDLERS.sed = function(self, argv, stdin)
 	for index = firstFile, #operands do
 		files[#files + 1] = operands[index]
 	end
-	local path = files[1]
 
-	local input, inputErr = textInput(self, { path }, stdin)
-	if not input then
-		return fail("sed", inputErr)
-	end
-	if flags["-i"] and not path then
+	-- Both refusals BEFORE anything is read, so a bad flag combination cannot
+	-- rewrite the first file and only then stop.
+	if flags["-i"] and #files == 0 then
 		return fail("sed", "-i edits a file in place, so it needs a file operand")
 	end
 	-- Real sed would happily truncate a file to a printed range. That is a
@@ -3099,100 +3196,37 @@ HANDLERS.sed = function(self, argv, stdin)
 			"drop one of them")
 	end
 
-	local lines = splitLines(input)
-	local out: { string } = {}
-	local active: { [number]: boolean } = {}
+	local sources, inputErr = inputs(self, files, stdin)
+	if not sources then
+		return fail("sed", inputErr)
+	end
+
 	local quiet = flags["-n"] == true
-
-	for index, line in ipairs(lines) do
-		local text = line
-		local deleted = false
-		local before: { string } = {}
-		local after: { string } = {}
-		local quit = false
-
-		for slot, command in ipairs(commands) do
-			if not sedSelects(command, index, text, #lines, active, slot) then
-				continue
+	local parts: { { path: string?, body: string } } = {}
+	for _, source in ipairs(sources) do
+		local result, applyErr, quit = applySed(commands, splitLines(source.text), quiet)
+		if not result then
+			return fail("sed", applyErr)
+		end
+		if flags["-i"] then
+			-- Through :write, so the substitution lands in one undo record like every
+			-- other mutation rather than being the one edit Ctrl+Z cannot reach.
+			local wrote, writeErr = self:write(source.path, result .. "\n")
+			if not wrote then
+				-- Named, because with several files the caller cannot tell which one
+				-- stopped it from the message alone.
+				return fail("sed", tostring(source.path) .. ": " .. tostring(writeErr))
 			end
-			local name = command.name
-			if name == "s" then
-				local args = command.args
-				-- The pattern compiled at parse time, so a bad one was refused
-				-- before any line ran. What is left to go wrong is the step
-				-- budget, which aborts the whole substitution rather than leaving
-				-- the file half-rewritten.
-				local ok, res, changed = pcall(substitute, args.program, text,
-					args.replacement, args.global, args.occurrence)
-				if not ok then
-					return fail("sed", Regex.isBudget(res)
-						and "that pattern is too expensive to run — anchor it, or replace a " ..
-							"nested quantifier like (a+)+ with a single one"
-						or tostring(res))
-				end
-				text = res
-				-- `p` prints the line only when the substitution actually fired.
-				-- With -n that is the whole output, which is what makes
-				-- `sed -n 's/x/y/p'` mean "show me just the changed lines".
-				if args.print and (changed :: number) > 0 then
-					after[#after + 1] = text
-				end
-			elseif name == "y" then
-				local args = command.args
-				local from = expandTrSet(args.pattern)
-				local to = expandTrSet(args.replacement)
-				if #from ~= #to then
-					return fail("sed", "y/// needs both sets to be the same length")
-				end
-				text = text:gsub(".", function(c)
-					local at = from:find(c, 1, true)
-					return at and to:sub(at, at) or c
-				end)
-			elseif name == "d" then
-				deleted = true
-				break
-			elseif name == "p" then
-				-- Without -n every line prints anyway, so an explicit p doubles it
-				-- which is exactly what `sed p` does.
-				after[#after + 1] = text
-			elseif name == "=" then
-				before[#before + 1] = tostring(index)
-			elseif name == "a" then
-				after[#after + 1] = command.args
-			elseif name == "i" then
-				before[#before + 1] = command.args
-			elseif name == "c" then
-				text = command.args
-			elseif name == "q" then
-				quit = true
-				break
-			end
-		end
-
-		for _, extra in ipairs(before) do
-			out[#out + 1] = extra
-		end
-		if not deleted and not quiet then
-			out[#out + 1] = text
-		end
-		for _, extra in ipairs(after) do
-			out[#out + 1] = extra
+			parts[#parts + 1] = { path = source.path, body = wrote }
+		else
+			parts[#parts + 1] = { path = source.path, body = result }
 		end
 		if quit then
 			break
 		end
 	end
-
-	local result = table.concat(out, "\n")
-
-	-- `sed -i` writes back, which is the whole point of the flag. It goes
-	-- through :write, so the substitution lands in one undo record like every
-	-- other mutation rather than being the one edit Ctrl+Z cannot reach.
-	if flags["-i"] then
-		local s, writeErr = self:write(path, result .. "\n")
-		return s or fail("sed", writeErr)
-	end
-	return result
+	-- -i already names every file it wrote, so a header would say it twice.
+	return joinFiles(parts, nil, flags["-i"])
 end
 
 -- diff
@@ -4200,8 +4234,22 @@ local STDIN_COMMANDS: { [string]: boolean } = {
 
 -- One command, already tokenized. `stdin` is a heredoc body or the previous
 -- stage's output; `> path` sends this command's output to a script instead.
+-- Forward-declared: a `for` loop is a pipeline STAGE, so runCommand has to be
+-- able to reach it, and the loop body runs back through runTokens, which is
+-- defined below both of them.
+local runLoopStage: (any, { string }, boolean?) -> (string, boolean)
+
 local function runCommand(self: any, argv: { string }, readOnly: boolean?, stdin: string?): (string, boolean)
 	failed = false
+	-- Before takeRedirect, which would otherwise steal a `>` out of the loop's
+	-- BODY: `for f in a; do echo $f > out.luau; done` is a redirect per
+	-- iteration, not one on the loop.
+	if argv[1] == "for" then
+		if stdin then
+			return fail("bash", "for: a loop does not read input — pipe its output instead"), false
+		end
+		return runLoopStage(self, argv, readOnly)
+	end
 	local args, redirect, append = takeRedirect(argv)
 	if redirect and readOnly then
 		return fail("bash", "redirection is not available here — /sh is read-only"), false
@@ -4312,25 +4360,77 @@ local function parseStatements(argv: { string }): { Statement }
 		end
 	end
 
-	for _, arg in ipairs(argv) do
-		if SEPARATORS[arg] then
+	local i = 1
+	while i <= #argv do
+		local arg = argv[i]
+		local stage = current.stages[#current.stages]
+		if arg == "for" and #stage == 0 then
+			-- A loop is ONE stage, taken whole. It used to be claimed before the
+			-- split instead, by a parser that only looked at the head of the line,
+			-- which is why `cd x; for f in ...` came back as "a `for` loop has to
+			-- start the command line" — the `;` had already cut the loop into four
+			-- unrunnable pieces. Depth-counted so a nested loop takes its own `done`.
+			local depth = 0
+			while i <= #argv do
+				local token = argv[i]
+				stage[#stage + 1] = token
+				if token == "for" then
+					depth += 1
+				elseif token == "done" then
+					depth -= 1
+					if depth == 0 then
+						break
+					end
+				end
+				i += 1
+			end
+		elseif SEPARATORS[arg] then
 			flush()
 			current = { joiner = arg, stages = { {} } }
 		elseif arg == "|" then
 			current.stages[#current.stages + 1] = {}
 		else
-			local stage = current.stages[#current.stages]
 			stage[#stage + 1] = arg
 		end
+		i += 1
 	end
 	flush()
 	return statements
 end
 
+-- One token, written the way it would have to be written to survive tokenize
+-- again. The echo used to join argv with plain spaces, so `grep -E 'a|b' f`
+-- came back as `grep -E a|b f`: a line that means something else, and reads as
+-- proof that the quotes were eaten before the search ran. They never were — the
+-- tokenizer claims a quoted `|` before the pipeline split can see it, which the
+-- tokenize cases above pin down — but the echo is all an agent has to go on, and
+-- one that misrepresents its own input costs a turn on a workaround for a bug
+-- that is not there. Same class of failure as a silently wrong answer.
+local function requote(token: string): string
+	if token ~= "" and not token:find("[%s'\"\\;|&]") then
+		return token
+	end
+	if not token:find("'") then
+		return "'" .. token .. "'"
+	end
+	-- Both kinds of quote in one token: double, with the four escapes that
+	-- DOUBLE_QUOTE_ESCAPES reads back.
+	return '"' .. token:gsub('[%$"\\`]', "\\%0") .. '"'
+end
+
 local function label(statement: Statement): string
 	local parts: { string } = {}
 	for _, stage in ipairs(statement.stages) do
-		parts[#parts + 1] = table.concat(stage, " ")
+		-- Inside a loop group the `;` tokens are the loop's own punctuation, not
+		-- arguments, so quoting them would echo `do echo $f ';' done`. A QUOTED
+		-- `;` written as an argument inside a loop body is the one case this gets
+		-- wrong, and there is nothing here that takes one.
+		local loop = stage[1] == "for"
+		local rendered: { string } = {}
+		for _, token in ipairs(stage) do
+			rendered[#rendered + 1] = (loop and token == ";") and ";" or requote(token)
+		end
+		parts[#parts + 1] = table.concat(rendered, " ")
 	end
 	return table.concat(parts, " | ")
 end
@@ -4385,8 +4485,8 @@ local function parseLoop(argv: { string }): (Loop?, string?)
 	--     for a in 1 2; do
 	--       for b in x y; do ... ; done
 	--     done
-	-- is not recognised as a loop at all, and comes back as the refusal that says
-	-- a loop has to start the command line.
+	-- is not recognised as a loop at all, and `for` comes back as an unknown
+	-- command with the whole command list printed beside it.
 	local i = 1
 	while argv[i] == ";" do
 		i += 1
@@ -4498,43 +4598,165 @@ local function runLoop(self: any, loop: Loop, readOnly: boolean?, lastOk: boolea
 	return table.concat(outputs, "\n"), ok
 end
 
+-- One loop, as a pipeline stage. `done | wc -l`, `done && echo ok` and
+-- `cd x; for ...` all fall out of that: the statement and pipeline machinery
+-- already knows what to do with a stage, and each of those shapes used to need
+-- its own branch up here, or was refused outright.
+function runLoopStage(self: any, argv: { string }, readOnly: boolean?): (string, boolean)
+	local loop, loopErr = parseLoop(argv)
+	if not loop then
+		return fail("bash", loopErr or ("for: " .. LOOP_SYNTAX)), false
+	end
+	-- parseStatements ends the stage at `done`, so anything still in `rest` was
+	-- written between `done` and the next separator. A redirect there belongs to
+	-- the loop as a whole, which is why it is taken HERE rather than in
+	-- runCommand, where it would have reached into the body.
+	local rest, redirect, append = takeRedirect(loop.rest)
+	if #rest > 0 then
+		return fail("bash", "for: unexpected " .. rest[1] .. " after `done`"), false
+	end
+	if redirect and readOnly then
+		return fail("bash", "redirection is not available here — /sh is read-only"), false
+	end
+
+	local output, ok = runLoop(self, loop, readOnly, true)
+	if redirect == DEV_NULL then
+		return "", ok
+	end
+	if redirect then
+		-- Cleared first: `failed` has been reset and set again by every command the
+		-- body ran, so the only way to hear about a failing write is to ask about
+		-- this one alone.
+		failed = false
+		local written = applyRedirect(self, redirect, output, append)
+		return written, ok and not failed
+	end
+	return output, ok
+end
+
 function runTokens(self: any, argv: { string }, readOnly: boolean?, stdin: string?,
 	lastOk: boolean): (string, boolean)
-	local loop, loopErr = parseLoop(argv)
-	if loopErr then
-		return fail("bash", loopErr), false
+	return runStatements(self, parseStatements(argv), readOnly, stdin, lastOk)
+end
+
+-- Forward-declared: `$(...)` runs a whole line of its own.
+local runLine: (any, string?, boolean?, number) -> (string, boolean)
+
+-- The closing `)` of a `$(`, skipping quoted text and nested parens. A plain
+-- paren count is not enough, and the command that made this necessary is the one
+-- that reported the bug: `$(grep -rl "feintWait(" Weps)` carries an unbalanced
+-- `(` INSIDE quotes, and counting it reads the whole rest of the line as open.
+local function takeSubstitution(line: string, start: number): (string?, number)
+	local depth = 1
+	local quote: string? = nil
+	local i = start
+	while i <= #line do
+		local c = line:sub(i, i)
+		if c == "\\" and quote ~= "'" then
+			i += 2
+			continue
+		end
+		if quote then
+			if c == quote then
+				quote = nil
+			end
+		elseif c == "'" or c == '"' then
+			quote = c
+		elseif c == "(" then
+			depth += 1
+		elseif c == ")" then
+			depth -= 1
+			if depth == 0 then
+				return line:sub(start, i - 1), i + 1
+			end
+		end
+		i += 1
 	end
-	if not loop then
-		return runStatements(self, parseStatements(argv), readOnly, stdin, lastOk)
+	return nil, 0
+end
+
+-- Characters that must not arrive from a substitution, because splicing happens
+-- on the TEXT of the line and tokenize would read them as syntax rather than as
+-- part of a name. bash splices post-parse and has no such problem; refusing is
+-- the honest version of the difference, and the alternative is an instance whose
+-- name contains a `;` quietly becoming two commands.
+local UNQUOTED_RISK = "[;|&'\"\\]"
+local QUOTED_RISK = "[\"\\]"
+
+-- `$(...)`: run the inner line and splice its output in where it stood.
+--
+-- On the RAW line, before tokenize, which is where bash does it too — the result
+-- has to be re-split into words, and the whole reason to have it is
+-- `for f in $(grep -rl Foo)`, one command producing the list the next consumes.
+-- Without it that line did not fail: it iterated ONCE, over the literal text
+-- `$(grep`, which is the silent kind of wrong.
+--
+-- Quoting is bash's. Single quotes suppress it; double quotes do not, and inside
+-- them the output is spliced whole, so `"$(...)"` stays one word — outside,
+-- whitespace collapses to single spaces so tokenize word-splits it instead of
+-- reading each output LINE as a new command.
+--
+-- ponytail: no `${VAR}`, no arithmetic, no backticks, and no expansion inside a
+-- heredoc body, which is lifted out before this runs and is meant to be literal
+-- text. Ceiling: MAX_SUBSTITUTION_DEPTH levels of shell-in-a-string; `run` is
+-- the upgrade path past it.
+local MAX_SUBSTITUTION_DEPTH = 4
+
+local function expandSubstitutions(self: any, line: string, readOnly: boolean?,
+	depth: number): (string?, string?)
+	if not line:find("$(", 1, true) then
+		return line, nil
+	end
+	if depth >= MAX_SUBSTITUTION_DEPTH then
+		return nil, string.format("`$(...)` nested more than %d deep", MAX_SUBSTITUTION_DEPTH)
 	end
 
-	-- `done | wc -l`: the loop is the first stage of a pipeline. Refused rather
-	-- than approximated past one pipeline, because the near miss is `wc` running
-	-- with no input at all and reporting 0, which reads as an empty result rather
-	-- than as a shape this shell does not parse.
-	--
-	-- Checked BEFORE the loop runs. A refusal issued afterwards would already
-	-- have made every write the body asked for.
-	local after = parseStatements(loop.rest)
-	local piped = loop.rest[1] == "|"
-	if piped and #after ~= 1 then
-		return fail("bash", "for: a loop can feed one pipeline and nothing after it — " ..
-			"run the rest as its own command"), false
+	local out: { string } = {}
+	local quote: string? = nil
+	local i = 1
+	while i <= #line do
+		local c = line:sub(i, i)
+		if c == "\\" and quote ~= "'" then
+			out[#out + 1] = line:sub(i, i + 1)
+			i += 2
+		elseif quote ~= "'" and c == "$" and line:sub(i + 1, i + 1) == "(" then
+			local inner, after = takeSubstitution(line, i + 2)
+			if not inner then
+				return nil, "unclosed `$(`"
+			end
+			local text, ok = runLine(self, inner, readOnly, depth + 1)
+			if not ok then
+				-- Splicing a refusal in as words is how `for f in $(grep ...)` would
+				-- come to iterate over the words of an error message.
+				return nil, string.format("`$(%s)` failed — %s", inner, text)
+			end
+			local risk = quote == nil and UNQUOTED_RISK or QUOTED_RISK
+			if text:find(risk) then
+				return nil, string.format("`$(%s)` produced text containing shell " ..
+					"punctuation, which cannot be spliced into a command line — " ..
+					"narrow it, or run the two commands separately", inner)
+			end
+			if quote == nil then
+				text = text:gsub("%s+", " "):match("^%s*(.-)%s*$") :: string
+			end
+			out[#out + 1] = text
+			i = after
+		elseif quote then
+			if c == quote then
+				quote = nil
+			end
+			out[#out + 1] = c
+			i += 1
+		elseif c == "'" or c == '"' then
+			quote = c
+			out[#out + 1] = c
+			i += 1
+		else
+			out[#out + 1] = c
+			i += 1
+		end
 	end
-
-	local output, ok = runLoop(self, loop, readOnly, lastOk)
-	if #loop.rest == 0 then
-		return output, ok
-	end
-	if piped then
-		return runPipeline(self, after[1].stages, readOnly, output)
-	end
-	-- `done && echo ok` reads the loop's result, which is why runStatements takes
-	-- a seed rather than starting at true.
-	local tail, tailOk = runStatements(self, after, readOnly, stdin, ok)
-	if output == "" then return tail, tailOk end
-	if tail == "" then return output, tailOk end
-	return output .. "\n" .. tail, tailOk
+	return table.concat(out), nil
 end
 
 -- Run a `bash` line. Split out from dispatch so the tokenizer and the command
@@ -4543,9 +4765,16 @@ end
 -- `readOnly` is for /sh, where the human types the line directly and mutations
 -- should stay Claude's, every write it makes carries an undo recording.
 function Shell.run(self: any, line: string?, readOnly: boolean?): string
+	local output = runLine(self, line, readOnly, 0)
+	return output
+end
+
+-- The body of Shell.run, plus the recursion depth `$(...)` needs, and the exit
+-- status it needs to refuse splicing the text of a failure.
+function runLine(self: any, line: string?, readOnly: boolean?, depth: number): (string, boolean)
 	local commandLine, stdin, heredocErr = extractHeredoc(line or "")
 	if heredocErr then
-		return "bash: " .. heredocErr
+		return "bash: " .. heredocErr, false
 	end
 
 	-- There is no stderr here, errors come back as ordinary output, so the
@@ -4564,19 +4793,23 @@ function Shell.run(self: any, line: string?, readOnly: boolean?): string
 		:gsub("%d?>&%-", " ")       -- 2>&-  close stderr
 		:gsub("%d?>&%d", " ")       -- 2>&1, 1>&2, >&2
 
-	local argv, tokenErr, quoted = tokenize(commandLine)
+	local expanded, subErr = expandSubstitutions(self, commandLine, readOnly, depth)
+	if not expanded then
+		return "bash: " .. tostring(subErr), false
+	end
+
+	local argv, tokenErr, quoted = tokenize(expanded)
 	if not argv then
-		return "bash: " .. tostring(tokenErr)
+		return "bash: " .. tostring(tokenErr), false
 	end
 	for index, arg in ipairs(argv) do
 		if METACHARACTERS[arg] and not quoted[index] then
 			return string.format("bash: %s is not supported — no input redirection or " ..
-				"backgrounding. `|` pipes, `;` `&&` `||` chain, `>` writes to a script.", arg)
+				"backgrounding. `|` pipes, `;` `&&` `||` chain, `>` writes to a script.", arg), false
 		end
 	end
 
-	local output = runTokens(self, argv, readOnly, stdin, true)
-	return output
+	return runTokens(self, argv, readOnly, stdin, true)
 end
 
 -- Self-test
@@ -4956,6 +5189,14 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		{ line = "grep -q alpha Sample.luau", want = "", why = "grep -q prints nothing" },
 		{ line = "grep -h alpha Sample.luau", want = "1: alpha", why = "grep -h drops the path" },
 
+		-- With several statements the echo is a RECONSTRUCTION from argv, so it has
+		-- to put the quoting back. Joined with plain spaces it printed `grep -E
+		-- alpha|beta`, and that echo — not the search, which ran correctly — is
+		-- what two separate bug reports read as the shell eating quotes.
+		{ line = "echo one; grep -c -E 'alpha|beta' Sample.luau",
+		  want = "$ echo one\none\n$ grep -c -E 'alpha|beta' Sample.luau\n2",
+		  why = "the echo re-quotes what tokenize took apart" },
+
 		-- cat display flags.
 		{ line = "cat -n Cased.luau", want = "     1\tHumanoid\n     2\thumanoid",
 		  why = "cat -n numbers lines" },
@@ -4992,6 +5233,12 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		{ line = "sed '1d;$d' Sample.luau", want = "beta\ngamma\ndelta",
 		  why = "one -e can carry several commands" },
 		{ line = "sed 'y/ae/AE/' Cased.luau", want = "HumAnoid\nhumAnoid", why = "sed y transliterates" },
+		-- Every operand, not just the first. sed read operands[1] and dropped the
+		-- rest, so `sed -i` over a list of files rewrote one, said nothing about
+		-- the others, and returned a success message.
+		{ line = "sed -n '1p' Sample.luau Cased.luau",
+		  want = "==> /Sample <==\nalpha\n\n==> /Cased <==\nHumanoid",
+		  why = "sed reads every operand, with headers" },
 		-- sed's replacement syntax is sed's, not Lua's: \1 for a group and & for
 		-- the whole match. `%1` was the old dialect and is now just two characters.
 		{ line = "sed -E 's/(al)(pha)/\\2\\1/' Sample.luau",
@@ -5080,6 +5327,25 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		  why = "${f} substitutes and $ff is left alone" },
 		{ line = "for a in 1 2; do for b in x y; do echo $a$b; done; done",
 		  want = "1x\n1y\n2x\n2y", why = "loops nest, and the inner done is the inner loop's" },
+		-- A loop is a pipeline STAGE now, so it composes like any other command:
+		-- after a `;`, after `&&`, feeding a pipe with more statements behind it.
+		-- All three used to be refusals, and `cd x; for f in ...` is the one that
+		-- reported it — the loop was claimed before statements were split, so the
+		-- only place it could appear was the head of the line.
+		{ line = "echo one; for f in a b; do echo $f; done",
+		  want = "$ echo one\none\n$ for f in a b ; do echo $f ; done\na\nb",
+		  why = "a loop can follow a `;`" },
+		{ line = "for f in a b; do echo $f; done | wc -l; echo tail",
+		  want = "$ for f in a b ; do echo $f ; done | wc -l\n2\n$ echo tail\ntail",
+		  why = "a loop feeds a pipeline with statements after it" },
+		-- `$(...)`. Without it this line did not fail: the word list was the single
+		-- literal token `$(echo`, so the loop ran once over text nobody wrote.
+		{ line = "for f in $(echo Sample.luau); do wc -l $f; done", want = "5",
+		  why = "$(...) produces the loop's word list" },
+		{ line = "echo \"[$(echo a b)]\"", want = "[a b]",
+		  why = "a quoted $(...) is spliced whole and stays one word" },
+		{ line = "echo '$(echo a)'", want = "$(echo a)",
+		  why = "single quotes suppress $(...), as in bash" },
 
 		{ line = "head -0 Sample.luau", want = "", why = "head -0 is a count, not a path" },
 		{ line = "tail -0 Sample.luau", want = "", why = "tail -0 is a count, not a path" },
@@ -5157,10 +5423,11 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			{ line = "for f in a; do echo $f", want = "missing `done`" },
 			{ line = "for f in a done", want = "expected `do`" },
 			{ line = "while true; do echo hi; done", want = "zero times or forever" },
-			{ line = "ls; for f in a; do echo $f; done", want = "start the command line" },
-			-- A loop feeds ONE pipeline. Anything after it would silently run the
-			-- pipe stage with no input, which reports 0 rather than a refusal.
-			{ line = "for f in a b; do echo $f; done | wc -l; ls", want = "one pipeline" },
+			-- A `$(...)` whose command failed must not be spliced. Its output is an
+			-- error message, and splicing it is how `for f in $(grep ...)` comes to
+			-- iterate over the words of a refusal.
+			{ line = "echo $(cat /nope)", want = "failed" },
+			{ line = "echo $(echo a", want = "unclosed" },
 			{ line = "grep zzz Cased.luau", want = "no matches" },
 			-- The case-sensitivity change has exactly one regression shape: a
 			-- search that used to work now finds nothing. It has to say so.

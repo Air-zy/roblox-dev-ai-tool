@@ -55,13 +55,15 @@ main.lua                        window, toolbar, popups, usage panel
 | one result capped / a turn's batch capped | `Agent.lua:140` `forModel`, `:168` `capTurn` |
 | open-editor hint on each message | `Agent.lua:1057` `editorContext` — `""` when nothing is open; capped by `MAX_OPEN_DOCS:1046`/`MAX_OPEN_CHARS:1055` |
 | login | `providers/AnthropicAuth.lua:219` `startLogin` -> `:262` `completeLogin`; refresh `:342`, used by `getAccessToken:406` |
-| a shell line runs | `Shell.lua:4486` `Shell.run` -> `runTokens:4417` -> `runStatements:4294` -> `runCommand:4156`; entered from `Terminal:shell:761` |
+| a shell line runs | `Shell.lua:4762` `Shell.run` -> `runLine:4770` -> `runTokens:4632` -> `runStatements:4436` -> `runCommand:4237`; entered from `Terminal:shell:761` |
 | a line becomes tokens | `Shell.lua:86` `tokenize` |
-| flags parsed / refused | `Shell.lua:230` `partition` against `SPECS:578` |
-| the command table | `Shell.lua:942` `HANDLERS` |
-| `for` loops | `Shell.lua:4334` `parseLoop`, `:4419` `runLoop`, `:4402` `expandVar` |
-| the list `/help` prints | `Shell.lua:4114` `Shell.COMMANDS` |
-| heredocs / redirection | `Shell.lua:407` `extractHeredoc`, `:467` `takeRedirect`, `:542` `applyRedirect` |
+| flags parsed / refused | `Shell.lua:230` `partition` against `SPECS:574` |
+| the command table | `Shell.lua:933` `HANDLERS` |
+| `for` loops | `Shell.lua:4476` `parseLoop`, `:4573` `runLoop`, `:4556` `expandVar`; grouped into ONE pipeline stage by `parseStatements:4341`, run from `runLoopStage:4600` |
+| the list `/help` prints | `Shell.lua:4190` `Shell.COMMANDS` |
+| `$(...)` | `Shell.lua:4700` `expandSubstitutions`, `:4644` `takeSubstitution` — on the raw line, before `tokenize` |
+| the `$ cmd` echo of a multi-command line | `Shell.lua:4416` `label`, quoting via `requote:4404` |
+| heredocs / redirection | `Shell.lua:407` `extractHeredoc`, `:467` `takeRedirect`, `:538` `applyRedirect` |
 | diff | `Shell.lua:3306` `diffOne`, handler at `:3366` |
 | a path becomes an instance | `Fs.lua:304` `Fs.resolve` — also `.luau` suffixes and root case-folding |
 | an instance becomes a path | `Fs.lua:265` `instancePath` |
@@ -95,7 +97,7 @@ main.lua                        window, toolbar, popups, usage panel
 
 | File | Lines | Owns |
 |---|---:|---|
-| `fs/Shell.lua` | 5557 | The command line. Still the biggest — see below. |
+| `fs/Shell.lua` | 5819 | The command line. Still the biggest — see below. |
 | `agent/Agent.lua` | 1354 | Turn loop, conversation state, trimming, stop. |
 | `ui/Console.lua` | 1355 | Bubbles, thinking drawers, tool-call blocks, the detached sink. |
 | `text/Regex.lua` | 958 | BRE/ERE engine. Requires nothing. |
@@ -124,13 +126,13 @@ main.lua                        window, toolbar, popups, usage panel
 | Lines | Region |
 |---:|---|
 | 1-63 | header, requires, aliases |
-| 64-941 | parsing: `tokenize:86`, `partition:230`, `extractHeredoc:407`, `takeRedirect:467`, `SPECS:578` |
-| 942-3352 | HANDLERS — 33 commands + private helpers |
-| 3353-4162 | diff core, the last handlers, curl/wget, `Shell.COMMANDS:4161` |
-| 4163-4363 | pipelines and statements, `runCommand:4203`, `runStatements:4341` |
-| 4364-4544 | loops: `parseLoop:4381`, `expandVar:4461`, `runLoop:4478`, `runTokens:4501` |
-| 4545-4585 | `Shell.run:4545` |
-| 4586-end | `Shell.selfTest:4586` |
+| 64-932 | parsing: `tokenize:86`, `partition:230`, `extractHeredoc:407`, `takeRedirect:467`, `SPECS:574` |
+| 933-3352 | HANDLERS — 33 commands + private helpers |
+| 3353-4190 | diff core, the last handlers, curl/wget, `Shell.COMMANDS:4190` |
+| 4191-4435 | pipelines and statements: `runCommand:4237`, `parseStatements:4341`, `requote:4404`, `label:4416` |
+| 4436-4636 | statements and loops: `runStatements:4436`, `parseLoop:4476`, `expandVar:4556`, `runLoop:4573`, `runLoopStage:4600`, `runTokens:4632` |
+| 4637-4813 | `$(...)`: `takeSubstitution:4644`, `expandSubstitutions:4700`; `Shell.run:4762` -> `runLine:4770` |
+| 4814-end | `Shell.selfTest:4814` |
 
 `tokenize`/`partition` and the diff core are pure text and are the next
 extractions; `HANDLERS` is not (below).

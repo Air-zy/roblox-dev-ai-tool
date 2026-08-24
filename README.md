@@ -73,9 +73,11 @@ word would hand you the markup around it.
 
 ## Tools
 
-bash runs a command line with pipes, ; && ||, redirects, heredocs, globs and
-`for f in <words>; do ... ; done`. There is no `while`: nothing here changes
-between two iterations, so it would run zero times or forever.
+bash runs a command line with pipes, ; && ||, redirects, heredocs, globs,
+`$(...)` and `for f in <words>; do ... ; done`. A loop is a pipeline stage like
+any other command, so it can follow a `;`, sit behind `&&`, or feed a pipe with
+more statements after it. There is no `while`: nothing here changes between two
+iterations, so it would run zero times or forever.
 edit and multiedit swap unique substrings, write replaces a whole .Source
 (creating the script if it is missing), run executes Luau, and catalog searches
 and loads free models. run is off by default since it runs at plugin permission
@@ -176,9 +178,17 @@ count. Modification time has no property behind it at all, so it is observed:
 edits this plugin makes, edits you make in the Script Editor, and anything
 parented after we loaded. Everything else reads "-" under ls -t and sorts last.
 
-It is not a real shell. No variables, control flow or command substitution. When
-something needs real composition it should use run instead of growing a language
-inside Shell.
+Composition is `|`, `;`, `&&`, `||`, `>`/`>>`, heredocs, `for f in WORDS; do
+... ; done` and `$(...)`. A loop is a pipeline stage like any other command, so
+`cd x; for ...` and `done | wc -l; ls` are ordinary lines rather than special
+cases. `$(...)` runs its inner line and splices the output in as words, with
+bash's quoting rules — single quotes suppress it, double quotes keep the result
+one word. Output carrying `; | & ' " \` is refused rather than spliced, because
+splicing happens on the text of the line and tokenize would read those as syntax.
+
+There are still no variables beyond a loop's own, no arithmetic and no
+backticks. HOWEVER we will try to make this a real shell harness (so all args and
+commands possible) for the roblox data model.
 
 ## Layout
 
@@ -197,7 +207,7 @@ main/
   fs/
     Fs.lua        paths, .Source access, undo, globs
     Terminal.lua  the commands themselves
-    Shell.lua     tokenizer, pipes, redirection, heredocs, for loops
+    Shell.lua     tokenizer, pipes, redirection, heredocs, for loops, $(...)
   studio/
     Props.lua     property names and defaults
     Exec.lua      runs Luau                (run tool only)
