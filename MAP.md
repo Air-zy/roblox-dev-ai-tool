@@ -15,9 +15,15 @@ main.lua                        window, toolbar, popups, usage panel
   Commands                      slash commands
     ui/Sessions                 session list, save/load/restore
       agent/Agent               the turn loop
-        agent/Provider          which provider is live
-          providers/Anthropic       one request, SSE back
+        agent/Provider          which provider is live; the picker
+          providers/Stream          one streaming request, retried, cancellable
+          providers/Retry           when to come back, and how long to wait
+          providers/ToolJson        decoding arguments the model wrote
+          providers/Pkce            verifier, challenge, state
+          providers/Anthropic       Messages API; one request, SSE back
           providers/AnthropicAuth   PKCE, refresh, usage
+          providers/OpenRouter      chat/completions; translation both ways
+          providers/OpenRouterAuth  PKCE (no refresh: the key is the credential)
         agent/Tools             registry; tools/ is one file per tool
     ui/Console -> ui/Markdown -> ui/Theme
     ui/Find                     search the open conversation
@@ -36,25 +42,31 @@ main.lua                        window, toolbar, popups, usage panel
 
 | Question | Answer |
 |---|---|
-| the system prompt is built | `providers/Anthropic.lua:455` `systemBlocks` — identity first, user block if non-empty, cache_control on the last |
+| the system prompt is built | `providers/Anthropic.lua:305` `systemBlocks` — identity first, user block if non-empty, cache_control on the last. OpenRouter has no identity block and builds a plain system message in `toChatMessages:273` |
 | the user's system prompt is stored | `Settings.lua:85` `Settings.system()`, default `DEFAULT_SYSTEM:35` (one line, edit-mode framing) |
-| a request is assembled | `providers/Anthropic.lua:410` `streamMessage` -> `applyReasoning:251` -> tools+cache -> `withMessageCache:302` |
-| a response is parsed | `providers/Anthropic.lua:590` `processSSEEvents` |
-| a tool call's arguments are decoded | `providers/Anthropic.lua:380` `decodeToolInput` — strict first, then `escapeControlChars:358` for a raw newline the model owed a `\n` |
-| effort / thinking / the output ceiling | `providers/Anthropic.lua:251` `applyReasoning` against `MODEL_CAPS:76`; the ceiling is `maxOutput` on the same table. `Settings` picks a level and nothing else — no per-effort token maths lives there |
-| which provider is live | `agent/Provider.lua` — `wire` and `auth`; nothing outside `providers/` names a vendor |
-| the turn loop | `Agent.lua:513` `runTurn` |
-| Stop | `Agent.lua:631` `stopCurrent`, reached through `Agent.stop`. The queued continuation re-checks `cancelRequested` after its wait (`continueTurn:612`), and `committed:591` is what keeps Stop from rolling back a turn already in the history |
-| a turn's result is handled | `Agent.lua:751` `onComplete` -> assemble -> dispatch tools -> `continueTurn:590` |
-| the user hits enter | `main.lua:833` `submit` -> `Commands.handle:184` -> `Agent.send:1102` |
+| a request is assembled | `providers/Anthropic.lua:259` `streamMessage` -> `applyReasoning:160` -> tools+cache -> `withMessageCache:211`. OpenRouter: `streamMessage:396` -> `toChatMessages:273` + `toChatTools:370` |
+| a response is parsed | `providers/Anthropic.lua:~420` `onFrame`, dispatching on the SSE `event:` name. OpenRouter: `OpenRouter.lua:599` `onFrame`, which has no `event:` lines at all — every frame is a `data:` chunk |
+| the socket, the retries, the latches | `providers/Stream.lua:56` `Stream.open` — `fail:135` is the one decision point, `processFrames:240` splits frames, `start:255` opens each attempt. There is exactly ONE copy of this; providers supply a request and read frames |
+| when a failure is worth retrying | `providers/Retry.lua` — `isRetryable`, `isOverload`, `delay`, `retryAfterSeconds`. Header names stay with the provider that spells them |
+| a tool call's arguments are decoded | `providers/ToolJson.lua:57` `ToolJson.decode` — strict first, then `escapeControlChars:34` for a raw newline the model owed a `\n`. Shared: the failure is the model's, not the wire's |
+| effort / thinking / the output ceiling | `providers/Anthropic.lua:160` `applyReasoning` against `MODEL_CAPS:80`; the ceiling is `maxOutput` on the same table. OpenRouter sends `reasoning.effort` and NO `max_tokens` — the model's own ceiling is the right default across several hundred models. `Settings` picks a level and nothing else |
+| Anthropic blocks <-> OpenAI messages | `providers/OpenRouter.lua:273` `toChatMessages` out, `:599` `onFrame` back. The internal conversation is Anthropic-shaped; OpenRouter converts at its own edge so Agent, Sessions and Find never learn a second shape |
+| a thinking block's signature, on OpenRouter | a JSON envelope holding `reasoning_details` (or plain reasoning text). Written in `assemble` inside `streamMessage`, read back by `reasoningFrom:263`. Opaque to everything else, which is what the signature contract already said |
+| which provider is live | `agent/Provider.lua` — `REGISTRY:20`, `use:64`, `list:47`. Read `Provider.wire.x` AT THE POINT OF USE: the pair is replaced on a switch, and a `local Wire = Provider.wire` would keep talking to the old one |
+| the free model list | `providers/OpenRouter.lua:160` `refreshModels` — fetched, filtered to free AND tool-capable, cached in plugin settings for a day. The seed list at `:77` is only a fallback |
+| the turn loop | `Agent.lua:510` `runTurn` |
+| Stop | `Agent.lua:~628` `stopCurrent`, reached through `Agent.stop`. The queued continuation re-checks `cancelRequested` after its wait (`continueTurn:618`), and `committed:592` is what keeps Stop from rolling back a turn already in the history |
+| a turn's result is handled | `Agent.lua:782` `onComplete` -> assemble -> dispatch tools -> `continueTurn:618` |
+| the user hits enter | `main.lua:839` `submit` -> `Commands.handle:236` -> `Agent.send:1134` |
 | a tool runs | `Tools.lua:106` `dispatch` — never throws |
-| tool definitions on the wire | `Tools.lua:78` `definitions` + `Agent.lua:219` `buildTools` |
-| model / thinking / effort / search per model | `providers/Anthropic.lua:76` `MODEL_CAPS`; UI list at `:224` |
-| beta headers | `providers/Anthropic.lua:49` — read the comment before adding one |
-| history trimming | `Agent.lua:451` `clearOldToolResults`, gated by `cacheIsCold:395` |
-| one result capped / a turn's batch capped | `Agent.lua:140` `forModel`, `:168` `capTurn` |
-| open-editor hint on each message | `Agent.lua:1057` `editorContext` — `""` when nothing is open; capped by `MAX_OPEN_DOCS:1046`/`MAX_OPEN_CHARS:1055` |
-| login | `providers/AnthropicAuth.lua:219` `startLogin` -> `:262` `completeLogin`; refresh `:342`, used by `getAccessToken:406` |
+| tool definitions on the wire | `Tools.lua:78` `definitions` + `Agent.lua:218` `buildTools` |
+| model / thinking / effort / search per model | `providers/Anthropic.lua:80` `MODEL_CAPS`; UI list at `:125`. OpenRouter has neither: no caps table, and its list is fetched |
+| beta headers | `providers/Anthropic.lua:53` — read the comment before adding one |
+| history trimming | `Agent.lua:448` `clearOldToolResults`, gated by `cacheIsCold:~392` |
+| one result capped / a turn's batch capped | `Agent.lua:139` `forModel`, `:167` `capTurn` |
+| open-editor hint on each message | `Agent.lua:1098` `editorContext` — `""` when nothing is open; capped by `MAX_OPEN_DOCS`/`MAX_OPEN_CHARS` just above it |
+| login | `providers/AnthropicAuth.lua:~160` `startLogin` -> `completeLogin`; refresh, used by `getAccessToken`. OpenRouter: `OpenRouterAuth.lua:69` `startLogin` -> `:88` `completeLogin`, which also accepts a pasted `sk-or-` key. No refresh there — the credential is a key and does not expire |
+| the usage rows in Settings | each `auth.fetchUsage()` returns rows ALREADY FORMATTED (`{label, value, bar?}`). Anthropic reports two rolling utilisation windows, OpenRouter reports credits and the free request cap; `main.lua` `usageRows` just draws whatever it is handed |
 | a shell line runs | `Shell.lua:4762` `Shell.run` -> `runLine:4770` -> `runTokens:4632` -> `runStatements:4436` -> `runCommand:4237`; entered from `Terminal:shell:761` |
 | a line becomes tokens | `Shell.lua:86` `tokenize` |
 | flags parsed / refused | `Shell.lua:230` `partition` against `SPECS:574` |
@@ -81,7 +93,8 @@ main.lua                        window, toolbar, popups, usage panel
 | regex compiled / matched | `text/Regex.lua:772` `compile`, `:743` `Program:find` |
 | sed parsed / applied | `text/Sed.lua:195` `parseSedCommand`, `:102` `substitute` |
 | property names / defaults | `studio/Props.lua:90` `names`, `:137` `default` |
-| sessions | `Sessions.lua:172` `save`, `:380` `load`, `:484` `restoreLast` |
+| sessions | `Sessions.lua:172` `save`, `:396` `load`, `:516` `restoreLast` |
+| a session is bound to its provider | stamped on the index Entry in `save`, checked in `load:396`, filtered in `restoreLast:516`. Missing means Claude, so nothing written before this needs migrating. A cross-provider restore is refused: thinking signatures are only readable by the provider that issued them |
 | another session is read mid-turn | `Sessions.lua:388` the peek branch of `load` — no `Agent.restore`, `currentId` never moves. Parked blocks in `previewHolder:239`, put back by `endPeek:259` or dropped by `dropPeek:250` |
 | where a new console block is parented | `Console.lua:32` `sink` — `output` normally, a detached holder during a peek. `detach:273` / `reattach:285` / `discard:302`, and `onScreen:307` for anything the reader asked to see |
 | a block gets its LayoutOrder | `Console.lua:42` `takeOrder` — a counter, never a child count. The holder a peek detaches holds three fewer children than the frame it came from, so counting numbered a block below ones already on screen |
@@ -97,28 +110,34 @@ main.lua                        window, toolbar, popups, usage panel
 
 | File | Lines | Owns |
 |---|---:|---|
-| `fs/Shell.lua` | 5819 | The command line. Still the biggest — see below. |
-| `agent/Agent.lua` | 1354 | Turn loop, conversation state, trimming, stop. |
+| `fs/Shell.lua` | 5824 | The command line. Still the biggest — see below. |
+| `agent/Agent.lua` | 1352 | Turn loop, conversation state, trimming, stop. |
 | `ui/Console.lua` | 1355 | Bubbles, thinking drawers, tool-call blocks, the detached sink. |
-| `text/Regex.lua` | 958 | BRE/ERE engine. Requires nothing. |
-| `main.lua` | 1009 | Widget, toolbar, popups. Owns `plugin`, hands it to Provider / Sessions / Settings — the only four that touch it. |
+| `text/Regex.lua` | 957 | BRE/ERE engine. Requires nothing. |
+| `main.lua` | 1005 | Widget, toolbar, popups. Owns `plugin`, hands it to Provider / Sessions / Settings — the only four that touch it. |
 | `fs/Terminal.lua` | 811 | Commands as tree operations. No parsing. |
 | `fs/Fs.lua` | 791 | Paths, `.Source`, undo, mtime, globs, mode bits. |
-| `agent/providers/Anthropic.lua` | 1278 | One request. Knows nothing about turns. |
-| `ui/Sessions.lua` | 855 | Session list, filter, peek and persistence. |
-| `ui/Settings.lua` | 578 | Preferences + panel. |
-| `studio/Exec.lua` | 565 | Luau execution. Tool-only. |
-| `agent/providers/AnthropicAuth.lua` | 514 | PKCE login, refresh, usage. |
-| `studio/Catalog.lua` | 402 | Free model search / insert. Tool-only. |
+| `agent/providers/OpenRouter.lua` | 842 | chat/completions, and the translation both ways. |
+| `agent/providers/Anthropic.lua` | 824 | One request. Knows nothing about turns. |
+| `agent/providers/Stream.lua` | 391 | The socket, the retries, the latches. One copy. |
+| `ui/Sessions.lua` | 888 | Session list, filter, peek and persistence. |
+| `ui/Settings.lua` | 603 | Preferences + panel. |
+| `studio/Exec.lua` | 564 | Luau execution. Tool-only. |
+| `agent/providers/AnthropicAuth.lua` | 507 | PKCE login, refresh, usage rows. |
+| `agent/providers/OpenRouterAuth.lua` | 273 | PKCE login, or a pasted key. Credits. |
+| `agent/providers/Retry.lua` | 229 | What is worth retrying, and how long to wait. |
+| `agent/providers/ToolJson.lua` | 103 | Decoding arguments the model wrote. |
+| `agent/providers/Pkce.lua` | 70 | verifier / challenge / state. |
+| `studio/Catalog.lua` | 401 | Free model search / insert. Tool-only. |
 | `ui/Find.lua` | 423 | Conversation search + the find panel. |
 | `ui/Markdown.lua` | 346 | Markdown to labels. |
-| `text/Sed.lua` | 330 | sed engine. Pure text. |
-| `main/Commands.lua` | 205 | Slash commands. |
-| `studio/Props.lua` | 201 | API dump. The only network I/O in fs. |
-| `util/Sha256.lua` | 170 | For PKCE. |
-| `agent/Tools.lua` | 119 | Registry + dispatch. |
-| `ui/Theme.lua` | 91 | Colours and `make`. |
-| `agent/Provider.lua` | 23 | The active provider. |
+| `text/Sed.lua` | 329 | sed engine. Pure text. |
+| `main/Commands.lua` | 256 | Slash commands. |
+| `studio/Props.lua` | 200 | API dump. The only network I/O in fs. |
+| `util/Sha256.lua` | 181 | For PKCE. |
+| `agent/Tools.lua` | 118 | Registry + dispatch. |
+| `ui/Theme.lua` | 99 | Colours and `make`. |
+| `agent/Provider.lua` | 115 | The active provider, the registry, and the switch. |
 | `agent/tools/*.lua` | 17-50 | One per tool. |
 
 ## Inside Shell.lua
@@ -157,12 +176,15 @@ Refactor steps not yet done.
 
 | # | Step |
 |---|---|
-| 2 | move `onComplete` block assembly + `clearOldToolResults` from Agent into the provider |
-| 3 | neutral tool schema in `Tools.lua`; provider maps to `input_schema` |
-| 4 | `Settings` asks `Provider` for the model list rather than reaching into `wire` |
-| 5 | record provider on a session, refuse cross-provider restore |
+| 2 | move `onComplete` block assembly + `clearOldToolResults` from Agent into the provider. Still open, and now clearly worth it: `Agent.lua:~820` still walks Anthropic block types by name, which is why OpenRouter has to speak that shape |
+| 3 | neutral tool schema in `Tools.lua`; provider maps to `input_schema`. Half-done by accident — `OpenRouter.toChatTools:370` already maps it, so `Tools.definitions` is the only thing still emitting Anthropic's spelling |
 | 6 | extract `Diff` and `Argv` from Shell into `text/` |
 | 8 | rename `Terminal:run` -> `Terminal:exec` (`Shell.run` already means a command line) |
+
+Done since this list was written: **4** (`Settings` no longer reaches into
+`wire` for anything but `DEFAULT_MODEL` and `acceptsModelId`, both of which are
+provider API rather than internals) and **5** (sessions carry their provider and
+refuse a cross-provider restore).
 
 `HANDLERS` does not split: its 33 commands share a dozen file-local helpers, so
 grouping them means threading a context table through every signature or copying

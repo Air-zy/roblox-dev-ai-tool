@@ -3,24 +3,27 @@
 --
 -- State lives in plugin:SetSetting, so it survives Studio restarts.
 --
--- EFFORT is a real, first-class Anthropic parameter: output_config.effort, with
--- levels low | medium | high | xhigh | max. It governs total token spend for the
--- whole response, prose, tool calls, and thinking alike, and needs no beta
--- header on current models. "high" is the API default.
+-- EFFORT is a real, first-class parameter on both providers, spelled
+-- differently by each — Anthropic takes output_config.effort, OpenRouter takes
+-- reasoning.effort — and carrying the same five levels either way. It governs
+-- total token spend for the whole response: prose, tool calls, and thinking
+-- alike. "high" is the API default.
 --
 -- The level is stored globally and always kept, the way /effort does it in
 -- Claude Code, which never asks whether the model supports the parameter. The
--- gate is at send time: Wire.luau drops it for a model that does not take one,
--- so picking Haiku 4.5 makes the setting do nothing and switching back makes it
--- matter again. Nothing is substituted in the meantime — budget_tokens is not an
--- effort dial.
+-- gate is at send time: the provider drops it for a model that does not take
+-- one, so picking such a model makes the setting do nothing and switching back
+-- makes it matter again. Nothing is substituted in the meantime — a thinking
+-- budget is not an effort dial.
+--
+-- MODEL is stored per provider. An id belongs to exactly one of them, so one
+-- shared slot would hand OpenRouter a Claude id the moment you switched.
 
 local Theme = require(script.Parent:WaitForChild("Theme"))
 -- Reaches into agent/ for the model list only. Settings is the one module that
 -- is genuinely half UI and half configuration; if it ever splits, the prefs half
 -- is what belongs next to the agent.
 local Provider = require(script.Parent.Parent:WaitForChild("agent"):WaitForChild("Provider"))
-local Wire = Provider.wire
 
 local make = Theme.make
 
@@ -54,7 +57,9 @@ Settings.EFFORT_LEVELS = EFFORT_LEVELS
 
 local pluginRef: Plugin = nil :: any
 local state = {
-	model = Wire.DEFAULT_MODEL,
+	-- Resolved in Initialize, not here: main.luau requires this module before it
+	-- calls Provider.Initialize, so there is no wire to ask yet.
+	model = "",
 	effort = 3,  -- High, matching the API default
 	system = DEFAULT_SYSTEM,
 	-- Off by default and deliberately not remembered as "on" by accident:
@@ -66,12 +71,33 @@ local state = {
 	webSearch = 0,
 }
 
+-- One slot per provider. Bare `cc_model` was the slot when there was only one.
+local function modelKey(): string
+	return KEY_MODEL .. "_" .. Provider.id
+end
+
+-- Loads the model belonging to whichever provider is active now. Called at
+-- startup and again after a switch, because a stored id is only meaningful to
+-- the provider that stored it.
+function Settings.reloadModel()
+	local saved = pluginRef and pluginRef:GetSetting(modelKey())
+	-- One-time migration: the choice used to live under a single global key,
+	-- from when Claude was the only provider. Read it so an existing install
+	-- does not silently reset to the default on first launch after this.
+	if (type(saved) ~= "string" or saved == "") and Provider.id == "anthropic" then
+		saved = pluginRef and pluginRef:GetSetting(KEY_MODEL)
+	end
+	local wire = Provider.wire
+	local usable = type(saved) == "string" and saved ~= ""
+		and (wire.acceptsModelId == nil or wire.acceptsModelId(saved))
+	state.model = if usable then saved :: string else wire.DEFAULT_MODEL
+end
+
 function Settings.Initialize(p: Plugin)
 	pluginRef = p
-	local model = p:GetSetting(KEY_MODEL)
 	local effort = p:GetSetting(KEY_EFFORT)
 	local system = p:GetSetting(KEY_SYSTEM)
-	if type(model) == "string" and model ~= "" then state.model = model end
+	Settings.reloadModel()
 	-- A saved index from an older build could point at a level that no longer
 	-- exists, or at the wrong one; validate rather than trust it.
 	if type(effort) == "number" and EFFORT_LEVELS[effort] then state.effort = effort end
@@ -92,7 +118,7 @@ end
 
 function Settings.setModel(id: string)
 	state.model = id
-	pluginRef:SetSetting(KEY_MODEL, id)
+	pluginRef:SetSetting(modelKey(), id)
 end
 
 function Settings.setEffort(index: number)

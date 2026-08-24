@@ -1,9 +1,24 @@
 # Claude Code for Roblox
 
-A Studio plugin that puts a coding agent inside Studio. It runs on your Claude
-subscription (OAuth login, no API key) and gives the model tools that treat the
-DataModel like a filesystem, so ls, cat, grep, cd, edit and write all work on
-Instances.
+A Studio plugin that puts a coding agent inside Studio. It gives the model tools
+that treat the DataModel like a filesystem, so ls, cat, grep, cd, edit and write
+all work on Instances.
+
+Two providers, both OAuth, neither needing an API key pasted from a dashboard:
+
+- **Claude** — your Claude subscription, the same login Claude Code uses.
+- **OpenRouter** — for the free tier. OpenRouter fronts a rotating set of models
+  that cost nothing, which is how to run this without a subscription. The model
+  list is fetched and filtered to the free models that can call tools, because
+  every capability here is a tool call and a model without them can only narrate
+  what it would have done. Free models are capped at 50 requests/day, or 1000
+  once you have bought $10 of credits at any point.
+
+Switch with `/provider`, or from the Provider row in the model picker. Each
+provider keeps its own model choice and its own sessions: a conversation is
+shaped by whoever produced it, down to reasoning blocks only the issuing
+provider can read, so opening one under the other is refused rather than
+silently corrupted.
 
 ## Install
 
@@ -19,8 +34,9 @@ A simple bash tool is self explanatory and the agent is already a pro at using b
 ## Use
 
 Click the toolbar button, run /login, open the URL it prints, then paste the
-code back with /code. After that just type. Enter sends, Shift+Enter adds a
-line, and / lists the commands.
+code back with /code. On OpenRouter, /code also takes an `sk-or-...` key
+directly if you already have one. After that just type. Enter sends,
+Shift+Enter adds a line, and / lists the commands.
 
 The button at the top left opens the sessions drawer. Conversations are saved as
 you go and the last one for the place you are in comes back when you reopen the
@@ -62,8 +78,9 @@ Shortcuts, which is the documented way a plugin gets a shortcut and the only one
 Studio dispatches ahead of a text box.
 
 Settings is at the bottom of that drawer: effort, web search, run code and system
-prompt, plus your plan usage for the 5 hour and weekly windows. The model has its
-own chip at the right of the input row. The widget floats over the viewport
+prompt, plus what you have left — the 5 hour and weekly windows on Claude,
+credits and the free-model request cap on OpenRouter. The model has its own chip
+at the right of the input row, and the provider is one page behind it. The widget floats over the viewport
 rather than docking to an edge, and hides itself during playtests.
 
 Plugins get no clipboard API, so instead anything worth copying is a text box
@@ -199,8 +216,14 @@ main/
   agent/
     Provider.lua  which provider is live; nothing outside providers/ names one
     providers/
+      Stream.lua         one streaming request: retries, cancel, SSE framing
+      Retry.lua          what is worth retrying, and how long to wait
+      ToolJson.lua       decoding arguments the model wrote
+      Pkce.lua           verifier, challenge, state
       Anthropic.lua      Messages API client, SSE streaming
       AnthropicAuth.lua  PKCE login, token storage and refresh
+      OpenRouter.lua     chat/completions client, and the translation both ways
+      OpenRouterAuth.lua PKCE login, or a pasted key
     Agent.lua     history and the tool-use loop
     Tools.lua     tool registry
     tools/        one file per tool
@@ -231,6 +254,20 @@ Terminal knows how to do things to the DataModel and Shell knows how to read a
 line and pick which one, so a new command is one entry in Shell and new syntax
 touches nothing else.
 
+Adding a provider is a pair of files under providers/ plus an entry in
+Provider.luau's REGISTRY. The transport is not part of that pair: Stream.luau
+owns the socket, the attempt counting and the latches that stop a retry
+re-rendering text the first attempt already put on screen, and there is exactly
+one copy of it. A provider supplies a request and reads frames.
+
+What a provider does own is translation. The conversation this plugin keeps is
+Anthropic-shaped — typed content blocks, reasoning carrying a signature, tool
+calls inline, a batch of tool results in one message — and Agent, Sessions and
+Find all read that shape. OpenRouter converts to and from OpenAI's shape at its
+own edge rather than teaching four more modules a second one. That direction is
+what makes it work: the Anthropic shape is the richer of the two, so going out
+is a flattening and coming back is a rebuild.
+
 Adding a tool means adding a file in tools/ that exports name, description,
 input_schema and run. The registry finds it and /help lists it. They stay sorted
 by name because tool definitions sit at the front of every request, and prompt
@@ -259,6 +296,12 @@ tools, and Stop or Escape ends it.
 
 ## Self-tests
 
-They run at startup and print to Output: Sha256 against known vectors, Markdown
-parsing plus every streaming prefix leaving RichText balanced, Terminal across
-its commands, flags and globs, and Props against the API dump.
+They run at startup and print to Output: Sha256 against known vectors, PKCE
+against the RFC 7636 vector, retry classification and backoff, tool-argument
+repair, both providers' request translation, Markdown parsing plus every
+streaming prefix leaving RichText balanced, Terminal across its commands, flags
+and globs, and Props against the API dump.
+
+Every provider's tests run, not only the live one — a translation bug in the
+provider you are not using would otherwise surface the moment you switched,
+which is the worst time to find one.

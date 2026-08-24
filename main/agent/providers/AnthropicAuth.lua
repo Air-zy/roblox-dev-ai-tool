@@ -23,8 +23,7 @@
 -- Storage: Plugin:SetSetting keys cannot contain `.` or `\` (per devforum),
 -- so we use plain underscore-separated keys.
 
-local Sha256 = require(script.Parent.Parent.Parent
-	:WaitForChild("util"):WaitForChild("Sha256")) :: any
+local Pkce = require(script.Parent:WaitForChild("Pkce"))
 
 local HttpService = game:GetService("HttpService")
 local warn = warn
@@ -77,76 +76,6 @@ local KEY_REFRESH_TOKEN = "claude_refresh_token"
 local KEY_EXPIRES_AT = "claude_expires_at"
 local KEY_PKCE_VERIFIER = "claude_pkce_verifier"  -- ephemeral, only during login
 local KEY_PKCE_STATE    = "claude_pkce_state"     -- ephemeral, only during login
-
--- PKCE primitives
--- Generate a high-entropy code_verifier (43-128 chars, base64url of random bytes).
--- Roblox has no crypto RNG; HttpService:GenerateGUID(false) returns a 32-hex-char
--- GUID without braces. We concatenate two GUIDs (64 hex chars = 256 bits entropy)
--- then hex-decode to 32 bytes and base64url-encode. This matches the spec's
--- recommendation of 256 random bits.
-local function generateVerifier(): string
-	local guid1 = HttpService:GenerateGUID(false)
-	local guid2 = HttpService:GenerateGUID(false)
-	local hex = (guid1 .. guid2):gsub("-", "")  -- 64 hex chars, no dashes
-	-- Hex-decode to 32 raw bytes, then base64url-encode
-	local bytes = {}
-	for i = 1, #hex, 2 do
-		local byte = tonumber(string.sub(hex, i, i + 1), 16) :: number
-		table.insert(bytes, string.char(byte))
-	end
-	local raw = table.concat(bytes)
-	-- base64url (no padding), reuse Sha256's helper logic
-	local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-	local out = {}
-	local i = 1
-	while i <= #raw do
-		local b1 = string.byte(raw, i) :: number
-		local b2 = string.byte(raw, i + 1) or 0
-		local b3 = string.byte(raw, i + 2) or 0
-		local n = b1 * 65536 + b2 * 256 + b3
-		table.insert(out, string.sub(chars, math.floor(n / 262144) + 1, math.floor(n / 262144) + 1))
-		table.insert(out, string.sub(chars, math.floor(n / 4096) % 64 + 1, math.floor(n / 4096) % 64 + 1))
-		table.insert(out, string.sub(chars, math.floor(n / 64) % 64 + 1, math.floor(n / 64) % 64 + 1))
-		if i + 2 <= #raw then
-			table.insert(out, string.sub(chars, n % 64 + 1, n % 64 + 1))
-		end
-		i = i + 3
-	end
-	return table.concat(out)
-end
-
--- Compute code_challenge = base64url( sha256( verifier ) )
--- We already have Sha256.hash() returning 32 raw bytes and base64url() taking a string
--- to hash then base64. We need a variant that base64urls *raw bytes*. Reimplement inline.
-local function base64urlOfBytes(raw: string): string
-	local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-	local out = {}
-	local i = 1
-	while i <= #raw do
-		local b1 = string.byte(raw, i) :: number
-		local b2 = string.byte(raw, i + 1) or 0
-		local b3 = string.byte(raw, i + 2) or 0
-		local n = b1 * 65536 + b2 * 256 + b3
-		table.insert(out, string.sub(chars, math.floor(n / 262144) + 1, math.floor(n / 262144) + 1))
-		table.insert(out, string.sub(chars, math.floor(n / 4096) % 64 + 1, math.floor(n / 4096) % 64 + 1))
-		table.insert(out, string.sub(chars, math.floor(n / 64) % 64 + 1, math.floor(n / 64) % 64 + 1))
-		if i + 2 <= #raw then
-			table.insert(out, string.sub(chars, n % 64 + 1, n % 64 + 1))
-		end
-		i = i + 3
-	end
-	return table.concat(out)
-end
-
-local function computeChallenge(verifier: string): string
-	local rawHash = Sha256.hash(verifier)
-	return base64urlOfBytes(rawHash)
-end
-
--- Random state string for CSRF protection (any opaque token works)
-local function generateState(): string
-	return HttpService:GenerateGUID(false):gsub("-", "")
-end
 
 -- HTTP helper
 -- HttpService:RequestAsync is synchronous and blocks the calling thread.
@@ -221,9 +150,9 @@ local function startLogin(): { authorizeUrl: string, state: string }
 		return { authorizeUrl = "", state = "" }
 	end
 
-	local verifier = generateVerifier()
-	local challenge = computeChallenge(verifier)
-	local state = generateState()
+	local verifier = Pkce.verifier()
+	local challenge = Pkce.challenge(verifier)
+	local state = Pkce.state()
 
 	plugin:SetSetting(KEY_PKCE_VERIFIER, verifier)
 	plugin:SetSetting(KEY_PKCE_STATE, state)
@@ -442,7 +371,74 @@ end
 -- for its two bars (a seven_day_overage_included window rides along when the
 -- account has usage credits). Blocking, like every other call here, run it from
 -- a task.spawn. Returns (windows, nil) or (nil, errorMessage).
-local function fetchUsage(): ({ [string]: any }?, string?)
+-- resets_at comes back as ISO 8601 with microseconds and a numeric offset
+-- ("2026-08-04T06:50:08.843137+00:00"), which DateTime.fromIsoDate rejects.
+-- Pull the fields out and rebuild the instant, applying the offset by hand.
+local function isoToEpoch(iso: string): number?
+	local y, mo, d, h, mi, s = iso:match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
+	if not y then return nil end
+	local ok, moment = pcall(function()
+		return DateTime.fromUniversalTime(
+			tonumber(y) :: number, tonumber(mo) :: number, tonumber(d) :: number,
+			tonumber(h) :: number, tonumber(mi) :: number, tonumber(s) :: number
+		)
+	end)
+	if not ok then return nil end
+	local epoch = moment.UnixTimestamp
+	local sign, offH, offM = iso:match("([%+%-])(%d%d):(%d%d)$")
+	if sign then
+		local shift = (tonumber(offH) :: number) * 3600 + (tonumber(offM) :: number) * 60
+		epoch += if sign == "+" then -shift else shift
+	end
+	return epoch
+end
+
+local function untilReset(resetsAt: any): string
+	if type(resetsAt) == "string" then
+		resetsAt = isoToEpoch(resetsAt)
+	end
+	if type(resetsAt) ~= "number" then return "" end
+	local seconds = resetsAt - os.time()
+	if seconds <= 0 then return "resets now" end
+	if seconds < 3600 then return string.format("resets in %dm", math.floor(seconds / 60)) end
+	if seconds < 86400 then
+		return string.format("resets in %dh %dm", math.floor(seconds / 3600), math.floor(seconds % 3600 / 60))
+	end
+	return string.format("resets in %dd %dh", math.floor(seconds / 86400), math.floor(seconds % 86400 / 3600))
+end
+
+-- ponytail: the endpoint's utilization scale isn't documented, and both 0..1 and
+-- 0..100 appear in the wild. Anything above 1 is read as a percentage. Drop the
+-- branch once the live response settles it.
+local function fraction(utilization: any): number?
+	if type(utilization) ~= "number" then return nil end
+	return math.clamp(if utilization > 1 then utilization / 100 else utilization, 0, 1)
+end
+
+-- The two rolling windows Claude Code's /usage draws, as rows. Anything the
+-- response does not carry is simply not a row.
+local function usageRows(payload: any): { { label: string, value: string, bar: number? } }
+	local rows: { { label: string, value: string, bar: number? } } = {}
+	for _, window in ipairs({
+		{ key = "five_hour", label = "Session (5h)" },
+		{ key = "seven_day", label = "Weekly" },
+	}) do
+		local data = payload[window.key]
+		if type(data) == "table" then
+			local used = fraction(data.utilization)
+			if used then
+				rows[#rows + 1] = {
+					label = window.label,
+					value = string.format("%d%% · %s", math.floor(used * 100 + 0.5), untilReset(data.resets_at)),
+					bar = used,
+				}
+			end
+		end
+	end
+	return rows
+end
+
+local function fetchUsage(): ({ { label: string, value: string, bar: number? } }?, string?)
 	local token, tokenErr = getAccessToken()
 	if not token then
 		return nil, tokenErr or "Not logged in."
@@ -478,7 +474,7 @@ local function fetchUsage(): ({ [string]: any }?, string?)
 	if not parseOk or type(parsed) ~= "table" then
 		return nil, "usage: response was not JSON"
 	end
-	return parsed :: any, nil
+	return usageRows(parsed :: any), nil
 end
 
 local function logout()
@@ -503,8 +499,6 @@ return {
 	refresh = refresh,
 	tokenExpiry = tokenExpiry,
 	-- Exposed for tests / debugging
-	_generateVerifier = generateVerifier,
-	_computeChallenge = computeChallenge,
 	_CLIENT_ID = CLIENT_ID,
 	_TOKEN_URL = TOKEN_URL,
 	_AUTHORIZE_URL = AUTHORIZE_URL,

@@ -15,8 +15,6 @@ local Console = require(ui:WaitForChild("Console"))
 local Settings = require(ui:WaitForChild("Settings"))
 local Sessions = require(ui:WaitForChild("Sessions"))
 local Provider = require(agent:WaitForChild("Provider"))
-local Auth = Provider.auth
-local Wire = Provider.wire
 local Agent = require(agent:WaitForChild("Agent"))
 local Terminal = require(script.Parent:WaitForChild("fs"):WaitForChild("Terminal"))
 local Tools = require(agent:WaitForChild("Tools"))
@@ -63,13 +61,13 @@ handlers["/help"] = function()
 end
 
 handlers["/login"] = function()
-	if Auth.isLoggedIn() then
+	if Provider.auth.isLoggedIn() then
 		Console.appendLine("Already logged in. Use /logout first.", "info")
 		return
 	end
 	Console.appendLine("Starting OAuth login…", "info")
 	task.spawn(function()
-		local ok, result = pcall(Auth.startLogin)
+		local ok, result = pcall(Provider.auth.startLogin)
 		if not ok then
 			Console.appendLine("Failed: " .. tostring(result), "error")
 			return
@@ -90,7 +88,7 @@ handlers["/code"] = function(_, raw)
 	end
 	Console.appendLine("Exchanging code…", "info")
 	task.spawn(function()
-		local ok, err = Auth.completeLogin(code)
+		local ok, err = Provider.auth.completeLogin(code)
 		if ok then
 			Console.appendLine("Login successful!", "assistant")
 		else
@@ -100,14 +98,14 @@ handlers["/code"] = function(_, raw)
 end
 
 handlers["/logout"] = function()
-	Auth.logout()
+	Provider.auth.logout()
 	Agent.reset()
 	Console.appendLine("Logged out.", "info")
 end
 
 handlers["/status"] = function()
-	if Auth.isLoggedIn() then
-		local expiry = Auth.tokenExpiry()
+	if Provider.auth.isLoggedIn() then
+		local expiry = Provider.auth.tokenExpiry()
 		local expiryText = "unknown"
 		if expiry then
 			expiryText = string.format("~%d min left", math.max(0, math.floor((expiry - os.time()) / 60)))
@@ -116,6 +114,7 @@ handlers["/status"] = function()
 	else
 		Console.appendLine("Not logged in. Use /login.", "info")
 	end
+	Console.appendLine("Provider: " .. Provider.label(), "info")
 	Console.appendLine("Model: " .. Settings.model(), "info")
 	Console.appendLine("Effort: " .. Settings.effortName(), "info")
 	Console.appendLine("CWD: " .. term:pwd(), "info")
@@ -123,24 +122,60 @@ end
 
 handlers["/model"] = function(arg)
 	if not arg or arg == "" then
-		for _, entry in ipairs(Wire.MODELS) do
+		for _, entry in ipairs(Provider.wire.MODELS) do
 			local marker = (entry.id == Settings.model()) and " *" or ""
 			Console.appendLine(string.format("  %-30s %s%s", entry.id, entry.label, marker), "info")
 		end
 		return
 	end
-	for _, entry in ipairs(Wire.MODELS) do
+	for _, entry in ipairs(Provider.wire.MODELS) do
 		if entry.id == arg or entry.id:find(arg, 1, true) then
 			Settings.setModel(entry.id)
 			Console.appendLine("Model: " .. entry.id, "info")
 			return
 		end
 	end
-	if arg:find("claude-", 1, true) then
+	-- An id the list has never heard of, so a model released after this build
+	-- is still reachable by name. The provider decides what one of its ids looks
+	-- like; OpenRouter alone has several hundred, far too many to list.
+	local wire = Provider.wire
+	if wire.acceptsModelId and wire.acceptsModelId(arg) then
 		Settings.setModel(arg)
 		Console.appendLine("Model: " .. arg, "info")
 	else
 		Console.appendLine("Unknown model: " .. arg, "error")
+	end
+end
+
+-- Switching providers resets the agent, and has to: the conversation in memory
+-- is shaped by whoever produced it, down to thinking-block signatures only that
+-- provider can read.
+handlers["/provider"] = function(arg)
+	if not arg or arg == "" then
+		for _, entry in ipairs(Provider.list()) do
+			local marker = (entry.id == Provider.id) and " *" or ""
+			Console.appendLine(string.format("  %-12s %s (%s)%s",
+				entry.id, entry.label, entry.hint, marker), "info")
+		end
+		Console.appendLine("Usage: /provider <name>", "info")
+		return
+	end
+	if arg == Provider.id then
+		Console.appendLine("Already on " .. Provider.label(arg) .. ".", "info")
+		return
+	end
+	if not Provider.use(arg) then
+		Console.appendLine("Unknown provider: " .. arg, "error")
+		return
+	end
+	Settings.reloadModel()
+	-- A new session rather than a wipe: the old conversation stays on disk and
+	-- opens again the moment you switch back.
+	Sessions.new()
+	Console.appendLine(string.format("Provider: %s · model %s",
+		Provider.label(arg), Settings.model()), "assistant")
+	if not Provider.auth.isLoggedIn() then
+		Console.appendLine("Not logged in for this provider. Use /login.", "info")
 	end
 end
 
@@ -189,6 +224,7 @@ Commands.SLASH_COMMANDS = {
 	{ cmd = "/logout",   desc = "Clear stored tokens" },
 	{ cmd = "/status",   desc = "Show login, model, effort, current path" },
 	{ cmd = "/model",    desc = "Switch model" },
+	{ cmd = "/provider", desc = "Switch between Claude and OpenRouter" },
 	{ cmd = "/settings", desc = "Open the settings panel" },
 	{ cmd = "/sh",       desc = "Run a read-only terminal command" },
 	{ cmd = "/find",     desc = "Search this chat, thinking included" },

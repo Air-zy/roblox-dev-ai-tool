@@ -7,6 +7,7 @@
 -- Public API:
 --   Sha256.hash(message: string): string  -- 32-byte raw binary
 --   Sha256.hex(message: string): string   -- 64-char lowercase hex
+--   Sha256.b64url(raw: string): string    -- URL-safe base64 of raw bytes
 --   Sha256.base64url(message: string): string  -- URL-safe base64 of the hash
 --   Sha256.hmac(key: string, message: string): string  -- raw HMAC-SHA256
 
@@ -110,9 +111,13 @@ local function hex(message: string): string
 	end))
 end
 
--- URL-safe Base64 (no padding) of the raw SHA-256 of `message`
-local function base64url(message: string): string
-	local bin = hash(message)
+-- URL-safe Base64 (no padding) of RAW BYTES.
+--
+-- Split out of base64url below because PKCE needs both halves separately: a
+-- code_challenge is base64url(sha256(verifier)) and a verifier is base64url of
+-- 32 random bytes that were never hashed. This exact loop had been copied into
+-- AnthropicAuth twice over for want of it.
+local function b64url(bin: string): string
 	local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 	local out = {}
 	local i = 1
@@ -130,6 +135,11 @@ local function base64url(message: string): string
 		i = i + 3
 	end
 	return table.concat(out)
+end
+
+-- URL-safe Base64 (no padding) of the raw SHA-256 of `message`
+local function base64url(message: string): string
+	return b64url(hash(message))
 end
 
 -- HMAC-SHA256(key, message) -> 32 raw bytes
@@ -165,6 +175,7 @@ end
 return {
 	hash = hash,
 	hex = hex,
+	b64url = b64url,
 	base64url = base64url,
 	hmac = hmac,
 }

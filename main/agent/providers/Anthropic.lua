@@ -13,8 +13,8 @@
 --
 -- Public API:
 --   Initialize(auth)
---   streamMessage({ model, system, messages, maxTokens, tools }, callbacks) -> handle
---   webSearchTool(maxUses)
+--   streamMessage({ model, system, messages, maxTokens, tools, webSearch }, callbacks) -> handle
+--   acceptsModelId(id)
 --   MODELS, DEFAULT_MODEL
 --
 -- The old non-streaming sendMessage/sendWithTools pair is gone. Agent drives the
@@ -23,6 +23,10 @@
 
 local HttpService = game:GetService("HttpService")
 local warn = warn
+
+local Retry = require(script.Parent:WaitForChild("Retry"))
+local Stream = require(script.Parent:WaitForChild("Stream"))
+local ToolJson = require(script.Parent:WaitForChild("ToolJson"))
 
 local OAuth: any = nil  -- set via Initialize
 
@@ -84,109 +88,6 @@ local function capsFor(model: string): { thinking: string, effort: boolean, maxO
 	return MODEL_CAPS[model] or DEFAULT_CAPS
 end
 
--- Retry, following Claude Code's withRetry.ts rather than inventing a schedule.
--- Theirs: BASE_DELAY_MS = 500, `min(500 * 2^(attempt-1), 32000)` plus up to 25%
--- jitter, and a `retry-after` taken literally — it deliberately bypasses the cap
--- there, being a server directive. DEFAULT_MAX_RETRIES = 10, with 529 held to a
--- separate MAX_529_RETRIES = 3, since an overloaded fleet is not helped by ten
--- of us.
---
--- The counts are lower here on purpose. Upstream is a CLI someone is watching in
--- a terminal; this is a docked widget where ten backoffs is over a minute of a
--- spinner saying nothing, with Stop as the only way out.
--- Attempts, not retries: the first try counts, so 4 here is one request and
--- three more. Named for what the code compares against, because "MAX_RETRIES = 4"
--- next to `attempts < MAX_RETRIES` reads as one more try than it performs.
--- From the source, and verified against the shipped bundle rather than only the
--- leak: `min(500 * 2^(attempt-1), 32000)` with up to 25% jitter.
-local BASE_DELAY = 0.5
-local MAX_DELAY = 32
-
--- NOT from the source. Upstream retries 10 times; four is a judgement call for a
--- docked widget, where the whole schedule has to stay inside the patience of
--- someone watching a spinner. Four attempts is at most ~8s of backoff.
-local MAX_ATTEMPTS = 4
--- Their MAX_529_RETRIES is also 3, but theirs counts RETRIES and this counts
--- ATTEMPTS, so this is the tighter of the two despite the matching number.
--- Deliberate: an overloaded fleet is the one case where coming back less is
--- strictly better for everyone.
-local MAX_OVERLOAD_ATTEMPTS = 3
--- NOT from the source, and there is no upstream equivalent — they sleep through
--- a quota window in unattended mode instead. Past a minute, waiting is no longer
--- something to do behind a spinner without saying so, and the reset time is more
--- useful to a person than four doomed attempts.
-local WINDOW_LIMIT_SECONDS = 60
-
-local function retryDelay(attempt: number, retryAfter: number?): number
-	local base = math.min(BASE_DELAY * 2 ^ (attempt - 1), MAX_DELAY)
-	-- Jitter so several Studio windows that failed together do not come back in
-	-- lockstep and rebuild the pileup they were caught in.
-	local delay = base + math.random() * 0.25 * base
-	-- The LARGER of the two, which is what ships: `Math.max(A*1000, Y)`. The
-	-- leaked tree returns retry-after bare, and that is the older behaviour —
-	-- worth knowing, because a server answering `retry-after: 1` would then pin
-	-- every attempt at one second while the backoff never got to grow.
-	if retryAfter then return math.max(retryAfter, delay) end
-	return delay
-end
-
--- What is worth trying again. Deliberately a short list: anything not named here
--- fails the turn, because a retry that cannot succeed just spends the user's
--- time twice.
---
--- 529 is matched on the BODY as well as the status. Upstream does the same, and
--- says why: "the SDK sometimes fails to properly pass the 529 status code during
--- streaming". That applies doubly here, where an overloaded_error arrives as an
--- SSE `event: error` inside a response whose HTTP status was already 200.
---
--- InactivityTimeout is ours. Roblox closes a stream that goes quiet, which
--- happens when the server is still reading an uncached prefix and has sent
--- nothing yet. Retrying is the right move precisely because the failed attempt
--- still warmed that prefix, so the second one starts talking sooner.
---
--- It was also the ONLY transport failure matched here, and the rest arrive the
--- same way: no HTTP status at all (the Error signal reports -1) and the
--- HttpError name in the message. So `HttpError: NetFail` before the first byte
--- — the same stall one layer lower — fell straight through as fatal and ended
--- the turn without a single retry. The names left out are the ones a second
--- attempt cannot fix: InvalidUrl, TooManyRedirects, InvalidRedirect,
--- SslVerificationFail and OutOfMemory answer the same way every time, and
--- Aborted is what a stream someone closed reports.
--- Anthropic publishes which statuses are worth retrying, and the table ships
--- inside Claude Code's own bundle: 400, 401, 403, 404 and 413 are No; 429
--- (rate_limit_error), 500 (api_error) and 529 (overloaded_error) are Yes. The
--- 5xx range is included rather than 500 alone because 502 and 503 come from
--- infrastructure in front of the API and mean the same thing to a client.
-local RETRYABLE_TRANSPORT = {
-	"InactivityTimeout", "NetFail", "ConnectFail", "DnsResolve", "TimedOut",
-	"SslConnectFail",
-}
-
-local function isRetryable(status: number?, body: string?): boolean
-	if status == 429 then return true end
-	if status and status >= 500 and status < 600 then return true end
-	if not body then return false end
-	-- Body matching as well as status for the same reason upstream does it: the
-	-- status is not always the thing that arrives. rate_limit_error is included
-	-- alongside overloaded_error because both can reach us through a path that
-	-- carried no usable status at all.
-	if string.find(body, '"type":"overloaded_error"', 1, true)
-		or string.find(body, '"type":"rate_limit_error"', 1, true) then
-		return true
-	end
-	for _, name in ipairs(RETRYABLE_TRANSPORT) do
-		if string.find(body, name, 1, true) then
-			return true
-		end
-	end
-	return false
-end
-
-local function isOverload(status: number?, body: string?): boolean
-	return status == 529
-		or (body ~= nil and string.find(body, '"type":"overloaded_error"', 1, true) ~= nil)
-end
-
 -- A 401 is not retryable on its own — the same token will be rejected again —
 -- but it IS retryable after forcing a refresh, which is what upstream does:
 -- on 401, or a 403 saying the token was revoked, it calls handleOAuth401Error
@@ -212,28 +113,7 @@ end
 -- reads for the same purpose (`getRateLimitResetDelayMs`). A unix timestamp, so
 -- a 429 that carries one is a quota window rather than a momentary burst.
 local function rateLimitResetSeconds(headers: string?): number?
-	if not headers then return nil end
-	local value = string.match(headers:lower(), "anthropic%-ratelimit%-unified%-reset:%s*(%d+)")
-	local reset = if value then tonumber(value) else nil
-	if not reset then return nil end
-	local delay = reset - os.time()
-	return if delay > 0 then delay else nil
-end
-
--- `retry-after` out of the raw header blob WebStreamClient hands to Opened. A
--- server directive beats our own schedule, so this is preferred over the
--- backoff when present — upstream lets it bypass the delay cap for the same
--- reason. Seconds only: the HTTP-date form is legal but Anthropic sends the
--- delta form, and guessing wrong on a date is worse than falling back.
-local function retryAfterSeconds(headers: string?): number?
-	if not headers then return nil end
-	-- Lowercased first because Lua patterns have no case-insensitivity flag and
-	-- header names are case-insensitive per HTTP. The alternative is spelling out
-	-- a bracket class per letter, which is what this was and which nobody should
-	-- have to read. A header blob is a few hundred bytes and this runs once per
-	-- failed attempt, so the copy costs nothing worth measuring.
-	local value = string.match(headers:lower(), "retry%-after:%s*(%d+)")
-	return if value then tonumber(value) else nil
+	return Retry.resetSeconds(headers, "anthropic-ratelimit-unified-reset")
 end
 
 -- Carried as parts, not as one string the callers take apart again. `label` is
@@ -248,6 +128,14 @@ local MODELS = {
 	{ id = "claude-haiku-4-5", label = "Claude Haiku 4.5 (fastest)",    name = "Haiku 4.5", hint = "fastest" },
 }
 local DEFAULT_MODEL = "claude-sonnet-5"
+
+-- Whether `/model <arg>` should accept an id the list above has never heard of,
+-- so a model released after this build can still be reached by name. The check
+-- used to live in Commands.luau as a literal "claude-", which put a vendor name
+-- in a file that is not allowed to hold one.
+local function acceptsModelId(id: string): boolean
+	return id:find("claude-", 1, true) ~= nil
+end
 
 -- Anthropic-executed ("server") tool: the API runs the searches itself and
 -- feeds Claude the results, so there is nothing for our dispatcher to do. Note
@@ -356,65 +244,6 @@ local function withMessageCache(messages: { any }): { any }
 	return out
 end
 
--- A tool call's arguments, decoded, or nil if they never became valid JSON.
---
--- The strict decode is the answer on every ordinary call. The repair below it
--- exists because the model sometimes writes a LITERAL newline inside a JSON
--- string instead of `\n`, most often in a long `write`/`multiedit` body
--- carrying a block comment. The stop_reason on those turns is "tool_use", not
--- "max_tokens": nothing was truncated, the JSON is complete and balanced and
--- simply illegal, and JSONDecode refuses the whole thing over one byte.
---
--- Escaping it is a reading, not a guess. RFC 8259 forbids an unescaped control
--- character inside a string, so one appearing there has exactly one possible
--- intent, and the repair only ever runs after the strict parse has already
--- failed. Everything outside a string is left exactly as it arrived, so a
--- genuinely truncated call still fails, which is what makes the retry hint
--- above it true.
-local UNESCAPED: { [string]: string } = {
-	["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t",
-	["\b"] = "\\b", ["\f"] = "\\f",
-}
-
-local function escapeControlChars(json: string): string
-	local out: { string } = {}
-	local inString, escaped = false, false
-	for i = 1, #json do
-		local c = json:sub(i, i)
-		if escaped then
-			escaped = false
-		elseif inString and c == "\\" then
-			escaped = true
-		elseif c == '"' then
-			inString = not inString
-		elseif inString and c:byte() < 32 then
-			c = UNESCAPED[c] or string.format("\\u%04x", c:byte())
-		end
-		out[#out + 1] = c
-	end
-	return table.concat(out)
-end
-
--- Returns the arguments and whether the repair was needed. The caller warns
--- rather than this function, so that selfTest can exercise the repair without
--- printing a warning into every startup.
-local function decodeToolInput(json: string): (any?, boolean)
-	local parsed
-	-- JSONDecode("") throws; a no-arg tool call never emits any
-	-- input_json_delta, so `input` stays "".
-	if pcall(function()
-		parsed = HttpService:JSONDecode(json ~= "" and json or "{}")
-	end) then
-		return parsed, false
-	end
-	if not pcall(function()
-		parsed = HttpService:JSONDecode(escapeControlChars(json))
-	end) then
-		return nil, false
-	end
-	return parsed, true
-end
-
 -- streamMessage: streaming via CreateWebStreamClient (SSE)
 -- Sends a streaming request. Callbacks fire as deltas arrive:
 --   onText(text), called for each text_delta chunk
@@ -434,6 +263,7 @@ local function streamMessage(args: {
 	maxTokens: number?,
 	effort: string?,
 	tools: { any }?,
+	webSearch: number?,
 	}, callbacks: {
 		onText: ((string) -> ())?,
 		onThinking: ((string) -> ())?,
@@ -459,8 +289,8 @@ local function streamMessage(args: {
 	end
 
 	-- Checked here so a logged-out caller fails immediately rather than after a
-	-- request is built. The token used on the wire is fetched per attempt inside
-	-- `start`, since a retry after a 401 has to pick up a refreshed one.
+	-- request is built. The token used on the wire is fetched per attempt in the
+	-- `request` hook below, since a retry after a 401 has to pick up a fresh one.
 	local firstToken, tokenErr = OAuth.getAccessToken()
 	if not firstToken then
 		if callbacks.onError then callbacks.onError("Auth: " .. tostring(tokenErr)) end
@@ -517,6 +347,14 @@ local function streamMessage(args: {
 
 	applyReasoning(bodyTable, model, args.effort)
 
+	-- Anthropic runs web search itself, so it is a tool in the array rather
+	-- than a body field. Appended LAST on purpose: tool definitions render at
+	-- the very front of the request and caching is a prefix match, so toggling
+	-- search only invalidates from the end of the tool block onward.
+	if args.webSearch and args.webSearch > 0 and args.tools then
+		table.insert(args.tools, webSearchTool(args.webSearch))
+	end
+
 	if args.tools and #args.tools > 0 then
 		-- Writes into the caller's table. Agent.buildTools() hands over freshly
 		-- built definitions precisely so the tag cannot accumulate on a shared
@@ -550,268 +388,206 @@ local function streamMessage(args: {
 	local usage: any = nil
 	local stopReason: string? = nil
 
-	-- Set the moment anything reaches the caller, and it is what makes retrying
-	-- safe: onText has already been appended to a bubble and onToolUseStart has
-	-- already put a block on screen, so a second attempt would render both twice
-	-- and there is no callback for "forget what I just told you". A retry is
-	-- therefore only ever offered before the first content block. That is not
-	-- much of a restriction in practice, because the failures worth retrying —
-	-- 429, 529, a stream that went quiet waiting on an uncached prefix — all
-	-- happen before the model has said anything.
-	local emitted = false
-	-- Per-attempt latch. Distinct from handle.cancelled, which means the USER
-	-- stopped this and must never be undone; this one only means the current
-	-- socket is finished, and a retry clears it.
-	local dead = false
-	-- Bumped by every attempt, and captured by that attempt's handlers. Closing a
-	-- WebStreamClient does not disconnect what is bound to it, so without this a
-	-- late event from the socket we just abandoned arrives after `dead` has been
-	-- cleared for the retry, and gets processed as though it belonged to the new
-	-- attempt — an old Error would kill a request that is working.
-	local generation = 0
-	-- Attempts made including the one in flight, and the subset of them that were
-	-- overloads. Two counters because they cap differently, the way upstream
-	-- tracks `attempt` and `consecutive529Errors` separately.
-	local attempts = 1
-	local overloadAttempts = 0
-	-- Latched, so a token refresh is tried once per request and never becomes a
-	-- loop against an endpoint that keeps saying no.
-	local refreshed = false
-
-	-- Forward-declare `stream` so processSSEEvents can reference it as an upvalue.
-	-- Without this, processSSEEvents would capture the GLOBAL `stream` (nil), causing
-	-- "attempt to index nil with 'Close'" when we try to close the stream.
-	local stream: any = nil
-
-	-- Returned to the caller so a Stop button has something to call. Cancelling
-	-- closes the socket and latches, so no late SSE chunk can fire a callback
-	-- after the UI has already been finalised.
-	local handle = { cancelled = false, cancel = function() end }
-	handle.cancel = function()
-		if handle.cancelled then return end
-		handle.cancelled = true
-		pcall(function()
-			if stream then stream:Close() end
-		end)
-	end
-
-	-- Create the stream client using RawStream (not SSE) because:
-	-- - The SSE client type validates that the RESPONSE Content-Type is
-	--   text/event-stream. If Anthropic returns an error (400/429/etc.), the
-	--   response body is application/json, and Roblox's SSE client rejects it
-	--   with "Invalid Content-Type header for SSE client", hiding the actual
-	--   error message from us.
-	-- - RawStream doesn't validate Content-Type, so we can read error bodies.
-	-- - Anthropic still sends SSE-formatted data for successful streams, so
-	--   our SSE parsing logic works the same.
-	-- We buffer received chunks and split on blank lines (\n\n) to get
-	-- complete SSE events, since RawStream doesn't guarantee message boundaries.
-	local sseBuffer = ""
-	local function processSSEEvents(data: string)
-		if handle.cancelled or dead then return end
-		sseBuffer = sseBuffer .. data
-		-- SSE events are separated by blank lines (\n\n)
-		-- Split and process all complete events, keep the remainder in the buffer
-		while true do
-			local eventEnd = sseBuffer:find("\n\n", 1, true)
-			if not eventEnd then break end
-			local eventStr = sseBuffer:sub(1, eventEnd - 1)
-			sseBuffer = sseBuffer:sub(eventEnd + 2)
-
-			-- Parse the event: look for "event:" and "data:" lines
-			local currentEvent: string? = nil
-			local dataLine: string? = nil
-			for line in eventStr:gmatch("[^\r\n]+") do
-				local evMatch = line:match("^event:%s*(.+)$")
-				local dtMatch = line:match("^data:%s*(.+)$")
-				if evMatch then
-					currentEvent = evMatch
-				elseif dtMatch then
-					dataLine = dtMatch
-				end
+	-- One complete SSE frame. Stream.luau owns the buffering and the split;
+	-- this reads what a frame MEANS, which is the only half that is Anthropic.
+	local function onFrame(eventStr: string, ctrl: Stream.Ctrl)
+		-- Parse the event: look for "event:" and "data:" lines
+		local currentEvent: string? = nil
+		local dataLine: string? = nil
+		for line in eventStr:gmatch("[^\r\n]+") do
+			local evMatch = line:match("^event:%s*(.+)$")
+			local dtMatch = line:match("^data:%s*(.+)$")
+			if evMatch then
+				currentEvent = evMatch
+			elseif dtMatch then
+				dataLine = dtMatch
 			end
+		end
 
-			if currentEvent and dataLine then
-				local parsed
-				local parseOk = pcall(function()
-					parsed = HttpService:JSONDecode(dataLine :: string)
-				end)
-				if not parseOk then
-					continue
+		if currentEvent and dataLine then
+			local parsed
+			local parseOk = pcall(function()
+				parsed = HttpService:JSONDecode(dataLine :: string)
+			end)
+			if not parseOk then
+				-- A frame we cannot read. Was `continue` when this ran inside
+				-- the buffer loop; one frame is one call now, so it is a return.
+				return
+			end
+			local evt = parsed :: any
+
+			if currentEvent == "message_start" then
+				-- Initial message object, empty content. Its usage is where
+				-- input_tokens and the two cache counts are guaranteed to
+				-- appear. message_delta MAY repeat them, and the streaming
+				-- reference shows it both ways: its web-search example carries
+				-- the full set, its plain text and tool_use examples carry
+				-- output_tokens alone. Keeping this one and letting the delta
+				-- overwrite field by field is correct under either, where
+				-- taking only the delta silently zeroes the cache line on
+				-- exactly the ordinary turns it exists to report.
+				if evt.message and evt.message.usage then
+					usage = table.clone(evt.message.usage)
 				end
-				local evt = parsed :: any
 
-				if currentEvent == "message_start" then
-					-- Initial message object, empty content. Its usage is where
-					-- input_tokens and the two cache counts are guaranteed to
-					-- appear. message_delta MAY repeat them, and the streaming
-					-- reference shows it both ways: its web-search example carries
-					-- the full set, its plain text and tool_use examples carry
-					-- output_tokens alone. Keeping this one and letting the delta
-					-- overwrite field by field is correct under either, where
-					-- taking only the delta silently zeroes the cache line on
-					-- exactly the ordinary turns it exists to report.
-					if evt.message and evt.message.usage then
-						usage = table.clone(evt.message.usage)
-					end
+			elseif currentEvent == "content_block_start" then
+				-- Past here the caller has been told something, so no retry.
+				ctrl.emitted()
+				local idx = evt.index
+				local block = evt.content_block
+				-- `raw` keeps the block exactly as the API sent it. Server tool
+				-- results (web_search_tool_result) arrive COMPLETE here rather
+				-- than as deltas, and they must be replayed verbatim on the next
+				-- turn or the conversation loses its search grounding.
+				blockCount = math.max(blockCount, idx + 1)
+				contentBlocks[idx + 1] = {
+					type = block.type,
+					raw = block,
+					text = "",
+					thinking = "",
+					input = "",
+					name = block.name,
+					id = block.id,
+					citations = nil,
+				}
+				-- The name and id are final here; only the arguments are still
+				-- coming. Announcing the call now is the difference between a
+				-- header that appears as the model starts writing it and one
+				-- that appears when the whole message has finished, seconds
+				-- apart for a `write`, whose input IS the file.
+				if block.type == "tool_use" and callbacks.onToolUseStart then
+					callbacks.onToolUseStart(block.id, block.name or "unknown")
+				end
+				if block.type == "web_search_tool_result" and callbacks.onServerToolResult then
+					-- Handed over raw: the caller pairs it with the server_tool_use
+					-- it answers via tool_use_id, and decides what of it to show.
+					callbacks.onServerToolResult("web_search", block.tool_use_id, block.content)
+				end
 
-				elseif currentEvent == "content_block_start" then
-					-- Past here the caller has been told something, so no retry.
-					emitted = true
-					local idx = evt.index
-					local block = evt.content_block
-					-- `raw` keeps the block exactly as the API sent it. Server tool
-					-- results (web_search_tool_result) arrive COMPLETE here rather
-					-- than as deltas, and they must be replayed verbatim on the next
-					-- turn or the conversation loses its search grounding.
+			elseif currentEvent == "content_block_delta" then
+				-- Set here as well as at content_block_start, because the branch
+				-- below deliberately tolerates a delta whose start never arrived
+				-- — and that path still fires onText, so it still makes a retry
+				-- unsafe. Guarding only the start would leave exactly the
+				-- malformed-stream case able to render twice.
+				ctrl.emitted()
+				local idx = evt.index
+				local delta = evt.delta
+				local block = contentBlocks[idx + 1]
+				if not block then
+					block = { type = "text", text = "", thinking = "", input = "" }
+					contentBlocks[idx + 1] = block
 					blockCount = math.max(blockCount, idx + 1)
-					contentBlocks[idx + 1] = {
-						type = block.type,
-						raw = block,
-						text = "",
-						thinking = "",
-						input = "",
-						name = block.name,
-						id = block.id,
-						citations = nil,
-					}
-					-- The name and id are final here; only the arguments are still
-					-- coming. Announcing the call now is the difference between a
-					-- header that appears as the model starts writing it and one
-					-- that appears when the whole message has finished, seconds
-					-- apart for a `write`, whose input IS the file.
-					if block.type == "tool_use" and callbacks.onToolUseStart then
-						callbacks.onToolUseStart(block.id, block.name or "unknown")
-					end
-					if block.type == "web_search_tool_result" and callbacks.onServerToolResult then
-						-- Handed over raw: the caller pairs it with the server_tool_use
-						-- it answers via tool_use_id, and decides what of it to show.
-						callbacks.onServerToolResult("web_search", block.tool_use_id, block.content)
-					end
+				end
 
-				elseif currentEvent == "content_block_delta" then
-					-- Set here as well as at content_block_start, because the branch
-					-- below deliberately tolerates a delta whose start never arrived
-					-- — and that path still fires onText, so it still makes a retry
-					-- unsafe. Guarding only the start would leave exactly the
-					-- malformed-stream case able to render twice.
-					emitted = true
-					local idx = evt.index
-					local delta = evt.delta
-					local block = contentBlocks[idx + 1]
-					if not block then
-						block = { type = "text", text = "", thinking = "", input = "" }
-						contentBlocks[idx + 1] = block
-						blockCount = math.max(blockCount, idx + 1)
+				if delta.type == "text_delta" then
+					block.text = block.text .. delta.text
+					if callbacks.onText then callbacks.onText(delta.text) end
+				elseif delta.type == "thinking_delta" then
+					block.thinking = block.thinking .. delta.thinking
+					if callbacks.onThinking then callbacks.onThinking(delta.thinking) end
+				elseif delta.type == "signature_delta" then
+					-- Exactly one per thinking block, immediately before its
+					-- content_block_stop: it arrives under display "omitted" too,
+					-- where no thinking_delta ever does. The signature is what the
+					-- server decrypts to rebuild the real reasoning when the block
+					-- is replayed, so a thinking block without it cannot be sent
+					-- back: Anthropic rejects a missing or altered signature.
+					block.signature = delta.signature
+				elseif delta.type == "input_json_delta" then
+					block.input = block.input .. delta.partial_json
+					-- Raw, unparsed, and possibly mid-token: these fragments are
+					-- only valid JSON once the block closes, so this is for
+					-- display and nothing else. content_block_stop still owns the
+					-- parse that decides whether the tool may run.
+					if callbacks.onToolInput then
+						callbacks.onToolInput(block.id, delta.partial_json)
 					end
+				elseif delta.type == "citations_delta" then
+					-- Cited text blocks carry their sources alongside the text;
+					-- dropping them on replay loses the grounding for later turns.
+					block.citations = block.citations or {}
+					table.insert(block.citations, delta.citation)
+				end
 
-					if delta.type == "text_delta" then
-						block.text = block.text .. delta.text
-						if callbacks.onText then callbacks.onText(delta.text) end
-					elseif delta.type == "thinking_delta" then
-						block.thinking = block.thinking .. delta.thinking
-						if callbacks.onThinking then callbacks.onThinking(delta.thinking) end
-					elseif delta.type == "signature_delta" then
-						-- Exactly one per thinking block, immediately before its
-						-- content_block_stop: it arrives under display "omitted" too,
-						-- where no thinking_delta ever does. The signature is what the
-						-- server decrypts to rebuild the real reasoning when the block
-						-- is replayed, so a thinking block without it cannot be sent
-						-- back: Anthropic rejects a missing or altered signature.
-						block.signature = delta.signature
-					elseif delta.type == "input_json_delta" then
-						block.input = block.input .. delta.partial_json
-						-- Raw, unparsed, and possibly mid-token: these fragments are
-						-- only valid JSON once the block closes, so this is for
-						-- display and nothing else. content_block_stop still owns the
-						-- parse that decides whether the tool may run.
-						if callbacks.onToolInput then
-							callbacks.onToolInput(block.id, delta.partial_json)
-						end
-					elseif delta.type == "citations_delta" then
-						-- Cited text blocks carry their sources alongside the text;
-						-- dropping them on replay loses the grounding for later turns.
-						block.citations = block.citations or {}
-						table.insert(block.citations, delta.citation)
+			elseif currentEvent == "content_block_stop" then
+				local idx = evt.index
+				local block = contentBlocks[idx + 1]
+				-- Parse the accumulated tool input UNCONDITIONALLY. This used to be
+				-- gated behind `callbacks.onToolUseStart`, which meant any caller that
+				-- omitted that callback got block.inputParsed = nil, and the caller's
+				-- `inputParsed or {}` fallback encoded as `[]`. Anthropic then rejects
+				-- the next turn with "tool_use.input: Input should be an object".
+				-- Parsing is stream state, not presentation; it must not depend on
+				-- whether anyone is listening.
+				-- server_tool_use streams its input exactly like tool_use, so it
+				-- needs the same parse, even though WE never execute it.
+				if block and (block.type == "tool_use" or block.type == "server_tool_use") then
+					local inputParsed, repaired = ToolJson.decode(block.input)
+					-- Not silent: the model produced invalid JSON and the call
+					-- ran anyway. Worth seeing in the Output window on the day a
+					-- write lands looking slightly wrong.
+					if repaired then
+						warn(string.format(
+							"[agent] %s: repaired unescaped control characters in tool input",
+							tostring(block.name)))
 					end
+					-- nil on failure, and it stays nil: the caller uses it to decide
+					-- whether the tool may be dispatched at all. What must NOT reach
+					-- the wire is an empty table, which Roblox encodes as `[]`, see
+					-- Agent.toolInput, which owns that fallback. block.input keeps the
+					-- raw accumulated JSON for it, so do not stop retaining it.
+					block.inputParsed = inputParsed
+					-- Our own tool_use blocks were already announced at
+					-- content_block_start; server ones are announced here
+					-- instead, because the API runs them the moment they
+					-- complete and their arguments are one short query.
+					if block.type == "server_tool_use" and callbacks.onServerToolUse then
+						callbacks.onServerToolUse(block.name or "unknown", block.id, inputParsed)
+					end
+				end
 
-				elseif currentEvent == "content_block_stop" then
-					local idx = evt.index
-					local block = contentBlocks[idx + 1]
-					-- Parse the accumulated tool input UNCONDITIONALLY. This used to be
-					-- gated behind `callbacks.onToolUseStart`, which meant any caller that
-					-- omitted that callback got block.inputParsed = nil, and the caller's
-					-- `inputParsed or {}` fallback encoded as `[]`. Anthropic then rejects
-					-- the next turn with "tool_use.input: Input should be an object".
-					-- Parsing is stream state, not presentation; it must not depend on
-					-- whether anyone is listening.
-					-- server_tool_use streams its input exactly like tool_use, so it
-					-- needs the same parse, even though WE never execute it.
-					if block and (block.type == "tool_use" or block.type == "server_tool_use") then
-						local inputParsed, repaired = decodeToolInput(block.input)
-						-- Not silent: the model produced invalid JSON and the call
-						-- ran anyway. Worth seeing in the Output window on the day a
-						-- write lands looking slightly wrong.
-						if repaired then
-							warn(string.format(
-								"[agent] %s: repaired unescaped control characters in tool input",
-								tostring(block.name)))
-						end
-						-- nil on failure, and it stays nil: the caller uses it to decide
-						-- whether the tool may be dispatched at all. What must NOT reach
-						-- the wire is an empty table, which Roblox encodes as `[]`, see
-						-- Agent.toolInput, which owns that fallback. block.input keeps the
-						-- raw accumulated JSON for it, so do not stop retaining it.
-						block.inputParsed = inputParsed
-						-- Our own tool_use blocks were already announced at
-						-- content_block_start; server ones are announced here
-						-- instead, because the API runs them the moment they
-						-- complete and their arguments are one short query.
-						if block.type == "server_tool_use" and callbacks.onServerToolUse then
-							callbacks.onServerToolUse(block.name or "unknown", block.id, inputParsed)
-						end
+			elseif currentEvent == "message_delta" then
+				if evt.delta and evt.delta.stop_reason then
+					stopReason = evt.delta.stop_reason
+				end
+				-- Merged, not replaced: output_tokens here is cumulative and
+				-- always present, the input and cache counts sometimes are
+				-- not, and an absent field must leave message_start's value
+				-- standing rather than erase it.
+				if evt.usage then
+					usage = usage or {}
+					for key, value in pairs(evt.usage) do
+						usage[key] = value
 					end
+				end
 
-				elseif currentEvent == "message_delta" then
-					if evt.delta and evt.delta.stop_reason then
-						stopReason = evt.delta.stop_reason
-					end
-					-- Merged, not replaced: output_tokens here is cumulative and
-					-- always present, the input and cache counts sometimes are
-					-- not, and an absent field must leave message_start's value
-					-- standing rather than erase it.
-					if evt.usage then
-						usage = usage or {}
-						for key, value in pairs(evt.usage) do
-							usage[key] = value
-						end
-					end
+			elseif currentEvent == "message_stop" then
+				-- contentBlocks is keyed by SSE index, so any index that never got
+				-- a content_block_start or a delta leaves a hole, and ipairs()
+				-- stops at the first hole, silently dropping every block after it.
+				-- A dropped tool_use gets no tool_result, which desyncs the
+				-- tool_use/tool_result pairing on the next turn. Compact once,
+				-- here, so neither this loop nor the caller's can truncate.
+				local dense: { any } = {}
+				for i = 1, blockCount do
+					local b = contentBlocks[i]
+					if b then dense[#dense + 1] = b end
+				end
 
-				elseif currentEvent == "message_stop" then
-					-- contentBlocks is keyed by SSE index, so any index that never got
-					-- a content_block_start or a delta leaves a hole, and ipairs()
-					-- stops at the first hole, silently dropping every block after it.
-					-- A dropped tool_use gets no tool_result, which desyncs the
-					-- tool_use/tool_result pairing on the next turn. Compact once,
-					-- here, so neither this loop nor the caller's can truncate.
-					local dense: { any } = {}
-					for i = 1, blockCount do
-						local b = contentBlocks[i]
-						if b then dense[#dense + 1] = b end
+				for _, b in ipairs(dense) do
+					if b.type == "text" and b.text ~= "" then
+						table.insert(textParts, b.text)
+					elseif b.type == "thinking" and b.thinking ~= "" then
+						table.insert(thinkingParts, b.thinking)
 					end
+				end
 
-					for _, b in ipairs(dense) do
-						if b.type == "text" and b.text ~= "" then
-							table.insert(textParts, b.text)
-						elseif b.type == "thinking" and b.thinking ~= "" then
-							table.insert(thinkingParts, b.thinking)
-						end
-					end
-
-					-- Latched before the callback: this attempt succeeded, and a
-					-- late Error on the socket must not now be mistaken for a
-					-- failure worth retrying on top of a delivered answer.
-					dead = true
+				-- ctrl.finish latches, emits, then closes, in that order. The
+				-- latch has to precede the callback so a late Error on the socket
+				-- is not mistaken for a failure worth retrying on top of a
+				-- delivered answer.
+				ctrl.finish(function()
 					if callbacks.onComplete then
 						callbacks.onComplete({
 							ok = true,
@@ -822,185 +598,42 @@ local function streamMessage(args: {
 							contentBlocks = dense,
 						})
 					end
-					stream:Close()
+				end)
 
-				elseif currentEvent == "error" then
-					-- Where overloaded_error actually shows up. The HTTP status was
-					-- 200 — the stream opened fine and the failure is in-band — so
-					-- the raw event JSON is handed to `fail` as the body, which is
-					-- what lets it be recognised and retried at all.
-					local errMsg = "stream error"
-					if evt.error and evt.error.type then
-						errMsg = tostring(evt.error.type)
-					end
-					if evt.error and evt.error.message then
-						errMsg = errMsg .. " — " .. tostring(evt.error.message)
-					end
-					fail(nil, dataLine, errMsg)
+			elseif currentEvent == "error" then
+				-- Where overloaded_error actually shows up. The HTTP status was
+				-- 200 — the stream opened fine and the failure is in-band — so
+				-- the raw event JSON is handed to `fail` as the body, which is
+				-- what lets it be recognised and retried at all.
+				local errMsg = "stream error"
+				if evt.error and evt.error.type then
+					errMsg = tostring(evt.error.type)
 				end
+				if evt.error and evt.error.message then
+					errMsg = errMsg .. " — " .. tostring(evt.error.message)
+				end
+				ctrl.fail(nil, dataLine, errMsg)
 			end
 		end
 	end
 
-	-- Timing lives outside `start` so a retry can report the whole wait rather
-	-- than only its own attempt, and is reset per attempt below.
-	local startedAt = os.time()
-	local firstByteAt: number? = nil
-
-	-- Forward-declared so `fail` can re-enter it.
-	local start: (() -> ())
-	-- The raw header blob from Opened, kept so a 429 can be answered on the
-	-- server's own schedule rather than ours.
-	local responseHeaders: string? = nil
-	-- The HTTP status from Opened. Load-bearing, and easy to lose: with
-	-- RawStream a 401 or 429 arrives as a normal response whose JSON body comes
-	-- through MessageReceived, so the status is ONLY ever seen here. Passing nil
-	-- from that path silently disabled auth refresh, window-limit reporting and
-	-- rate-limit retries all at once, since each of them keys off the number.
-	local responseStatus: number? = nil
-
-	-- One decision point for every way an attempt can die: a transport Error, an
-	-- SSE `error` event, and a JSON error body all route here rather than each
-	-- calling onError with its own idea of what is fatal.
-	local function fail(status: number?, body: string?, message: string)
-		if handle.cancelled or dead then return end
-		dead = true  -- latch first: a late MessageReceived must not race this
-		pcall(function()
-			if stream then stream:Close() end
-		end)
-
-		-- A quota window, not a burst. Backing off 32 seconds against a limit that
-		-- resets in three hours only spends the attempts and arrives at the same
-		-- refusal, so this reports the wait instead of pretending to ride it out.
-		-- Upstream can afford to sleep through one because it has an unattended
-		-- mode; a docked widget has a person in front of it.
-		--
-		-- Rewrites the message and falls through rather than answering here, so
-		-- the partial-text handover at the bottom stays the single exit. An
-		-- earlier version returned early and silently dropped whatever the model
-		-- had already written.
-		local resetIn = if status == 429 then rateLimitResetSeconds(responseHeaders) else nil
-		local windowed = resetIn ~= nil and resetIn > WINDOW_LIMIT_SECONDS
-		if windowed then
-			message = string.format("%s — usage limit reached, resets in %d min",
-				message, math.ceil((resetIn :: number) / 60))
-		end
-
-		-- One forced refresh, then the retry carries a new token. Bounded to once
-		-- because a second 401 on a freshly minted credential is a real auth
-		-- failure, and looping on it would just relogin-spam the token endpoint.
-		if needsTokenRefresh(status, body) and not refreshed and not emitted
-			and not windowed and attempts < MAX_ATTEMPTS then
-			refreshed = true
-			attempts += 1
-			warn(string.format("[Claude Code] %s — refreshing token and retrying", message))
-			task.spawn(function()
-				if handle.cancelled then return end
-				-- Yields on an HTTP round trip, which is why this is not inline:
-				-- `fail` runs inside a stream event handler.
-				OAuth.refresh()
-				if handle.cancelled then return end
-				start()
-			end)
-			return
-		end
-
-		local overload = isOverload(status, body)
-		if overload then overloadAttempts += 1 end
-		-- Both caps apply. The overall one bounds how long a user waits; the
-		-- overload one is tighter because a fleet that is already saturated is
-		-- not helped by us coming back four times.
-		local allowed = attempts < MAX_ATTEMPTS
-			and not windowed
-			and (not overload or overloadAttempts < MAX_OVERLOAD_ATTEMPTS)
-		if not emitted and allowed and isRetryable(status, body) then
-			local wait = retryDelay(attempts, retryAfterSeconds(responseHeaders))
-			attempts += 1
-			warn(string.format("[Claude Code] %s — retrying in %.1fs (attempt %d/%d)",
-				message, wait, attempts, MAX_ATTEMPTS))
-			-- Said out loud, because a silent backoff is indistinguishable from
-			-- the hang this whole mechanism exists to survive: same spinner, same
-			-- nothing, for up to eight seconds. The caller decides how to show it;
-			-- this file does not reach into the UI.
-			if callbacks.onRetry then
-				callbacks.onRetry(message, wait, attempts, MAX_ATTEMPTS)
+	-- Everything past the parser is transport, and lives in Stream.luau: the
+	-- retry schedule, the generation counter that silences an abandoned socket,
+	-- and the latches that stop a retry re-rendering text the first attempt
+	-- already put on screen. This file supplies a request and reads frames.
+	return Stream.open({
+		request = function()
+			-- Re-read per attempt rather than captured once. A turn can outlive its
+			-- access token, and a 401 retry is only worth making with a new one —
+			-- getAccessToken refreshes when it is close to expiry, and the refresh
+			-- hook below forces one when the server has already rejected it.
+			local accessToken, attemptTokenErr = OAuth.getAccessToken()
+			if not accessToken then
+				return nil, "Auth: " .. tostring(attemptTokenErr)
 			end
-			task.delay(wait, function()
-				-- Re-checked after the wait: Stop during a backoff must not be
-				-- answered by opening another socket.
-				if handle.cancelled then return end
-				start()
-			end)
-			return
-		end
-
-		if callbacks.onError then
-			-- textParts is only filled in at message_stop, which an error mid-
-			-- stream never reaches, so it is empty here even when real text
-			-- already arrived. Read live from contentBlocks instead, the same
-			-- accumulator onText has been writing into all along. Indexed by
-			-- blockCount rather than ipairs for the same reason message_stop is:
-			-- a hole would cut the partial text short.
-			local partial: { string } = {}
-			for i = 1, blockCount do
-				local block = contentBlocks[i]
-				if block and block.type == "text" and block.text ~= "" then
-					table.insert(partial, block.text)
-				end
-			end
-			-- Second argument is that partial text, so a caller (Agent.stopCurrent
-			-- already does the equivalent for the Stop-button path) can keep a
-			-- mostly-finished answer instead of discarding it on what is usually
-			-- a transient stall, not a real failure.
-			callbacks.onError(message, #partial > 0 and table.concat(partial, "\n") or nil)
-		end
-	end
-
-	start = function()
-		dead = false
-		sseBuffer = ""
-		responseHeaders = nil
-		-- Reset even though a retry only happens with `emitted` false, which
-		-- already implies the block accumulators are empty. `usage` is the
-		-- exception that proves it is worth doing: it is written at message_start
-		-- WITHOUT setting emitted, so a failed attempt can leave its numbers
-		-- behind. Clearing all of them costs nothing and removes the need for
-		-- anyone to re-derive which ones were safe.
-		textParts = {}
-		thinkingParts = {}
-		contentBlocks = {}
-		blockCount = 0
-		usage = nil
-		stopReason = nil
-		generation += 1
-		-- Captured, not read live: every handler below belongs to THIS socket and
-		-- must go silent the moment a later attempt supersedes it.
-		local myGeneration = generation
-
-		-- Re-read per attempt rather than captured once. A turn can outlive its
-		-- access token, and a 401 retry is only worth making with a new one —
-		-- getAccessToken refreshes when it is close to expiry, and `fail` forces
-		-- one outright when the server has already rejected it.
-		local accessToken, attemptTokenErr = OAuth.getAccessToken()
-		if not accessToken then
-			if callbacks.onError then callbacks.onError("Auth: " .. tostring(attemptTokenErr)) end
-			return
-		end
-		-- InactivityTimeout is raised by Roblox, not by the API, and it says nothing
-		-- about WHERE the silence was. The two cases have different causes and
-		-- different fixes: before the first byte is the server reprocessing an
-		-- uncached prefix, which is a caching problem; after it is a stall mid-answer,
-		-- which is not. Wall clock, because the thing being measured is a network
-		-- wait, and seconds are enough against a window Roblox puts near 20.
-		startedAt = os.time()
-		firstByteAt = nil
-
-		local client
-		local ok, err = pcall(function()
-			client = HttpService:CreateWebStreamClient(Enum.WebStreamClientType.RawStream, {
-				Url = MESSAGES_URL,
-				Method = "POST",
-				Headers = {
+			return {
+				url = MESSAGES_URL,
+				headers = {
 					["Authorization"] = "Bearer " .. (accessToken :: string),
 					["anthropic-version"] = ANTHROPIC_VERSION,
 					["anthropic-beta"] = ANTHROPIC_BETA,
@@ -1008,95 +641,53 @@ local function streamMessage(args: {
 					["content-type"] = "application/json",
 					["accept"] = "text/event-stream",
 				},
-				Body = bodyStr,
-			})
-		end)
+				body = bodyStr,
+			}
+		end,
 
-		if not ok or not client then
-			-- Not routed through `fail`: there is no stream to close and no status to
-			-- classify. Six clients may exist at once, so this is also what a leak
-			-- from an earlier turn eventually looks like.
-			if callbacks.onError then callbacks.onError("Failed to create stream client: " .. tostring(err)) end
-			return
-		end
+		reset = function()
+			-- Reset even though a retry only happens with nothing emitted, which
+			-- already implies the block accumulators are empty. `usage` is the
+			-- exception that proves it is worth doing: it is written at
+			-- message_start WITHOUT marking anything emitted, so a failed attempt
+			-- can leave its numbers behind. Clearing all of them costs nothing and
+			-- removes the need for anyone to re-derive which ones were safe.
+			textParts = {}
+			thinkingParts = {}
+			contentBlocks = {}
+			blockCount = 0
+			usage = nil
+			stopReason = nil
+		end,
 
-		-- Assign to the forward-declared `stream` local (so processSSEEvents can see it)
-		stream = client
+		frame = onFrame,
 
-		stream.Opened:Connect(function(statusCode: number, headers: string)
-			if myGeneration ~= generation then return end
-			-- Kept whatever the status: a 429 carries retry-after here, and the body
-			-- explaining it arrives separately through MessageReceived.
-			responseHeaders = headers
-			responseStatus = statusCode
-		end)
-
-		stream.MessageReceived:Connect(function(message: string)
-			if handle.cancelled or dead or myGeneration ~= generation then return end
-			if firstByteAt == nil then firstByteAt = os.time() end
-			-- Try to parse as SSE events first (normal streaming response)
-			-- If the response is an error (JSON, not SSE format), processSSEEvents
-			-- won't find any valid events, and we'll check if it's a JSON error.
-			local hadEvents = message:find("event:", 1, true) ~= nil
-			if hadEvents then
-				processSSEEvents(message)
-			else
-				-- Might be a JSON error response (non-SSE)
-				local parsed
-				local parseOk = pcall(function()
-					parsed = HttpService:JSONDecode(message)
-				end)
-				if parseOk and type(parsed) == "table" and (parsed :: any).error then
-					local e = (parsed :: any).error
-					local msg = "HTTP error: " .. tostring(e.type or "") .. " — " .. tostring(e.message or "")
-					warn("[Claude Code] " .. msg)
-					warn("[Claude Code] Response body: " .. message)
-					-- The body is passed on so an overloaded_error is recognised even
-					-- when the status never made it through.
-					-- responseStatus, not nil: this is the 401/429 path, and every
-					-- decision fail makes about those keys off the number.
-					fail(responseStatus, message, msg)
-				else
-					-- Could be a partial SSE event, buffer it
-					processSSEEvents(message)
+		partial = function(): string?
+			-- textParts is only filled in at message_stop, which an error mid-stream
+			-- never reaches, so it is empty here even when real text already
+			-- arrived. Read live from contentBlocks instead, the same accumulator
+			-- onText has been writing into all along. Indexed by blockCount rather
+			-- than ipairs for the same reason message_stop is: a hole would cut the
+			-- partial text short.
+			local partial: { string } = {}
+			for i = 1, blockCount do
+				local block = contentBlocks[i]
+				if block and block.type == "text" and block.text ~= "" then
+					table.insert(partial, block.text)
 				end
 			end
-		end)
+			return if #partial > 0 then table.concat(partial, "\n") else nil
+		end,
 
-		stream.Error:Connect(function(statusCode: number, errorMessage: string)
-			-- An abandoned socket erroring on its way out must not be allowed to
-			-- fail the attempt that replaced it.
-			if myGeneration ~= generation then return end
-			-- Which side of the first byte this died on, and how long it took to get
-			-- there. Spelled out in the message itself rather than logged separately,
-			-- because the person who sees this is the one who has to decide whether
-			-- the history is too big or the connection is bad.
-			local now = os.time()
-			local where: string
-			if firstByteAt == nil then
-				where = string.format(
-					"silent for %ds, no first byte — the prefix was almost certainly uncached and the server was still reading it",
-					now - startedAt)
-			else
-				where = string.format(
-					"first byte after %ds, then stalled %ds mid-answer",
-					(firstByteAt :: number) - startedAt, now - (firstByteAt :: number))
-			end
-			-- errorMessage carries the HttpError name, which is what isRetryable
-			-- matches InactivityTimeout on; the status here is 200 for a stream that
-			-- opened cleanly and then went quiet.
-			fail(statusCode, errorMessage,
-				string.format("Stream error (HTTP %s): %s — %s",
-					tostring(statusCode), tostring(errorMessage), where))
-		end)
-
-		stream.Closed:Connect(function()
-			-- Stream ended. If onComplete hasn't fired, this was unexpected.
-		end)
-	end
-
-	start()
-	return handle
+		refresh = function()
+			OAuth.refresh()
+		end,
+		needsRefresh = needsTokenRefresh,
+		windowReset = rateLimitResetSeconds,
+	}, {
+		onError = callbacks.onError,
+		onRetry = callbacks.onRetry,
+	})
 end
 
 -- Self-test
@@ -1106,6 +697,14 @@ end
 -- over the 4-breakpoint cap, and a rewritten user message survives into the
 -- saved session, where replay no longer recognises it.
 local function selfTest(): (boolean, string?)
+	-- Retry moved to its own module and took its assertions with it. Chained
+	-- rather than dropped: it is still this provider's retry behaviour, and
+	-- startup is the only gate any of this has.
+	local retryOk, retryErr = Retry.selfTest()
+	if not retryOk then return false, "Retry: " .. tostring(retryErr) end
+	local jsonOk, jsonErr = ToolJson.selfTest()
+	if not jsonOk then return false, "ToolJson: " .. tostring(jsonErr) end
+
 	local function countTags(messages: { any }): number
 		local tags = 0
 		for _, message in ipairs(messages) do
@@ -1183,92 +782,6 @@ local function selfTest(): (boolean, string?)
 			tostring(budget.thinking.budget_tokens))
 	end
 
-	-- Retry classification. Each of these has a way of being wrong that costs
-	-- something real: refusing a 529 wastes the turn, retrying a 400 wastes the
-	-- user's time twice, and missing the body-matched overload means the one
-	-- error that arrives inside a 200 response is never caught.
-	if not isRetryable(429, nil) then return false, "429 is not being retried" end
-	if not isRetryable(529, nil) then return false, "529 is not being retried" end
-	if not isRetryable(nil, '{"type":"error","error":{"type":"overloaded_error"}}') then
-		return false, "overloaded_error in a 200 stream is not being retried"
-	end
-	if not isRetryable(200, "HttpError: InactivityTimeout") then
-		return false, "InactivityTimeout is not being retried"
-	end
-	-- A transport failure carries no status at all, so the -1 is the whole test:
-	-- NetFail before the first byte used to fall through as fatal and end the
-	-- turn without one retry, because InactivityTimeout was the only name matched.
-	if not isRetryable(-1, "HttpError: NetFail") then
-		return false, "a transport failure with no status is not being retried"
-	end
-	if isRetryable(-1, "HttpError: SslVerificationFail") then
-		return false, "a certificate failure is being retried; it cannot succeed"
-	end
-	if isRetryable(400, "invalid_request_error") then
-		return false, "a 400 is being retried; it cannot succeed"
-	end
-	if isRetryable(401, nil) then return false, "an auth failure is being retried" end
-	if not isOverload(nil, '{"type":"overloaded_error"}') then
-		return false, "overload not detected from the body, so it gets the wrong budget"
-	end
-	if isOverload(429, nil) then return false, "a 429 is being counted against the 529 budget" end
-
-	-- retry-after wins when it is the longer wait, and does NOT shorten a backoff
-	-- that has already grown past it — the second half is the part the leaked
-	-- tree gets wrong, so it is worth pinning.
-	if retryDelay(1, 7) ~= 7 then return false, "retry-after was not honoured" end
-	if retryDelay(8, 1) <= 1 then
-		return false, "a short retry-after shortened a long backoff"
-	end
-	-- Doubling, and the jitter only ever adds.
-	for attempt = 1, 8 do
-		local base = math.min(BASE_DELAY * 2 ^ (attempt - 1), MAX_DELAY)
-		local delay = retryDelay(attempt, nil)
-		if delay < base or delay > base * 1.25 then
-			return false, string.format("retryDelay(%d) = %.3f, outside [%.3f, %.3f]",
-				attempt, delay, base, base * 1.25)
-		end
-	end
-	if retryDelay(99, nil) > MAX_DELAY * 1.25 then
-		return false, "backoff is not capped"
-	end
-
-	if retryAfterSeconds("content-type: application/json\r\nretry-after: 12\r\n") ~= 12 then
-		return false, "retry-after header not parsed"
-	end
-	if retryAfterSeconds("Retry-After: 3") ~= 3 then
-		return false, "retry-after header is case-sensitive"
-	end
-	if retryAfterSeconds("content-type: application/json") ~= nil then
-		return false, "retry-after invented from headers that carry none"
-	end
-
-	-- Tool input. The strict path must stay strict, and the repair must only ever
-	-- rescue an unescaped control character INSIDE a string: a body that is
-	-- genuinely truncated has to keep failing, or the "retry with a smaller
-	-- input" the agent prints in its place becomes a lie.
-	local good = decodeToolInput('{"path":"/a","content":"one\\ntwo"}')
-	if not good or good.content ~= "one\ntwo" then
-		return false, "a valid tool input did not decode"
-	end
-	-- The reported failure: a literal newline where the model owed a \n. The one
-	-- BETWEEN values is legal whitespace and must survive untouched, which is the
-	-- half that says the repair tracks string boundaries rather than replacing
-	-- every newline in the document.
-	local repaired = decodeToolInput('{"path":"/a",\n"content":"one\ntwo"}')
-	if not repaired or repaired.content ~= "one\ntwo" then
-		return false, "a literal newline inside a JSON string was not repaired"
-	end
-	if decodeToolInput('{"path":"/a","content":"tail\\"}') ~= nil then
-		return false, "an escaped quote was miscounted, so the repair closed a string early"
-	end
-	if decodeToolInput('{"path":"/a","content":"cut off') ~= nil then
-		return false, "a truncated tool input was accepted; the retry hint would be wrong"
-	end
-	if decodeToolInput("") == nil then
-		return false, "a no-argument tool call did not decode as an empty object"
-	end
-
 	if not needsTokenRefresh(401, nil) then return false, "401 does not trigger a token refresh" end
 	if not needsTokenRefresh(403, '{"error":{"message":"OAuth token has been revoked"}}') then
 		return false, "a revoked-token 403 does not trigger a refresh"
@@ -1277,10 +790,6 @@ local function selfTest(): (boolean, string?)
 		return false, "a plain permission 403 is being answered with a token refresh"
 	end
 	if needsTokenRefresh(429, nil) then return false, "a rate limit is being treated as an auth failure" end
-	if not isRetryable(500, nil) then return false, "500 api_error is not being retried" end
-	if not isRetryable(503, nil) then return false, "503 is not being retried" end
-	if isRetryable(404, nil) then return false, "404 is being retried" end
-	if isRetryable(413, nil) then return false, "413 request_too_large is being retried" end
 
 	-- A window reset in the future is reported; one in the past is not a limit
 	-- at all and must not be mistaken for one.
@@ -1305,7 +814,7 @@ return {
 	streamMessage = streamMessage,
 	selfTest = selfTest,
 	MODELS = MODELS,
-	webSearchTool = webSearchTool,
+	acceptsModelId = acceptsModelId,
 	DEFAULT_MODEL = DEFAULT_MODEL,
 	_MESSAGES_URL = MESSAGES_URL,
 	_ANTHROPIC_VERSION = ANTHROPIC_VERSION,

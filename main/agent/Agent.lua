@@ -9,7 +9,6 @@
 local ui = script.Parent.Parent:WaitForChild("ui")
 
 local Provider = require(script.Parent:WaitForChild("Provider"))
-local Wire = Provider.wire
 local Tools = require(script.Parent:WaitForChild("Tools"))
 local Console = require(ui:WaitForChild("Console"))
 local Settings = require(ui:WaitForChild("Settings"))
@@ -217,12 +216,7 @@ end
 -- sorts; web search is appended last so toggling it only ever invalidates from
 -- the end of the tool block onward.
 local function buildTools(): { any }
-	local tools = Tools.definitions()
-	local searches = Settings.webSearchMaxUses()
-	if searches > 0 then
-		table.insert(tools, Wire.webSearchTool(searches))
-	end
-	return tools
+	return Tools.definitions()
 end
 
 local term: any = nil
@@ -711,12 +705,16 @@ local function runTurn(turn: number)
 	-- recursions included, so a long sweep keeps the cache correctly marked warm.
 	lastRequestAt = os.time()
 
-	stream = Wire.streamMessage({
+	stream = Provider.wire.streamMessage({
 		model = Settings.model(),
 		system = Settings.system(),
 		messages = conversation,
 		effort = Settings.effort(),
 		tools = buildTools(),
+		-- How many searches are allowed, not what a search IS. Anthropic runs it
+		-- as a server tool in the tools array; OpenRouter runs it as a body-level
+		-- plugin. Both are the provider's business, and neither is Agent's.
+		webSearch = Settings.webSearchMaxUses(),
 	}, {
 		onThinking = function(delta: string)
 			if not thinkingSeen then

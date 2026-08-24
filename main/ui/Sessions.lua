@@ -40,7 +40,20 @@ local MAX_BYTES = 400000
 local KEEP_RESULTS = 5
 local CLEARED = "[old tool result cleared — re-run the command if needed]"
 
-type Entry = { id: string, title: string, place: number, updated: number }
+-- `provider` is stamped on the index rather than into the saved blob, so
+-- there is no stored format to migrate: an entry written before this simply
+-- has none, and is read as Claude's, which is what it was.
+--
+-- It is load-bearing, not bookkeeping. A conversation is shaped by whoever
+-- produced it, down to thinking-block signatures that only the issuing provider
+-- can decrypt, so replaying one into the other is rejected by the API — or
+-- worse, quietly accepted with the reasoning stripped.
+type Entry = { id: string, title: string, place: number, updated: number, provider: string? }
+
+-- `Provider.id` is read at CALL time, never captured here: main.luau requires
+-- this module before it calls Provider.Initialize, so a copy taken now would be
+-- the default rather than the saved one, and would never follow a switch.
+local Provider = require(script.Parent.Parent:WaitForChild("agent"):WaitForChild("Provider"))
 
 local pluginRef: Plugin = nil :: any
 local index: { Entry } = {}
@@ -188,6 +201,9 @@ function Sessions.save()
 		entry = { id = currentId, title = "", place = game.PlaceId, updated = 0 }
 		table.insert(index, entry :: Entry)
 	end
+	-- Stamped on every save, not only at creation: /clear empties a session in
+	-- place, so the provider has to follow whatever produced the messages NOW.
+	entry.provider = Provider.id
 	-- Retitled every save rather than once at creation: /clear empties the
 	-- conversation without changing session, so the title has to follow whatever
 	-- the first message is NOW.
@@ -378,6 +394,18 @@ local function repairInputs(conversation: { any })
 end
 
 function Sessions.load(id: string)
+	-- Refused rather than half-loaded. The alternative is a conversation that
+	-- looks fine on screen and is rejected by the API on the next turn, with an
+	-- error naming a signature rather than the session that carried it.
+	local entry = entryFor(id)
+	local owner = (entry and entry.provider) or "anthropic"
+	if owner ~= Provider.id then
+		Console.appendLine(string.format(
+			"That session was made with %s. Switch back with /provider %s to open it.",
+			Provider.label(owner), owner), "error")
+		return
+	end
+
 	local conversation = decode(pluginRef:GetSetting(KEY_PREFIX .. id))
 	if type(conversation) ~= "table" then
 		Console.appendLine("That session could not be loaded.", "error")
@@ -481,9 +509,14 @@ end
 
 -- Most recent session for THIS place, restored on open so a crash costs no
 -- clicks. Silent when there is nothing to restore.
+-- The most recent session for this place THAT THIS PROVIDER MADE. Skipping the
+-- others rather than refusing on the first one: reopening the plugin after a
+-- provider switch should land somewhere usable, not print an error about a
+-- session nobody asked for.
 function Sessions.restoreLast()
 	for _, entry in ipairs(index) do
-		if entry.place == game.PlaceId then
+		if entry.place == game.PlaceId
+			and ((entry.provider or "anthropic") == Provider.id) then
 			Sessions.load(entry.id)
 			return
 		end

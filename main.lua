@@ -33,8 +33,6 @@ local ui    = script:WaitForChild("ui")
 
 local Sha256   = require(util:WaitForChild("Sha256"))   :: any
 local Provider = require(agent:WaitForChild("Provider")) :: any
-local Auth     = Provider.auth
-local Wire     = Provider.wire
 local Props    = require(studio:WaitForChild("Props"))  :: any
 local Fs       = require(fs:WaitForChild("Fs"))         :: any
 local Terminal = require(fs:WaitForChild("Terminal"))   :: any
@@ -352,85 +350,35 @@ end
 -- Held between openings so the bars are already on screen while a refresh is in
 -- flight, and so a rate-limited fetch (the usage endpoint has its own limit)
 -- leaves the last known numbers up instead of blanking them.
-local usageWindows: { [string]: any }? = nil
+local usageWindows: { any }? = nil
 local usageError: string? = nil
 local usageFetchedAt = 0
 local usageInFlight = false
 
--- resets_at comes back as ISO 8601 with microseconds and a numeric offset
--- ("2026-08-04T06:50:08.843137+00:00"), which DateTime.fromIsoDate rejects.
--- Pull the fields out and rebuild the instant, applying the offset by hand.
-local function isoToEpoch(iso: string): number?
-	local y, mo, d, h, mi, s = iso:match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
-	if not y then return nil end
-	local ok, moment = pcall(function()
-		return DateTime.fromUniversalTime(
-			tonumber(y) :: number, tonumber(mo) :: number, tonumber(d) :: number,
-			tonumber(h) :: number, tonumber(mi) :: number, tonumber(s) :: number
-		)
-	end)
-	if not ok then return nil end
-	local epoch = moment.UnixTimestamp
-	local sign, offH, offM = iso:match("([%+%-])(%d%d):(%d%d)$")
-	if sign then
-		local shift = (tonumber(offH) :: number) * 3600 + (tonumber(offM) :: number) * 60
-		epoch += if sign == "+" then -shift else shift
-	end
-	return epoch
-end
-
-local function untilReset(resetsAt: any): string
-	if type(resetsAt) == "string" then
-		resetsAt = isoToEpoch(resetsAt)
-	end
-	if type(resetsAt) ~= "number" then return "" end
-	local seconds = resetsAt - os.time()
-	if seconds <= 0 then return "resets now" end
-	if seconds < 3600 then return string.format("resets in %dm", math.floor(seconds / 60)) end
-	if seconds < 86400 then
-		return string.format("resets in %dh %dm", math.floor(seconds / 3600), math.floor(seconds % 3600 / 60))
-	end
-	return string.format("resets in %dd %dh", math.floor(seconds / 86400), math.floor(seconds % 86400 / 3600))
-end
-
--- ponytail: the endpoint's utilization scale isn't documented, and both 0..1 and
--- 0..100 appear in the wild. Anything above 1 is read as a percentage. Drop the
--- branch once the live response settles it.
-local function fraction(utilization: any): number?
-	if type(utilization) ~= "number" then return nil end
-	return math.clamp(if utilization > 1 then utilization / 100 else utilization, 0, 1)
-end
-
+-- Already formatted by whichever provider fetched them: one reports rolling
+-- utilisation windows and the other reports credits, and this panel is not the
+-- place to know the difference.
 local function usageRows(rows: { Settings.StatusRow })
-	if not Auth.isLoggedIn() then return end
+	if not Provider.auth.isLoggedIn() then return end
 	if not usageWindows then
 		table.insert(rows, { label = "Plan usage", value = usageError or "loading…" })
 		return
 	end
-	for _, window in ipairs({
-		{ key = "five_hour", label = "Session (5h)" },
-		{ key = "seven_day", label = "Weekly" },
-	}) do
-		local data = usageWindows[window.key]
-		if type(data) == "table" then
-			local used = fraction(data.utilization)
-			if used then
-				local age = usageError and " · stale" or ""
-				table.insert(rows, {
-					label = window.label,
-					value = string.format("%d%% · %s%s", math.floor(used * 100 + 0.5), untilReset(data.resets_at), age),
-					bar = used,
-				})
-			end
-		end
+	local age = usageError and " · stale" or ""
+	for _, row in ipairs(usageWindows) do
+		table.insert(rows, {
+			label = row.label,
+			value = row.value .. age,
+			bar = row.bar,
+		})
 	end
 end
 
 local toggleSettings, refreshSettings = Settings.mountPanel(widget, function(): { Settings.StatusRow }
 	local rows: { Settings.StatusRow } = {}
 
-	if Auth.isLoggedIn() then
-		local expiry = Auth.tokenExpiry()
+	if Provider.auth.isLoggedIn() then
+		local expiry = Provider.auth.tokenExpiry()
 		local detail = "yes"
 		if expiry then
 			detail = string.format("yes · ~%d min", math.max(0, math.floor((expiry - os.time()) / 60)))
@@ -468,11 +416,11 @@ end)
 -- synchronous status provider above. Fetch on open, redraw when it lands.
 local USAGE_MAX_AGE = 60
 local function refreshUsage()
-	if usageInFlight or not Auth.isLoggedIn() then return end
+	if usageInFlight or not Provider.auth.isLoggedIn() then return end
 	if usageWindows and os.clock() - usageFetchedAt < USAGE_MAX_AGE then return end
 	usageInFlight = true
 	task.spawn(function()
-		local windows, err = Auth.fetchUsage()
+		local windows, err = Provider.auth.fetchUsage()
 		usageInFlight = false
 		if windows then
 			usageWindows = windows
@@ -551,7 +499,7 @@ local function refreshModel()
 		'  <font color="#6B6862" size="12">%s</font>',
 		Settings.effortName():lower()
 	)
-	for _, entry in ipairs(Wire.MODELS) do
+	for _, entry in ipairs(Provider.wire.MODELS) do
 		if entry.id == id then
 			modelButton.Text = entry.name .. effort
 			return
@@ -567,22 +515,36 @@ end
 -- keyboard shape; with a mouse the same idea is a submenu, so the Effort row
 -- swaps this popup to a second page and back.
 --
--- No "More models" page, which Claude Code does have: it is there because that
--- list runs to a dozen entries including legacy ones. Ours is three, and
--- `/model claude-anything` already takes an id the list has never heard of.
-local modelPopup = make("Frame", {
+-- A ScrollingFrame rather than a Frame, and the reason is the model list. This
+-- used to be three hardcoded entries and grew to fit them; OpenRouter's free
+-- roster is around twenty and is FETCHED, so its length is not something this
+-- file can know. AutomaticSize grows the popup to its content, MaxSize stops it
+-- growing off the top of the widget, and AutomaticCanvasSize gives it something
+-- to scroll once it hits that cap.
+--
+-- No "More models" page, which Claude Code does have. Scrolling covers it, and
+-- `/model <anything>` still takes an id no list has ever heard of.
+local modelPopup = make("ScrollingFrame", {
 	Name = "ModelPopup",
 	Parent = widget,
 	BackgroundColor3 = Theme.BG_INPUT,
 	BorderColor3 = Theme.BORDER,
 	BorderSizePixel = 1,
 	AnchorPoint = Vector2.new(1, 1),
-	-- Height follows the page, which is two different lengths.
+	-- Height follows the page, which is now three different lengths.
 	Size = UDim2.new(0, 240, 0, 0),
 	AutomaticSize = Enum.AutomaticSize.Y,
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	CanvasSize = UDim2.new(),
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	ScrollBarThickness = 4,
+	ScrollBarImageColor3 = Theme.BORDER,
 	Visible = false,
 	ZIndex = 45,
 })
+-- 360px is about twelve rows. Past that the list scrolls rather than running
+-- off the top of a widget that may only be a few hundred pixels tall itself.
+make("UISizeConstraint", { Parent = modelPopup, MaxSize = Vector2.new(240, 360) })
 make("UIListLayout", { Parent = modelPopup, SortOrder = Enum.SortOrder.LayoutOrder })
 make("UIPadding", { Parent = modelPopup, PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 2) })
 
@@ -668,13 +630,55 @@ local function popupRow(
 	row.MouseButton1Click:Connect(onClick)
 end
 
--- Rebuilt on every open and every page flip, rather than kept in sync: it is
--- eight rows, and /model, /effort and the settings panel can all have moved the
--- selection since the last time this was on screen.
+local function popupDivider(order: number)
+	make("Frame", {
+		Parent = modelPopup,
+		BackgroundColor3 = Theme.BORDER,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 0, 1),
+		LayoutOrder = order,
+		ZIndex = 46,
+	})
+end
+
+-- Rebuilt on every open and every page flip, rather than kept in sync: /model,
+-- /effort, /provider and the settings panel can all have moved the selection
+-- since the last time this was on screen.
 local effortPage = false
+local providerPage = false
 local function drawPopup()
 	for _, child in ipairs(modelPopup:GetChildren()) do
 		if child:IsA("GuiObject") then child:Destroy() end
+	end
+
+	if providerPage then
+		popupRow(1, "Models", "chevron-small-left", nil, false, function()
+			providerPage = false
+			drawPopup()
+		end)
+		popupDivider(2)
+		for i, entry in ipairs(Provider.list()) do
+			popupRow(i + 2, entry.label, entry.id == Provider.id and "check-small" or nil,
+				entry.hint, false, function()
+					if entry.id ~= Provider.id then
+						Provider.use(entry.id)
+						Settings.reloadModel()
+						-- The conversation is shaped by whoever produced it, so it
+						-- cannot come along. A NEW session rather than a wipe: the old
+						-- one stays on disk and reopens when you switch back.
+						Sessions.new()
+						Console.appendLine(string.format("Provider: %s · model %s",
+							Provider.label(entry.id), Settings.model()), "assistant")
+						if not Provider.auth.isLoggedIn() then
+							Console.appendLine("Not logged in for this provider. Use /login.", "info")
+						end
+					end
+					providerPage = false
+					modelPopup.Visible = false
+					refreshModel()
+				end)
+		end
+		return
 	end
 
 	if effortPage then
@@ -682,14 +686,7 @@ local function drawPopup()
 			effortPage = false
 			drawPopup()
 		end)
-		make("Frame", {
-			Parent = modelPopup,
-			BackgroundColor3 = Theme.BORDER,
-			BorderSizePixel = 0,
-			Size = UDim2.new(1, 0, 0, 1),
-			LayoutOrder = 2,
-			ZIndex = 46,
-		})
+		popupDivider(2)
 		local current = Settings.effortName()
 		for i, level in ipairs(Settings.EFFORT_LEVELS) do
 			popupRow(i + 2, level.name, level.name == current and "check-small" or nil,
@@ -705,7 +702,7 @@ local function drawPopup()
 	end
 
 	local current = Settings.model()
-	for i, entry in ipairs(Wire.MODELS) do
+	for i, entry in ipairs(Provider.wire.MODELS) do
 		-- The parenthetical rides in the trailing column rather than being dropped:
 		-- it is the only thing separating "Max only" from "fastest" at the moment
 		-- of choosing.
@@ -715,15 +712,13 @@ local function drawPopup()
 			refreshModel()
 		end)
 	end
-	make("Frame", {
-		Parent = modelPopup,
-		BackgroundColor3 = Theme.BORDER,
-		BorderSizePixel = 0,
-		Size = UDim2.new(1, 0, 0, 1),
-		LayoutOrder = #Wire.MODELS + 1,
-		ZIndex = 46,
-	})
-	popupRow(#Wire.MODELS + 2, "Effort", nil, Settings.effortName():lower(), true, function()
+	local n = #Provider.wire.MODELS
+	popupDivider(n + 1)
+	popupRow(n + 2, "Provider", nil, Provider.label():lower(), true, function()
+		providerPage = true
+		drawPopup()
+	end)
+	popupRow(n + 3, "Effort", nil, Settings.effortName():lower(), true, function()
 		effortPage = true
 		drawPopup()
 	end)
@@ -735,6 +730,7 @@ modelButton.MouseButton1Click:Connect(function()
 		return
 	end
 	effortPage = false
+	providerPage = false
 	drawPopup()
 	-- Right-aligned with the chip, floating just above the input row however tall
 	-- that row currently is.
@@ -848,7 +844,7 @@ local function submit(text: string)
 	-- peek is up.
 	Sessions.endPeek()
 	if not Commands.handle(text) then
-		Agent.send(text, Auth.isLoggedIn)
+		Agent.send(text, Provider.auth.isLoggedIn)
 	end
 	-- `/model` changes it from under the chip.
 	refreshModel()
@@ -959,7 +955,7 @@ task.spawn(function()
 	end
 
 	Console.appendLine(NAME, "system")
-	if Auth.isLoggedIn() then
+	if Provider.auth.isLoggedIn() then
 		Console.appendLine("Logged in. Type /help for commands, or just start typing.", "info")
 	else
 		Console.appendLine("Not logged in. Type /login to start.", "info")
@@ -992,9 +988,9 @@ task.spawn(function()
 	if not agentOk then
 		warn("[agent] Context trimming self-test FAILED: " .. tostring(agentErr))
 	end
-	local cacheOk, cacheErr = Wire.selfTest()
-	if not cacheOk then
-		warn("[agent] Prompt cache self-test FAILED: " .. tostring(cacheErr))
+	local providerOk, providerErr = Provider.selfTest()
+	if not providerOk then
+		warn("[agent] Provider self-test FAILED: " .. tostring(providerErr))
 	end
 	local sessionsOk, sessionsErr = Sessions.selfTest()
 	if not sessionsOk then
