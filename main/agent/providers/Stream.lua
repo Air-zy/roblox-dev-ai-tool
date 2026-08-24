@@ -22,6 +22,8 @@
 --   reset()    -> ()          clear the provider's per-attempt accumulators
 --   frame(text, ctrl) -> ()   one complete SSE frame, "\n\n"-delimited
 --   partial()  -> string?     text already accumulated, for the error handover
+--   explain?(status, body) -> string?   replace the error line for a status
+--                 this provider can say something more useful about
 --   closed?(ctrl) -> ()       the socket ended without the provider finishing.
 --                 A clean close raises no Error, so a protocol whose terminator
 --                 can go missing would otherwise leave the turn spinning until
@@ -59,6 +61,7 @@ function Stream.open(config: {
 	frame: (string, Ctrl) -> (),
 	partial: () -> string?,
 	closed: ((Ctrl) -> ())?,
+	explain: ((number?, string?) -> string?)?,
 	refresh: (() -> ())?,
 	needsRefresh: ((number?, string?) -> boolean)?,
 	windowReset: ((string?) -> number?)?,
@@ -333,7 +336,15 @@ function Stream.open(config: {
 			end)
 			if parseOk and type(parsed) == "table" and (parsed :: any).error then
 				local e = (parsed :: any).error
-				local msg = "HTTP error: " .. tostring(e.type or "") .. " — " .. tostring(e.message or "")
+				-- `type` is Anthropic's spelling, `code` is OpenAI's and
+				-- OpenRouter's. Reading only the first left every OpenRouter
+				-- failure reading "HTTP error:  — ...", blank where the useful
+				-- half goes.
+				local kind = e.type or e.code
+				local msg = "HTTP error: " .. tostring(kind or status or "") .. " — " .. tostring(e.message or "")
+				if config.explain then
+					msg = config.explain(status or responseStatus, message) or msg
+				end
 				warn("[agent] " .. msg)
 				warn("[agent] Response body: " .. message)
 				-- The body is passed on so an overloaded_error is recognised even

@@ -542,9 +542,60 @@ local modelPopup = make("ScrollingFrame", {
 	Visible = false,
 	ZIndex = 45,
 })
--- 360px is about twelve rows. Past that the list scrolls rather than running
--- off the top of a widget that may only be a few hundred pixels tall itself.
-make("UISizeConstraint", { Parent = modelPopup, MaxSize = Vector2.new(240, 360) })
+-- Insurance rather than the mechanism: the models page shows at most
+-- MAX_MODEL_ROWS entries, so this only ever binds on the effort page.
+make("UISizeConstraint", { Parent = modelPopup, MaxSize = Vector2.new(240, 320) })
+
+-- At most this many models on screen at once. OpenRouter's free roster is about
+-- twenty and every one of them has a long slug, so the list was taller than the
+-- widget and ran off the top of it. Four plus a search box is the whole list
+-- reachable in a couple of keystrokes, and a fixed popup height.
+local MAX_MODEL_ROWS = 4
+
+-- Built ONCE and never destroyed, which is the entire trick: drawPopup runs on
+-- every keystroke, and a TextBox that gets rebuilt underneath the person typing
+-- loses focus after the first character. Sessions' drawer filter is built the
+-- same way and for the same reason. Hidden on the pages that are not the model
+-- list; UIListLayout skips invisible children, so it costs no space there.
+local modelQuery = ""
+local modelSearch: TextBox
+do
+	local row = make("Frame", {
+		Name = "ModelSearch",
+		Parent = modelPopup,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 26),
+		LayoutOrder = 0,
+		ZIndex = 46,
+	})
+	make("TextLabel", {
+		Parent = row,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(0, 16, 1, 0),
+		Position = UDim2.new(0, 9, 0, 0),
+		FontFace = Theme.ICON,
+		TextSize = 12,
+		TextColor3 = Theme.TEXT_LO,
+		Text = "magnifying-glass",
+		ZIndex = 47,
+	})
+	modelSearch = make("TextBox", {
+		Parent = row,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, -34, 1, 0),
+		Position = UDim2.new(0, 28, 0, 0),
+		FontFace = Theme.SANS,
+		TextSize = 12,
+		TextColor3 = Theme.TEXT_HI,
+		ClearTextOnFocus = false,
+		MultiLine = false,
+		Text = "",
+		PlaceholderText = "Search models…",
+		PlaceholderColor3 = Theme.TEXT_LO,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		ZIndex = 47,
+	}) :: TextBox
+end
 make("UIListLayout", { Parent = modelPopup, SortOrder = Enum.SortOrder.LayoutOrder })
 make("UIPadding", { Parent = modelPopup, PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 2) })
 
@@ -630,6 +681,23 @@ local function popupRow(
 	row.MouseButton1Click:Connect(onClick)
 end
 
+local function popupNote(order: number, text: string)
+	make("TextLabel", {
+		Parent = modelPopup,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, -20, 0, 22),
+		Position = UDim2.new(0, 10, 0, 0),
+		FontFace = Theme.SANS,
+		TextSize = 12,
+		TextColor3 = Theme.TEXT_LO,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Text = text,
+		LayoutOrder = order,
+		ZIndex = 46,
+	})
+end
+
 local function popupDivider(order: number)
 	make("Frame", {
 		Parent = modelPopup,
@@ -648,8 +716,11 @@ local effortPage = false
 local providerPage = false
 local function drawPopup()
 	for _, child in ipairs(modelPopup:GetChildren()) do
-		if child:IsA("GuiObject") then child:Destroy() end
+		if child:IsA("GuiObject") and child ~= modelSearch.Parent then child:Destroy() end
 	end
+	-- Only the model list is searchable; the other two pages are five rows and
+	-- two rows respectively.
+	modelSearch.Parent.Visible = not (effortPage or providerPage)
 
 	if providerPage then
 		popupRow(1, "Models", "chevron-small-left", nil, false, function()
@@ -702,17 +773,41 @@ local function drawPopup()
 	end
 
 	local current = Settings.model()
-	for i, entry in ipairs(Provider.wire.MODELS) do
-		-- The parenthetical rides in the trailing column rather than being dropped:
-		-- it is the only thing separating "Max only" from "fastest" at the moment
-		-- of choosing.
-		popupRow(i, entry.name, entry.id == current and "check-small" or nil, entry.hint, false, function()
-			Settings.setModel(entry.id)
-			modelPopup.Visible = false
-			refreshModel()
-		end)
+	-- Matched against the id as well as the name, because the id is what carries
+	-- the vendor: "ox" should find stealth/ox-alpha, and so should "stealth".
+	local shown, matches = 0, 0
+	for _, entry in ipairs(Provider.wire.MODELS) do
+		local hit = modelQuery == ""
+			or entry.name:lower():find(modelQuery, 1, true) ~= nil
+			or entry.id:lower():find(modelQuery, 1, true) ~= nil
+		if hit then
+			matches += 1
+			if shown < MAX_MODEL_ROWS then
+				shown += 1
+				-- The parenthetical rides in the trailing column rather than being
+				-- dropped: it is the only thing separating "Max only" from "fastest"
+				-- at the moment of choosing.
+				local id, name, hint = entry.id, entry.name, entry.hint
+				popupRow(shown, name, id == current and "check-small" or nil, hint, false, function()
+					Settings.setModel(id)
+					modelPopup.Visible = false
+					refreshModel()
+				end)
+			end
+		end
 	end
-	local n = #Provider.wire.MODELS
+
+	local n = shown
+	if matches == 0 then
+		n += 1
+		popupNote(n, "Nothing matches that.")
+	elseif matches > shown then
+		-- Said rather than silently truncated: the selected model can easily be
+		-- one of the ones not drawn, and without this the list looks complete.
+		n += 1
+		popupNote(n, string.format("%d more — keep typing", matches - shown))
+	end
+
 	popupDivider(n + 1)
 	popupRow(n + 2, "Provider", nil, Provider.label():lower(), true, function()
 		providerPage = true
@@ -724,6 +819,11 @@ local function drawPopup()
 	end)
 end
 
+modelSearch:GetPropertyChangedSignal("Text"):Connect(function()
+	modelQuery = modelSearch.Text:lower()
+	drawPopup()
+end)
+
 modelButton.MouseButton1Click:Connect(function()
 	if modelPopup.Visible then
 		modelPopup.Visible = false
@@ -731,6 +831,11 @@ modelButton.MouseButton1Click:Connect(function()
 	end
 	effortPage = false
 	providerPage = false
+	-- Every open starts from the whole list. Setting Text fires the handler
+	-- above, which redraws, so `drawPopup` below is for the case where it was
+	-- already empty and nothing changed.
+	modelSearch.Text = ""
+	modelQuery = ""
 	drawPopup()
 	-- Right-aligned with the chip, floating just above the input row however tall
 	-- that row currently is.

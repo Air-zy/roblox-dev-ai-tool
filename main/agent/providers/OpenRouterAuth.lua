@@ -71,8 +71,13 @@ local function startLogin(): { authorizeUrl: string, state: string }
 	if plugin then
 		plugin:SetSetting(KEY_PKCE_VERIFIER, verifier)
 	end
+	-- callback_url is OMITTED, not sent empty. That absence is what selects the
+	-- documented headless mode, where the code is shown on screen to copy rather
+	-- than redirected somewhere — the only mode a Studio plugin can use, since
+	-- there is nothing here to receive a redirect. key_label is required in that
+	-- mode and becomes the key's name on the user's dashboard.
 	local url = string.format(
-		"%s?callback_url=&code_challenge=%s&code_challenge_method=S256&key_label=%s",
+		"%s?code_challenge=%s&code_challenge_method=S256&key_label=%s",
 		AUTHORIZE_URL,
 		HttpService:UrlEncode(challenge),
 		HttpService:UrlEncode(KEY_LABEL))
@@ -235,12 +240,19 @@ local function fetchUsage(): ({ { label: string, value: string, bar: number? } }
 
 	-- A key with no limit is the normal case for a pay-as-you-go account, and
 	-- there is no fraction to draw for it — only a number spent.
+	--
+	-- A limit of ZERO is not that case, and used to fall through to the same
+	-- "$0.00 used" line — which reads like an idle account when it is in fact the
+	-- whole problem. A key capped at nothing is refused on billing grounds for
+	-- every request, free models included, so it gets said out loud.
 	if type(d.limit) == "number" and d.limit > 0 then
 		table.insert(rows, {
 			label = "Credits",
 			value = string.format("%s of %s", money(d.usage), money(d.limit)),
 			bar = math.clamp((d.usage or 0) / d.limit, 0, 1),
 		})
+	elseif type(d.limit) == "number" then
+		table.insert(rows, { label = "Key limit", value = "$0 — this key cannot spend" })
 	else
 		table.insert(rows, { label = "Credits", value = money(d.usage) .. " used" })
 	end
@@ -261,6 +273,11 @@ local function fetchUsage(): ({ { label: string, value: string, bar: number? } }
 end
 
 return {
+	-- Exported because the wire quotes these numbers back at the user when a
+	-- request is refused for credits, and two copies of a limit is two things to
+	-- get wrong on the day OpenRouter changes it.
+	FREE_RPD = FREE_RPD,
+	PAID_RPD = PAID_RPD,
 	Initialize = Initialize,
 	startLogin = startLogin,
 	completeLogin = completeLogin,

@@ -700,6 +700,25 @@ local function streamMessage(args: {
 			return if textAcc ~= "" then textAcc else nil
 		end,
 
+		-- A 402 on a model that costs nothing is confusing enough to be worth
+		-- spelling out, because the raw message names none of its three causes.
+		-- The free daily request cap is SHARED across every free model, so
+		-- switching models cannot help and it looks like they are all broken; a
+		-- key can carry a spending limit of its own, and one capped at $0 refuses
+		-- free models too; and a negative account balance blocks them as well.
+		-- Worth saying here rather than anywhere else: an agent turn is many
+		-- requests, not one, so a 50/day cap goes faster in this plugin than it
+		-- would in a chat window.
+		explain = function(status: number?, _body: string?): string?
+			if status ~= 402 then return nil end
+			return string.format(
+				"Out of free requests, or this key cannot spend. The free cap is shared "
+				.. "across ALL free models (%d/day, %d once $10 of credits has ever been "
+				.. "bought) and resets at UTC midnight, so switching models will not help. "
+				.. "Settings shows this key's own limit; a key created with a $0 cap is "
+				.. "refused for free models too.", Auth.FREE_RPD, Auth.PAID_RPD)
+		end,
+
 		-- No refresh hook: an OpenRouter key does not expire, so a 401 means it
 		-- was deleted and asking again with the same one cannot help.
 	}, {
