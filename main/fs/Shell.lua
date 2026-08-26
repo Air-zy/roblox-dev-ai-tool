@@ -506,7 +506,12 @@ local UNSUPPORTED: { [string]: string } = {
 	sudo = "no privilege levels here",
 	ps = "no processes; `ls /Workspace` or the run tool is what you want",
 	kill = "no processes",
-	man = "no man pages; an unknown command lists what exists",
+	man = "no man pages; `help` lists the commands and `help NAME` gives one's flags",
+	-- Generates completions, and nothing here completes: no terminal, no tab. Its
+	-- one useful action, "what commands exist", is what `help` answers. Named
+	-- rather than left to "unknown command" because a model reaching for it wants
+	-- that list and would otherwise get it by accident, from a failure.
+	compgen = "no completion here; `help` lists the commands and `help NAME` gives one's flags",
 	-- Named with their replacements, because both are reached for as the fallback
 	-- after something else was missing, and "use the run tool" is the answer that
 	-- sends a read-only session into a write-capable one. curl and wget were on
@@ -596,6 +601,13 @@ local SPECS: { [string]: FlagSpec } = {
 		bool = "cfRv",
 		long = { ["--recursive"] = "bool:-R", ["--verbose"] = "bool:-v", ["--silent"] = "bool:-f" },
 		why = { ["-h"] = NO_LINKS },
+	},
+	command = {
+		bool = "vV",
+		-- Refused here rather than in the handler so the reason arrives before the
+		-- lookup runs, and so the handler only ever reads letters it acts on.
+		why = { ["-p"] = "runs with the default PATH, and there is no PATH here — " ..
+			"every command is a builtin" },
 	},
 	cp = {
 		bool = "afnprRTv", value = "t",
@@ -694,6 +706,17 @@ local SPECS: { [string]: FlagSpec } = {
 			["--regexp"] = "value:-e", ["--no-filename"] = "bool:-h",
 			["--with-filename"] = "bool:-H" },
 		why = { ["-z"] = NO_NUL, ["-Z"] = NO_NUL },
+	},
+	-- No flags, which is a real answer: bash's three all ask for prose this help
+	-- does not carry, so each is refused by name rather than silently accepted
+	-- and ignored — the `rm -rf` failure this table exists to prevent.
+	help = {
+		why = {
+			["-s"] = "prints the usage line alone, which is already all this prints",
+			["-d"] = "prints a one-line description, and there are none here — the " ..
+				"flag list is the documentation",
+			["-m"] = "prints in man-page format, and there are no man pages",
+		},
 	},
 	head = {
 		bool = "qv", value = "cn",
@@ -2184,6 +2207,127 @@ HANDLERS.which = function(self, argv)
 		end
 	end
 	return table.concat(out, "\n")
+end
+
+-- `command -v NAME` is the portable "does this exist", and the answer is shorter
+-- here than in bash: with no PATH, a name either is a builtin or is nothing.
+--
+-- A miss prints NOTHING and fails, which is the entire point of the form —
+-- `command -v sed && sed ...` reads the status, not the text, and a message here
+-- would land in the output of every guard that used it. `grep -q` sets `failed`
+-- the same way for the same reason.
+--
+-- The bare `command NAME args` form never reaches here: runCommand strips the
+-- prefix, so the command that runs is the real one, with its own spec and its
+-- own read-only status.
+HANDLERS.command = function(_, argv)
+	local flags, _, operands = parse(argv)
+	local name = operands[1]
+	if not name or name == "" then
+		-- No operand is a malformed invocation, not a lookup that missed. Silence
+		-- is only the right answer for a name that was actually searched for, so
+		-- these two cases must not share one.
+		if flags["-v"] or flags["-V"] then
+			return fail("command", "-v requires a name, as `command -v grep`")
+		end
+		return ""       -- bare `command` runs nothing, successfully, as in bash
+	end
+	-- The same three tables `which` reads, in the same order. Not shared with it
+	-- as a helper: they are the source tables themselves, so there is nothing to
+	-- drift, and the two commands word their answers differently on purpose.
+	local what: string? = nil
+	if HANDLERS[name] then
+		what = "a shell builtin"
+	elseif isSeparateTool(name) then
+		what = "a separate tool, not a shell command"
+	end
+	if flags["-V"] then
+		if not what then
+			return fail("command", name .. ": not found")
+		end
+		return name .. " is " .. what
+	end
+	if flags["-v"] then
+		if not what then
+			failed = true
+			return ""
+		end
+		-- bash prints the path for an external command and the bare name for a
+		-- builtin. Everything here is a builtin, so it is always the name.
+		return name
+	end
+	-- Only reachable when the word after `command` began with a dash, so the
+	-- prefix strip left it alone and it is not a command name.
+	return fail("command", string.format("%q is not a command name — `command -v NAME` " ..
+		"asks whether one exists, `command NAME args` runs it", name))
+end
+
+-- `help` with no argument lists what exists; `help NAME` gives one command's
+-- flags. Both are read out of HANDLERS and SPECS, so help cannot describe a
+-- command that is not there, nor miss one that is.
+--
+-- Deliberately no per-command prose. bash's help carries a paragraph and an
+-- Options block per builtin, and writing 33 of those is the tool description
+-- that bash.lua kept OUT of the tool description, arriving through another door.
+-- `ls`, `grep` and `cp` describe themselves; their flags are the part that
+-- cannot be guessed, and that part is already written down.
+HANDLERS.help = function(_, argv)
+	local _, _, operands = parse(argv)
+
+	local function describe(name: string): string
+		local spec = SPECS[name]
+		-- A command absent from SPECS is unchecked rather than flagless, so the
+		-- honest answer for it is to say nothing about flags at all.
+		if not spec then
+			return name .. ": shell builtin"
+		end
+		-- The flags it TAKES, and nothing about the ones it refuses. Those reasons
+		-- live in spec.why and already arrive on their own, at the one call that
+		-- reached for the flag. Listing them here turned that pull into a push:
+		-- `help ls` came out as eight refusals over 1027 characters and `help curl`
+		-- as ten over 1388, most of it naming DataModel internals to answer a
+		-- question nobody had asked. Nothing needs to know what this is running on
+		-- to use the shell, and this was the one place that insisted.
+		return name .. ": shell builtin\n  flags: " .. flagNames(spec)
+	end
+
+	local topic = operands[1]
+	if not topic or topic == "" then
+		return "shell builtins — `help NAME` for one command's flags:\n  " ..
+			table.concat(Shell.COMMANDS, " ")
+	end
+	if HANDLERS[topic] then
+		return describe(topic)
+	end
+	-- A name that names something real gets its own reason. "no help topics
+	-- match" would be true and useless for both of these.
+	if isSeparateTool(topic) then
+		return fail("help", topic .. ": separate tool, not a shell command")
+	end
+	local why = UNSUPPORTED[topic]
+	if why then
+		return fail("help", topic .. ": " .. why)
+	end
+	-- bash's help takes a pattern, so `help gr*` works. nameMatcher is the one
+	-- --include and which already use, which also makes a bare substring match:
+	-- `help ec` finds echo.
+	local matches = nameMatcher(topic)
+	local found: { string } = {}
+	for _, name in ipairs(Shell.COMMANDS) do
+		if matches(name) then
+			found[#found + 1] = name
+		end
+	end
+	if #found == 0 then
+		return fail("help", string.format("no help topics match %q — `help` lists them", topic))
+	end
+	if #found == 1 then
+		return describe(found[1])
+	end
+	-- bash prints every match in full. Names only here, for the reason MAX_RESULTS
+	-- exists: `help *` in full is 35 entries of output nobody asked for, and the
+	-- next call names the one that was wanted.
+	return table.concat(found, " ")
 end
 
 -- Render hits: the path once per file, then `N: text` for a match and `N- text`
@@ -4239,6 +4383,10 @@ local READ_ONLY: { [string]: boolean } = {
 	find = true, grep = true, egrep = true, fgrep = true, head = true, ls = true,
 	pwd = true, sed = true, stat = true, tail = true, tr = true, tree = true,
 	wc = true, which = true, basename = true, dirname = true, whoami = true,
+	-- Both only read the command tables. `command` is listed for its -v/-V forms;
+	-- the `command foo` form is stripped before this check, so what gets tested
+	-- is foo's own place on this list, not command's.
+	command = true, help = true,
 }
 
 -- The one flag that turns each read-only command into a mutating one. Kept as a
@@ -4286,6 +4434,21 @@ local function runCommand(self: any, argv: { string }, readOnly: boolean?, stdin
 			return applyRedirect(self, redirect, stdin or "", append), not failed
 		end
 		return "", true
+	end
+
+	-- `command foo args` runs foo with shell functions and aliases bypassed. There
+	-- are neither here, so it is exactly `foo args` — stripped rather than handled
+	-- inside HANDLERS.command, so that everything below sees the REAL command:
+	-- its flag spec, its read-only status, its stdin eligibility. Handling it in
+	-- the handler would have meant re-entering dispatch with all three already
+	-- decided against the wrong name.
+	--
+	-- A dash after `command` is the -v/-V question instead, which is a command in
+	-- its own right and goes to the handler. A loop, not an `if`, because bash
+	-- accepts `command command foo` and stopping after one would leave the second
+	-- to be read as an operand.
+	while args[1] == "command" and args[2] and args[2]:sub(1, 1) ~= "-" do
+		table.remove(args, 1)
 	end
 
 	local cmd = args[1]
@@ -5597,19 +5760,21 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		return false, "Fs.openDocuments did not return a table"
 	end
 
-	-- COMMANDS is derived from HANDLERS now, so it cannot drift. What this
-	-- catches is a handler that throws on a bare invocation. Safe to run: every
-	-- command that mutates (rm, mv, cp, set, new, mkdir, touch, ln) needs a path
-	-- and bails before touching anything, and the rest just read the cwd.
+	-- Every command, invoked bare: the one smoke test that covers all of them, and
+	-- it catches a handler that throws when its operands are missing. Safe to run:
+	-- every command that mutates (rm, mv, cp, set, new, mkdir, touch, ln) needs a
+	-- path and bails before touching anything, and the rest just read the cwd.
+	--
+	-- It does NOT also check for "unknown command" any more. COMMANDS is built by
+	-- walking HANDLERS and dispatch looks the name back up in HANDLERS, so that
+	-- branch could not fire — and it would not have caught the drift it was named
+	-- for, which was a hand-written list too SHORT, not one with a bad entry.
 	for _, name in ipairs(COMMANDS) do
 		local ok, result = pcall(function()
 			return Shell.run(probe, name)
 		end)
 		if not ok then
 			return false, string.format("shell(%q) threw: %s", name, tostring(result))
-		end
-		if (result :: string):match("^bash: unknown command") then
-			return false, "COMMANDS lists a command with no handler: " .. name
 		end
 	end
 	if not Shell.run(probe, "chown me /Workspace"):match("no owner") then
@@ -5730,6 +5895,23 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		return false, "which does not recognise a tool"
 	end
 
+	-- `command -v` on a miss prints NOTHING and fails. Both halves matter: the
+	-- form exists to be read as a status by `&&`, and any message added here
+	-- would land in the output of every guard that used it.
+	if Shell.run(probe, "command -v nosuchthing") ~= "" then
+		return false, "command -v is not silent on a miss"
+	end
+	if Shell.run(probe, "command -v nosuchthing && echo reached"):match("reached") then
+		return false, "command -v does not fail on a miss"
+	end
+	if Shell.run(probe, "command -v grep") ~= "grep" then
+		return false, "command -v does not name a builtin"
+	end
+	-- The strip, from the other side: `command foo` has to BE `foo`, flags and all.
+	if Shell.run(probe, "command echo hi") ~= Shell.run(probe, "echo hi") then
+		return false, "`command foo` is not the same as `foo`"
+	end
+
 	-- One flag can turn an allowlisted read-only command into a mutating one, and
 	-- /sh exists so that every mutation arrives through Claude with an undo
 	-- recording attached. Each of these has to be refused however the allowlist
@@ -5738,6 +5920,10 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		"sed -i s/a/b/ x.luau", "sed -in s/a/b/ x.luau",
 		"sort -o out.luau x.luau", "sort -oout.luau x.luau",
 		"find / -name X -delete",
+		-- `command` is on the read-only allowlist, so the prefix strip is the only
+		-- thing standing between it and a hole in /sh: what gets tested has to be
+		-- the command that actually runs, not the word in front of it.
+		"command rm /x", "command command rm /x",
 	}) do
 		if not Shell.run(probe, line, true):match("read%-only") then
 			return false, "not blocked in read-only mode: " .. line

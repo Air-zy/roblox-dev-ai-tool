@@ -454,6 +454,16 @@ function Exec.selfTest(probeTerm: any): (boolean, string?)
 		return false, "PROLOGUE_LINES no longer matches #PROLOGUE"
 	end
 
+	-- Everything past here needs code execution, which is off by default and is
+	-- deliberately NOT enabled to run it: that switch exists because `run`
+	-- executes arbitrary Luau at plugin permission level, and a self-test that
+	-- flips it on is a hole in the one guard the user actually opted into. So
+	-- these are skipped when it is off rather than forced.
+	--
+	-- reload, end to end, in ONE chunk: require a module, change its source,
+	-- require it again (edit-mode caches per instance, so this is still the OLD
+	-- value: that IS the bug), then reload it and get the new one. "1/1/2" is the
+	-- cache being real and reload defeating it, in a single assertion.
 	if runGuard and runGuard() then
 		local probe = Instance.new("ModuleScript")
 		probe.Name = "AgentReloadProbe"

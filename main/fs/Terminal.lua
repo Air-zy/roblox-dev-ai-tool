@@ -806,16 +806,6 @@ function Terminal.selfTest(): (boolean, string?)
 	local catOk, catErr = Catalog.selfTest()
 	if not catOk then return false, catErr end
 
-
-	-- reload, end to end, in ONE chunk: require a module, change its source,
-	-- require it again (edit-mode caches per instance, so this is still the OLD
-	-- value: that IS the bug), then reload it and get the new one. "1/1/2" is
-	-- the cache being real and reload defeating it, in a single assertion.
-	--
-	-- Needs code execution, which is off by default. Deliberately NOT enabled
-	-- here: that switch exists because `run` executes arbitrary Luau at plugin
-	-- permission level, and a self-test that flips it on is a hole in the one
-	-- guard the user actually opted into. Skipped when it is off.
 	return Shell.selfTest(Terminal.new(game))
 end
 

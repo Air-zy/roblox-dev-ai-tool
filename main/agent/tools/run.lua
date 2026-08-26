@@ -8,7 +8,7 @@
 -- buffer, so it tested stale text and reported a pass. See Exec.run.
 return {
 	name = "run",
-	description = "runs luau, bound loops. scratch: /ServerStorage/tmp, NOT for data model exploration/edits",
+	description = "runs luau, bound loops. scratch: /ServerStorage/tmp, NOT for vfs exploration/edits",
 	input_schema = {
 		type = "object",
 		properties = {
