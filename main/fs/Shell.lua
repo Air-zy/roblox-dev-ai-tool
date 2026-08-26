@@ -2345,7 +2345,7 @@ HANDLERS.grep = function(self, argv, stdin)
 		-- One pcall for the whole stream: the only thing that throws is the
 		-- engine's step budget, and a pattern too expensive for one line is too
 		-- expensive for all of them.
-		local streamOk, hits = pcall(Fs.grepLines, splitLines(stdin), programs, opts)
+		local streamOk, hits, taken, refused = pcall(Fs.grepLines, splitLines(stdin), programs, opts)
 		if not streamOk then
 			return fail("grep", Regex.isBudget(hits)
 				and "that pattern is too expensive to run — anchor it, or replace a " ..
@@ -2362,7 +2362,10 @@ HANDLERS.grep = function(self, argv, stdin)
 			return ""
 		end
 		if flags["-c"] then
-			return tostring(matches)
+			-- Matching LINES, capped by -m alone, the same number the walked path
+			-- now reports. Counting the hits instead counted -o's one-row-per-match
+			-- expansion, so `-co` disagreed with `-c`.
+			return tostring(math.min(taken + refused, opts.limit or math.huge))
 		end
 		-- Line numbers of a stream are the stream's, not a file's, so they are
 		-- only worth printing when asked for.
@@ -2442,7 +2445,31 @@ HANDLERS.grep = function(self, argv, stdin)
 	end
 
 	if flags["-c"] then
-		return tostring(matches)
+		-- Off the per-file counts, not off `matches`: the hit list has already
+		-- been truncated by MAX_RESULTS, so counting it answered "how many fit"
+		-- on the one command whose entire output is a number.
+		local counts: { { path: string, n: number } } = (hits :: any).counts or {}
+		-- grep prefixes the path when it was handed more than one input, so a
+		-- named script counts bare and a subtree counts per file — which is what
+		-- `grep -rc X dir | grep -v ":0"` is written against. -h forces the bare
+		-- total, -H forces the prefix, as everywhere else.
+		local target = self:resolve(path)
+		local perFile = not flags["-h"] and (flags["-H"] == true or not (target and getSource(target)))
+		if not perFile then
+			local total = 0
+			for _, entry in ipairs(counts) do
+				total += entry.n
+			end
+			return tostring(total)
+		end
+		-- Files with no match are left out rather than printed as `path:0`, which
+		-- is ripgrep's default and the only survivable one here: a place with a
+		-- few thousand scripts would spend the whole reply on zeros.
+		local out: { string } = {}
+		for _, entry in ipairs(counts) do
+			out[#out + 1] = string.format("%s:%d", entry.path, entry.n)
+		end
+		return table.concat(out, "\n")
 	end
 	if flags["-l"] then
 		local seen: { [string]: boolean } = {}

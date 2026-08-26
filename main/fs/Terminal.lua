@@ -334,6 +334,11 @@ function Terminal:grep(programs: { any }?, path: string?, opts: Fs.GrepOpts?,
 	local results: { GrepMatch } = {}
 	local budget = MAX_RESULTS
 	local skipped = 0
+	-- What -c has to answer, which the hit list cannot: MAX_RESULTS caps what is
+	-- EMITTED, not what is scanned, so counting hits reports how many fit rather
+	-- than how many there are. Per file, because that is the shape `grep -rc`
+	-- has everywhere else and one total cannot be split back apart.
+	local counts: { { path: string, n: number } } = {}
 	-- Include the target: `grep foo Main.luau` means search Main, and walking
 	-- only descendants made that silently return "no matches". GetDescendants
 	-- hands back a fresh table, so prepending to it is safe.
@@ -373,8 +378,13 @@ function Terminal:grep(programs: { any }?, path: string?, opts: Fs.GrepOpts?,
 				})
 				budget -= taken
 				skipped += refused
-				if #hits > 0 then
+				-- -m is the only cap that belongs in a count: it is grep's own, and
+				-- it legitimately stops at N per file. `budget` is this harness's
+				-- output cap and has no business changing a number.
+				local total = math.min(taken + refused, o.limit or math.huge)
+				if total > 0 then
 					local instPath = instancePath(inst)
+					counts[#counts + 1] = { path = instPath, n = total }
 					for _, hit in ipairs(hits) do
 						results[#results + 1] = {
 							path = instPath, line = hit.line, text = hit.text, match = hit.match,
@@ -398,6 +408,7 @@ function Terminal:grep(programs: { any }?, path: string?, opts: Fs.GrepOpts?,
 	if skipped > 0 then
 		tagged.skipped = skipped
 	end
+	tagged.counts = counts
 	return results, nil
 end
 
