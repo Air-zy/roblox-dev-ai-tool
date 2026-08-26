@@ -28,6 +28,7 @@ local UserInputService = game:GetService("UserInputService")
 local agent = script:WaitForChild("agent")
 local util  = script:WaitForChild("util")
 local fs     = script:WaitForChild("fs")
+local git    = script:WaitForChild("git")
 local studio = script:WaitForChild("studio")
 local ui    = script:WaitForChild("ui")
 
@@ -36,6 +37,7 @@ local Provider = require(agent:WaitForChild("Provider")) :: any
 local Props    = require(studio:WaitForChild("Props"))  :: any
 local Fs       = require(fs:WaitForChild("Fs"))         :: any
 local Terminal = require(fs:WaitForChild("Terminal"))   :: any
+local Git      = require(git:WaitForChild("Git"))       :: any
 local Theme    = require(ui:WaitForChild("Theme"))
 local Markdown = require(ui:WaitForChild("Markdown"))
 local Console  = require(ui:WaitForChild("Console"))
@@ -50,6 +52,10 @@ local make = Theme.make
 Provider.Initialize(plugin)
 Settings.Initialize(plugin)
 Sessions.Initialize(plugin)
+-- The remote, the branch and the token. Through the plugin store rather than the
+-- DataModel: Team Create replicates the DataModel to every collaborator, and the
+-- token must not travel with it.
+Git.Initialize(plugin)
 
 local term = Terminal.new(game)
 -- Terminal asks this before executing anything, rather than importing Settings

@@ -36,6 +36,10 @@ local TR_ESCAPES = Sed.ESCAPES
 -- The only reach out of fs/: the shell has to know which words are tools rather
 -- than commands, so it can say so instead of reporting "unknown command".
 local Tools = require(script.Parent.Parent:WaitForChild("agent"):WaitForChild("Tools"))
+-- Object ids, the path mapping and the working-tree walk. Everything git knows
+-- that is not a request lives there; the requests stay here beside curl's, so
+-- there is one place that knows what RequestAsync will send.
+local Git = require(script.Parent.Parent:WaitForChild("git"):WaitForChild("Git"))
 
 local isScript     = Fs.isScript
 local getSource    = Fs.getSource
@@ -706,6 +710,16 @@ local SPECS: { [string]: FlagSpec } = {
 			["--regexp"] = "value:-e", ["--no-filename"] = "bool:-h",
 			["--with-filename"] = "bool:-H" },
 		why = { ["-z"] = NO_NUL, ["-Z"] = NO_NUL },
+	},
+	-- Only what `git diff` reads, since it is the one subcommand here that takes
+	-- flags at all. Subcommands arrive as OPERANDS, so `status` and `config` need
+	-- nothing declared. -b/-i/-w reach diffKey and -U reaches unified, the same
+	-- four `diff` itself honours, because the same two functions render both.
+	git = {
+		bool = "biwAf", value = "Umn",
+		long = { ["--unified"] = "value:-U", ["--ignore-case"] = "bool:-i",
+			["--ignore-all-space"] = "bool:-w", ["--ignore-space-change"] = "bool:-b",
+			["--all"] = "bool:-A", ["--message"] = "value:-m", ["--force"] = "bool:-f" },
 	},
 	-- No flags, which is a real answer: bash's three all ask for prose this help
 	-- does not carry, so each is refused by name rather than silently accepted
@@ -4356,6 +4370,499 @@ HANDLERS.wget = function(self, argv)
 	return table.concat(out, "\n")
 end
 
+-- git
+--
+-- Against the host's API rather than git's wire protocol. That is not a shortcut
+-- taken for size: the whole object model is exposed as JSON, so a commit is
+-- three requests and needs neither a zlib nor a packfile, and this engine hands
+-- over SHA-1 natively, so the ids are still real git ids and can be checked
+-- against the ones the host reports.
+--
+-- Only the READ half lives here so far — config, status, diff. They need no
+-- write token, which means they can be run against any public repository, and
+-- they are what proves the id comparison end to end before anything is pushed.
+--
+-- Subcommands are OPERANDS, not flags, so SPECS.git declares only the flags the
+-- subcommands themselves take. Placed after httpRequest because it needs it.
+local function githubCall(url: string, method: string, body: string?): (any?, string?, number?)
+	local response, err = httpRequest({
+		url = url, method = method, headers = Git.headers(), body = body, timeoutFlag = "-m",
+	})
+	if not response then
+		return nil, err
+	end
+	local code = response.StatusCode
+	-- Named individually, because "404" against a repository that plainly exists
+	-- reads as a bug in this code rather than as a branch nobody has pushed yet.
+	if code == 404 then
+		return nil, "not found — check the owner, repo and branch, or whether the " ..
+			"token can see a private repository", code
+	elseif code == 401 or code == 403 then
+		return nil, Git.token() == ""
+			and "unauthorized, and no token is set — `git config token <pat>` for a private repo"
+			or "unauthorized — the token is wrong, expired, or lacks Contents access", code
+	elseif code >= 300 then
+		return nil, string.format("HTTP %d: %s", code, tostring(response.Body):sub(1, 200)), code
+	end
+	local ok, decoded = pcall(function()
+		return HttpService:JSONDecode(response.Body)
+	end)
+	if not ok then
+		return nil, "the response was not JSON"
+	end
+	return decoded, nil
+end
+
+local function githubJson(url: string): (any?, string?)
+	return githubCall(url, "GET", nil)
+end
+
+-- Every blob in a tree, by path. `ref` is the branch when comparing against what
+-- the remote has, or a tree sha when reading back one just written.
+local function remoteTree(cfg: any, ref: string?): ({ [string]: string }?, string?)
+	local data, err = githubJson(Git.treeUrl(cfg, ref))
+	if not data then
+		return nil, err
+	end
+	-- A recursive tree past the host's own limits comes back truncated WITH A
+	-- FLAG. Reporting a partial tree as the whole one would show every file it
+	-- left out as deleted, which is the most alarming possible way to be wrong.
+	if data.truncated then
+		return nil, "the remote tree came back truncated, so every file it left " ..
+			"out would read as deleted — this repo is too large to compare this way"
+	end
+	local byPath: { [string]: string } = {}
+	for _, entry in ipairs(data.tree or {}) do
+		if entry.type == "blob" then
+			byPath[entry.path] = entry.sha
+		end
+	end
+	return byPath, nil
+end
+
+-- One remote file's text. The host wraps base64 at a fixed width, so the
+-- whitespace has to go before decoding or the decoder rejects it.
+local function remoteBlob(cfg: any, sha: string): (string?, string?)
+	local data, err = githubJson(Git.blobUrl(cfg, sha))
+	if not data then
+		return nil, err
+	end
+	if data.encoding ~= "base64" then
+		return nil, "unexpected blob encoding: " .. tostring(data.encoding)
+	end
+	local text, decodeErr = Git.decodeBase64(tostring(data.content))
+	if not text then
+		return nil, "could not decode the blob: " .. tostring(decodeErr)
+	end
+	return text, nil
+end
+
+HANDLERS.git = function(self, argv)
+	local flags, values, operands = parse(argv)
+	local sub = operands[1]
+	if not sub or sub == "" then
+		return fail("git", "needs a subcommand — `config`, `status` or `diff`")
+	end
+	local usable, why = Git.available()
+	if not usable then
+		return fail("git", why)
+	end
+
+	-- Every subcommand that reaches the remote opens with the same question, and
+	-- asking it six separate times was six places for the answer to drift.
+	local function remoteConfig(): (any?, string?)
+		local cfg = Git.config()
+		local ready, err = Git.configured(cfg)
+		if not ready then
+			return nil, err
+		end
+		return cfg
+	end
+
+	if sub == "config" then
+		local name, value = operands[2], operands[3]
+		if not name then
+			local cfg = Git.config()
+			-- The token is shown as present or absent and never printed. It ends up
+			-- in a tool result otherwise, which is a transcript, which is stored.
+			return table.concat({
+				string.format("remote  %s", cfg.owner ~= "" and (cfg.owner .. "/" .. cfg.repo) or "(unset)"),
+				string.format("branch  %s", cfg.branch),
+				string.format("token   %s", Git.token() ~= "" and "(set)" or "(unset)"),
+			}, "\n")
+		end
+		if not value then
+			return fail("git", string.format("`git config %s <value>` sets it", name))
+		end
+		if name == "remote" then
+			local ok, remoteErr = Git.setRemote(value)
+			if not ok then
+				return fail("git", remoteErr)
+			end
+			return "remote  " .. value
+		end
+		local ok, setErr = Git.setConfig(name, value)
+		if not ok then
+			return fail("git", setErr)
+		end
+		return string.format("%s  %s", name, name == "token" and "(set)" or value)
+	end
+
+	-- Staging records PATHS, never content: `git commit` reads each one's source
+	-- at the moment it commits, which is what keeps the index a list of strings
+	-- instead of the object database this design does without.
+	if sub == "reset" then
+		local paths: { string } = {}
+		table.move(operands, 2, #operands, 1, paths)
+		Git.unstage(#paths > 0 and paths or nil)
+		local left = Git.staged()
+		return #left == 0 and "nothing staged"
+			or string.format("%d still staged", #left)
+	end
+
+	if sub == "add" then
+		local named: { string } = {}
+		table.move(operands, 2, #operands, 1, named)
+		if #named == 0 and not flags["-A"] then
+			return fail("git", "name a path, or `git add -A` for everything that changed")
+		end
+		if #named > 0 then
+			-- Validated against the working tree, which needs no request: a typo
+			-- staged silently would surface three steps later as a missing file.
+			local working = Git.walk(game)
+			for _, path in ipairs(named) do
+				if not working[path] then
+					return fail("git", string.format("%q is not a script here — " ..
+						"`git status` lists what can be staged", path))
+				end
+			end
+			Git.stage(named)
+			return string.format("%d staged, %d total", #named, #Git.staged())
+		end
+		-- -A is every CHANGE, which includes the deletions, and those can only be
+		-- known by asking what the remote still has.
+		local cfg, configErr = remoteConfig()
+		if not cfg then
+			return fail("git", configErr)
+		end
+		local remote, remoteErr = remoteTree(cfg)
+		if not remote then
+			return fail("git", remoteErr)
+		end
+		local working = Git.walk(game)
+		local changed = Git.changedPaths(Git.compare(working, remote))
+		Git.stage(changed)
+		return #changed == 0 and "nothing to stage"
+			or string.format("%d staged", #changed)
+	end
+
+	if sub == "commit" then
+		local message = valueOf(values, "-m")
+		if not message or message == "" then
+			return fail("git", "a commit needs a message — `git commit -m \"what changed\"`")
+		end
+		if Git.token() == "" then
+			return fail("git", "committing needs a token — `git config token <pat>`, " ..
+				"fine-grained with Contents: write")
+		end
+		local cfg, configErr = remoteConfig()
+		if not cfg then
+			return fail("git", configErr)
+		end
+		local staged = Git.staged()
+		if #staged == 0 then
+			return fail("git", "nothing staged — `git add -A` stages every change")
+		end
+
+		-- One request for both halves a commit needs: the head to parent from and
+		-- the tree to build on. A 404 here is not a failure — it is a branch that
+		-- does not exist yet, which is what a freshly created repository looks
+		-- like. That case builds a ROOT commit instead: no base tree to extend, no
+		-- parent to follow, and the ref has to be created rather than moved.
+		local branch, branchErr, branchCode = githubCall(Git.branchUrl(cfg), "GET", nil)
+		local parentSha: string? = nil
+		local baseSha: string? = nil
+		if branch then
+			local head = branch.commit
+			local tree = head and head.commit and head.commit.tree
+			if not head or not head.sha or not tree or not tree.sha then
+				return fail("git", "the branch carried no head commit to build on")
+			end
+			parentSha, baseSha = head.sha, tree.sha
+		elseif branchCode ~= 404 then
+			return fail("git", branchErr)
+		end
+
+		local working = Git.walk(game)
+		local entries = Git.treePayload(working, staged)
+		-- Chained through base_tree rather than sent as one body: a first commit
+		-- of a whole place measures over a megabyte, and the engine documents no
+		-- size limit to size it against. Each chunk builds on the last, so the
+		-- number of requests changes and the resulting commit does not.
+		local chunks = Git.chunkPayload(entries)
+		local treeSha = baseSha
+		for index, chunk in ipairs(chunks) do
+			-- base_tree is omitted on the first chunk of a root commit: there is no
+			-- tree to build on, and a nil field would simply vanish from the JSON
+			-- rather than say so.
+			local encoded = treeSha
+				and HttpService:JSONEncode({ base_tree = treeSha, tree = chunk })
+				or HttpService:JSONEncode({ tree = chunk })
+			local body, nullErr = Git.encodeTree(encoded)
+			if not body then
+				return fail("git", nullErr)
+			end
+			local tree, treeErr = githubCall(Git.newTreeUrl(cfg), "POST", body)
+			if not tree or not tree.sha then
+				return fail("git", string.format("tree %d of %d: %s", index, #chunks,
+					tostring(treeErr or "the remote returned a tree with no sha")))
+			end
+			treeSha = tree.sha
+		end
+
+		-- The check this design rests on: the remote hashed the blobs it just
+		-- wrote, and this end hashed them before sending. Read the FINISHED tree
+		-- back to do it — a tree response carries top-level entries only, so
+		-- checking against one matched no nested path and passed on every commit
+		-- without ever comparing anything.
+		local created, createdErr = remoteTree(cfg, treeSha)
+		if not created then
+			return fail("git", "could not read back the tree to verify it: " .. tostring(createdErr))
+		end
+		local verified, verifyErr = Git.verifyTree(created, working, staged)
+		if not verified then
+			return fail("git", tostring(verifyErr) .. " — the object model is wrong, " ..
+				"so this commit has not been made")
+		end
+
+		-- `parents` is OMITTED for a root commit rather than sent empty. The API
+		-- reads either as a root, but an empty Luau table encodes as {} and not
+		-- [], so the field that is not there is the one that cannot be wrong.
+		local commitBody = parentSha
+			and HttpService:JSONEncode({ message = message, tree = treeSha, parents = { parentSha } })
+			or HttpService:JSONEncode({ message = message, tree = treeSha })
+		local commit, commitErr = githubCall(Git.newCommitUrl(cfg), "POST", commitBody)
+		if not commit or not commit.sha then
+			return fail("git", commitErr or "the remote returned a commit with no sha")
+		end
+		-- Until a ref points at it, that commit is unreachable and will be
+		-- collected. Moving an existing branch and creating a new one are two
+		-- different endpoints, not one endpoint with two verbs.
+		local moved, refErr
+		if parentSha then
+			moved, refErr = githubCall(Git.refUrl(cfg), "PATCH",
+				HttpService:JSONEncode({ sha = commit.sha }))
+		else
+			moved, refErr = githubCall(Git.newRefUrl(cfg), "POST",
+				HttpService:JSONEncode({ ref = Git.refName(cfg), sha = commit.sha }))
+		end
+		if not moved then
+			return fail("git", string.format("the commit %s was written but the branch " ..
+				"could not be %s it: %s", commit.sha:sub(1, 7),
+				parentSha and "moved to" or "created at", tostring(refErr)))
+		end
+		Git.unstage()
+		return string.format("[%s%s %s] %s\n %d file%s changed",
+			cfg.branch, parentSha and "" or " (root-commit)", commit.sha:sub(1, 7),
+			message, #staged, #staged == 1 and "" or "s")
+	end
+
+	if sub == "log" then
+		local cfg, configErr = remoteConfig()
+		if not cfg then
+			return fail("git", configErr)
+		end
+		local count = numberOf(values, "-n") or 20
+		local data, logErr = githubJson(Git.logUrl(cfg, math.min(count, MAX_LIST)))
+		if not data then
+			return fail("git", logErr)
+		end
+		local out: { string } = {}
+		for _, entry in ipairs(data) do
+			local commit = entry.commit or {}
+			local author = commit.author or {}
+			-- The first line only. A commit body is prose nobody asked for here,
+			-- and a log that wraps is a log nothing can scan.
+			local subject = tostring(commit.message or ""):match("^([^\n]*)") or ""
+			out[#out + 1] = string.format("%s  %s  %s  %s",
+				tostring(entry.sha):sub(1, 7), tostring(author.date or ""):sub(1, 10),
+				tostring(author.name or "?"), subject)
+		end
+		return #out > 0 and table.concat(out, "\n") or "no commits"
+	end
+
+	if sub == "pull" then
+		local cfg, configErr = remoteConfig()
+		if not cfg then
+			return fail("git", configErr)
+		end
+		local remote, remoteErr = remoteTree(cfg)
+		if not remote then
+			return fail("git", remoteErr)
+		end
+		local working = Git.walk(game)
+		local status = Git.compare(working, remote)
+		-- The one guard that matters. A modified path is one where this side and
+		-- the remote disagree, which is exactly what pull would overwrite, so it
+		-- stops rather than discarding work nobody has committed.
+		if #status.modified > 0 and not flags["-f"] then
+			return fail("git", string.format("%d local change%s would be overwritten " ..
+				"(%s%s) — commit them, or `git pull -f` to discard them",
+				#status.modified, #status.modified == 1 and "" or "s",
+				status.modified[1], #status.modified > 1 and ", …" or ""))
+		end
+		local incoming = Git.incoming(working, remote)
+		if #incoming == 0 then
+			return "Already up to date."
+		end
+
+		-- Fetched first, written second. Writing as they arrive would mean
+		-- yielding on a request inside an open undo recording, and a half-applied
+		-- pull that cannot be undone in one step is the failure worth avoiding.
+		local fetched: { { path: string, source: string } } = {}
+		for _, path in ipairs(incoming) do
+			local text, blobErr = remoteBlob(cfg, remote[path])
+			if not text then
+				return fail("git", string.format("%s: %s (nothing has been written)", path, tostring(blobErr)))
+			end
+			fetched[#fetched + 1] = { path = path, source = text }
+		end
+
+		local written, failures = 0, {}
+		local _, undoErr = withUndo("agent: git pull", function()
+			for _, item in ipairs(fetched) do
+				-- Containers first. The leading segment is a service and already
+				-- exists; anything else missing at the top would mean inventing a
+				-- container directly under the DataModel root, which this refuses
+				-- rather than quietly polluting the place.
+				local segments: { string } = {}
+				for segment in item.path:gmatch("[^/]+") do
+					segments[#segments + 1] = segment
+				end
+				local walked = ""
+				local blocked: string? = nil
+				for index = 1, #segments - 1 do
+					local parentPath = walked == "" and "/" or walked
+					walked ..= "/" .. segments[index]
+					if not self:resolve(walked) then
+						if index == 1 then
+							blocked = walked .. " is not a service in this place"
+							break
+						end
+						local _, createErr = self:create("Folder", segments[index], parentPath)
+						if createErr then
+							blocked = createErr
+							break
+						end
+					end
+				end
+				if blocked then
+					failures[#failures + 1] = item.path .. ": " .. blocked
+				else
+					local _, writeErr = self:write("/" .. item.path, item.source)
+					if writeErr then
+						failures[#failures + 1] = item.path .. ": " .. tostring(writeErr)
+					else
+						written += 1
+					end
+				end
+			end
+		end)
+		if undoErr then
+			return fail("git", undoErr)
+		end
+		local out: { string } = {
+			string.format("%d file%s updated from %s/%s",
+				written, written == 1 and "" or "s", cfg.owner, cfg.branch),
+		}
+		-- Nothing is DELETED by a pull. A script here that the remote does not
+		-- have is reported, never removed: this direction is where the data loss
+		-- other tools warn about lives, and a report costs one line.
+		if #status.added > 0 then
+			out[#out + 1] = string.format("%d here but not on the remote, left alone:", #status.added)
+			for index, path in ipairs(status.added) do
+				if index > 10 then
+					out[#out + 1] = string.format("  … %d more", #status.added - 10)
+					break
+				end
+				out[#out + 1] = "  " .. path
+			end
+		end
+		for _, note in ipairs(failures) do
+			out[#out + 1] = "failed: " .. note
+		end
+		return table.concat(out, "\n")
+	end
+
+	if sub == "status" or sub == "diff" then
+		local cfg, configErr = remoteConfig()
+		if not cfg then
+			return fail("git", configErr)
+		end
+		local remote, remoteErr = remoteTree(cfg)
+		if not remote then
+			return fail("git", remoteErr)
+		end
+		local working, skipped = Git.walk(game)
+		local status = Git.compare(working, remote)
+
+		if sub == "status" then
+			return Git.formatStatus(cfg, status, skipped, MAX_LIST)
+		end
+
+		-- diff: a named path, or everything that changed. Deletions are part of
+		-- that — a script the remote has and this side does not is a change, and
+		-- rendering it as a file removed whole is what git does with one.
+		local wanted: { string } = {}
+		if operands[2] then
+			local path = operands[2]
+			if not working[path] and not remote[path] then
+				return fail("git", string.format("%q is neither a script here nor a " ..
+					"file on the remote — `git status` lists what changed", path))
+			end
+			wanted[1] = path
+		else
+			table.move(status.modified, 1, #status.modified, 1, wanted)
+			table.move(status.deleted, 1, #status.deleted, #wanted + 1, wanted)
+		end
+		if #wanted == 0 then
+			return ""
+		end
+		local out: { string } = {}
+		for index, path in ipairs(wanted) do
+			if index > 20 then
+				out[#out + 1] = string.format("… %d more changed (name one to see it)", #wanted - 20)
+				break
+			end
+			local text, blobErr = remoteBlob(cfg, remote[path])
+			if not text then
+				return fail("git", blobErr)
+			end
+			-- A deleted path has no side B at all, so it diffs against nothing and
+			-- is named /dev/null, which is how git spells "this file is gone".
+			local mine = working[path]
+			local before = splitLines(text)
+			local after = mine and splitLines(mine.source) or {}
+			local script, diffErr = diffLines(before, after, function(line)
+				return diffKey(line, flags)
+			end)
+			if not script then
+				return fail("git", diffErr)
+			end
+			local body = unified(script, before, after, "a/" .. path,
+				mine and ("b/" .. path) or "/dev/null", numberOf(values, "-U") or 3)
+			if body ~= "" then
+				out[#out + 1] = body
+			end
+		end
+		return table.concat(out, "\n")
+	end
+
+	return fail("git", string.format("no `git %s` here — this speaks to the host's API, " ..
+		"not git's wire protocol, so there is no local history to %s. " ..
+		"`config`, `status` and `diff` are what exists", sub, sub))
+end
+
 local COMMANDS: { string } = {}
 for name in pairs(HANDLERS) do
 	COMMANDS[#COMMANDS + 1] = name
@@ -4387,6 +4894,10 @@ local READ_ONLY: { [string]: boolean } = {
 	-- the `command foo` form is stripped before this check, so what gets tested
 	-- is foo's own place on this list, not command's.
 	command = true, help = true,
+	-- Deliberately absent: `git`. This list is keyed by COMMAND NAME and
+	-- MUTATING_FLAGS matches a flag, so neither can say "status yes, commit no",
+	-- and `git` is one name covering both. Growing a third mechanism for one
+	-- command is the wrong order; /sh refuses the whole of git and that errs safe.
 }
 
 -- The one flag that turns each read-only command into a mutating one. Kept as a
@@ -5910,6 +6421,18 @@ function Shell.selfTest(probe: any): (boolean, string?)
 	-- The strip, from the other side: `command foo` has to BE `foo`, flags and all.
 	if Shell.run(probe, "command echo hi") ~= Shell.run(probe, "echo hi") then
 		return false, "`command foo` is not the same as `foo`"
+	end
+
+	-- Git owns its own checks now, the way Regex and Sed do; what stays here is
+	-- the part that belongs to the HANDLER rather than to the module.
+	local gitOk, gitErr = Git.selfTest()
+	if not gitOk then
+		return false, "git: " .. tostring(gitErr)
+	end
+	-- The token is the one value in this shell that must never reach a tool
+	-- result, since a tool result is a transcript and a transcript is stored.
+	if Shell.run(probe, "git config"):match("token%s+gh") then
+		return false, "git config printed the token instead of whether one is set"
 	end
 
 	-- One flag can turn an allowlisted read-only command into a mutating one, and

@@ -36,6 +36,7 @@ main.lua                        window, toolbar, popups, usage panel
       studio/Catalog            free models        (catalog tool only)
       text/Regex                BRE/ERE engine
       text/Sed                  sed engine
+      git/Git                   object ids, path mapping, working-tree walk
 ```
 
 ## Where does X happen
@@ -110,11 +111,11 @@ main.lua                        window, toolbar, popups, usage panel
 
 | File | Lines | Owns |
 |---|---:|---|
-| `fs/Shell.lua` | 5824 | The command line. Still the biggest — see below. |
+| `fs/Shell.lua` | 6581 | The command line. Still the biggest — see below. |
 | `agent/Agent.lua` | 1352 | Turn loop, conversation state, trimming, stop. |
 | `ui/Console.lua` | 1355 | Bubbles, thinking drawers, tool-call blocks, the detached sink. |
 | `text/Regex.lua` | 957 | BRE/ERE engine. Requires nothing. |
-| `main.lua` | 1005 | Widget, toolbar, popups. Owns `plugin`, hands it to Provider / Sessions / Settings — the only four that touch it. |
+| `main.lua` | 1116 | Widget, toolbar, popups. Owns `plugin`, hands it to Provider / Sessions / Settings / Git — the only five that touch it. |
 | `fs/Terminal.lua` | 811 | Commands as tree operations. No parsing. |
 | `fs/Fs.lua` | 791 | Paths, `.Source`, undo, mtime, globs, mode bits. |
 | `agent/providers/OpenRouter.lua` | 842 | chat/completions, and the translation both ways. |
@@ -134,6 +135,7 @@ main.lua                        window, toolbar, popups, usage panel
 | `text/Sed.lua` | 329 | sed engine. Pure text. |
 | `main/Commands.lua` | 256 | Slash commands. |
 | `studio/Props.lua` | 200 | API dump. The only network I/O in fs. |
+| `git/Git.lua` | 650 | Object ids, the path mapping, the index, the tree payload. No I/O — the requests live in Shell beside curl's. |
 | `util/Sha256.lua` | 181 | For PKCE. |
 | `agent/Tools.lua` | 118 | Registry + dispatch. |
 | `ui/Theme.lua` | 99 | Colours and `make`. |
@@ -144,14 +146,14 @@ main.lua                        window, toolbar, popups, usage panel
 
 | Lines | Region |
 |---:|---|
-| 1-63 | header, requires, aliases |
-| 64-932 | parsing: `tokenize:86`, `partition:230`, `extractHeredoc:407`, `takeRedirect:467`, `SPECS:574` |
-| 933-3352 | HANDLERS — 33 commands + private helpers |
-| 3353-4190 | diff core, the last handlers, curl/wget, `Shell.COMMANDS:4190` |
-| 4191-4435 | pipelines and statements: `runCommand:4237`, `parseStatements:4341`, `requote:4404`, `label:4416` |
-| 4436-4636 | statements and loops: `runStatements:4436`, `parseLoop:4476`, `expandVar:4556`, `runLoop:4573`, `runLoopStage:4600`, `runTokens:4632` |
-| 4637-4813 | `$(...)`: `takeSubstitution:4644`, `expandSubstitutions:4700`; `Shell.run:4762` -> `runLine:4770` |
-| 4814-end | `Shell.selfTest:4814` |
+| 1-67 | header, requires, aliases |
+| 68-979 | parsing: `tokenize:94`, `partition:238`, `extractHeredoc:415`, `takeRedirect:475`, `SPECS:588` |
+| 980-4459 | HANDLERS — 38 commands + private helpers |
+| 4460-4865 | `HANDLERS.git:4460` — config/add/reset/commit/log/pull/status/diff, and the GitHub calls |
+| 4866-4927 | `Shell.COMMANDS:4866` |
+| 4928-5467 | pipelines, statements, loops, `$(...)`: `runCommand:4928` |
+| 5468-5519 | `Shell.run:5468` -> `runLine` |
+| 5520-end | `Shell.selfTest:5520` |
 
 `tokenize`/`partition` and the diff core are pure text and are the next
 extractions; `HANDLERS` is not (below).
@@ -160,7 +162,7 @@ extractions; `HANDLERS` is not (below).
 
 - Every mutation goes through `Fs.withUndo`. Bypassing it is data loss.
 - `selfTest` is a convention, not a framework: `Regex`, `Props`, `Markdown`,
-  `Sessions`, `Find`, `Console`, `Shell`, `Agent`, `Exec`, `Catalog` and
+  `Sessions`, `Find`, `Console`, `Shell`, `Agent`, `Exec`, `Catalog`, `Git` and
   `Terminal` export one, and `main.lua` runs them at startup. A module that gains logic gains a selfTest,
   and `Terminal.selfTest` chains the fs-side ones.
 - Scripts render as `name.luau`. `Fs.displayName` adds it, `Fs.resolve` strips
