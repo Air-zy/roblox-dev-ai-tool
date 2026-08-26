@@ -5751,6 +5751,8 @@ function Shell.selfTest(probe: any): (boolean, string?)
 	probe.cwd = grepFixture
 	local grepOut = Shell.run(probe, "grep needle")
 	local grepCount = Shell.run(probe, "grep -c needle")
+	local grepTotal = Shell.run(probe, "grep -hc needle")
+	local grepOne = Shell.run(probe, "grep -c needle A")
 	local grepList = Shell.run(probe, "grep -l needle")
 	probe.cwd = savedCwd
 	grepFixture:Destroy()
@@ -5761,8 +5763,21 @@ function Shell.selfTest(probe: any): (boolean, string?)
 				headers, grepOut)
 		end
 	end
-	if grepCount ~= "3" then
-		return false, "grep -c returned " .. grepCount .. ", want 3 (grouping must run after -c)"
+	-- -c answers per file when the search covered more than one, which is the
+	-- shape `grep -rc X dir | grep -v ":0"` is written against and the reason a
+	-- bare total was wrong. -h forces the total back; one named script counts
+	-- bare because it was one input. All three go through the per-file counts,
+	-- never through the grouping the header check above pins — that separation is
+	-- still what this is here to catch.
+	if grepCount ~= "/A:2\n/B:1" then
+		return false, string.format("grep -c over a container returned %q, want /A:2 and /B:1",
+			grepCount)
+	end
+	if grepTotal ~= "3" then
+		return false, "grep -hc returned " .. grepTotal .. ", want the bare total 3"
+	end
+	if grepOne ~= "2" then
+		return false, "grep -c on one named script returned " .. grepOne .. ", want a bare 2"
 	end
 	if #splitLines(grepList) ~= 2 then
 		return false, "grep -l returned " .. grepList .. ", want 2 paths"
