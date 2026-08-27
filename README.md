@@ -242,6 +242,12 @@ bash's quoting rules — single quotes suppress it, double quotes keep the resul
 one word. Output carrying `; | & ' " \` is refused rather than spliced, because
 splicing happens on the text of the line and tokenize would read those as syntax.
 
+`seq` is what makes a COUNTED loop possible without either: `for i in $(seq 1
+20); do mkdir Part$i; done`. It takes LAST, FIRST LAST or FIRST STEP LAST the way
+seq(1) does, with -s for the separator and -w to zero-pad, and it refuses past a
+thousand values rather than truncating, since half a sequence is the wrong
+sequence and the loop built from one quietly does the wrong number of things.
+
 There are still no variables beyond a loop's own, no arithmetic and no
 backticks. HOWEVER we will try to make this a real shell harness (so all args and
 commands possible) for the roblox data model.

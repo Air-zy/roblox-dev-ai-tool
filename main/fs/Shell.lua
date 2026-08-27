@@ -327,7 +327,12 @@ local function partition(argv: { string }, spec: FlagSpec?):
 			else
 				recordBoth(nil)
 			end
-		elseif #arg > 1 and arg:sub(1, 1) == "-" and not arg:match("^%-%d+$") then
+		-- A negative NUMBER is an operand, never a flag: `head -20` is a count and
+		-- `seq 5 -1 1` is a step. The guard used to read `^%-%d+$`, integers only,
+		-- so `seq 2 -0.5 0` was taken apart into the flags -0, -. and -5. Nothing
+		-- declares a digit or a dot as a flag, so widening it can only move a
+		-- number out of the flag path and into the operands where it belongs.
+		elseif #arg > 1 and arg:sub(1, 1) == "-" and not arg:match("^%-%d*%.?%d+$") then
 			local rest = arg:sub(2)
 			while rest ~= "" do
 				local char = rest:sub(1, 1)
@@ -806,6 +811,15 @@ local SPECS: { [string]: FlagSpec } = {
 			["--regexp-extended"] = "bool:-E", ["--expression"] = "value:-e" },
 		why = { ["-z"] = NO_NUL },
 	},
+	-- -f is a printf format string, and there is no printf here to honour one.
+	-- Named rather than silently dropped, because the thing it is usually reached
+	-- for is zero-padding, which -w does.
+	seq = {
+		bool = "w", value = "s",
+		long = { ["--separator"] = "value:-s", ["--equal-width"] = "bool:-w" },
+		why = { ["-f"] = "is a printf format and there is no printf here; -w " ..
+			"zero-pads to equal width, which is what -f is usually asked for" },
+	},
 	sort = {
 		bool = "bcfnrRsuV", value = "kot",
 		long = { ["--reverse"] = "bool:-r", ["--unique"] = "bool:-u", ["--numeric-sort"] = "bool:-n",
@@ -1062,6 +1076,88 @@ HANDLERS.echo = function(_, argv)
 	-- returned string here to suppress, so it is accepted and changes nothing
 	-- which is the true answer, not a silently dropped flag.
 	return text
+end
+
+-- seq: the counted loop this shell could not otherwise write.
+--
+-- `for f in <words>` takes words, and there are no variables and no arithmetic to
+-- make words out of a number, so the only counted loop available was typing the
+-- numbers out. `$(...)` collapses whitespace to single spaces when it splices, so
+-- `for i in $(seq 1 20); do mkdir Part$i; done` falls out with nothing else added.
+--
+-- The output is a stream rather than a listing, so it is CAPPED and REFUSED at
+-- the cap rather than truncated: a listing cut short is still true as far as it
+-- goes, where half a sequence is the wrong sequence and the loop built from it
+-- silently does the wrong number of things.
+--
+-- ponytail: 1000, which is `cat`'s own line cap, for the same reason — it is the
+-- point where output stops being a value and starts being a context bill.
+local MAX_SEQ = 1000
+
+-- How many decimals to print, taken from the operands as GNU does, so `seq 0 0.5
+-- 2` reads 0.0 0.5 1.0 and `seq 1 5` stays 1 2 3 rather than 1.0 2.0 3.0.
+local function decimalsOf(text: string): number
+	local frac = text:match("^%-?%d*%.(%d+)$")
+	return frac and #frac or 0
+end
+
+HANDLERS.seq = function(_, argv)
+	local flags, values, operands = parse(argv)
+	if #operands == 0 or #operands > 3 then
+		return fail("seq", string.format("takes LAST, FIRST LAST, or FIRST STEP LAST " ..
+			"— got %d operands", #operands))
+	end
+	-- One operand is the LAST, not the first: `seq 5` is 1..5.
+	local firstText = if #operands == 1 then "1" else operands[1]
+	local stepText = if #operands == 3 then operands[2] else "1"
+	local lastText = operands[#operands]
+	for _, text in ipairs({ firstText, stepText, lastText }) do
+		if not tonumber(text) then
+			return fail("seq", string.format("%q is not a number", text))
+		end
+	end
+	local first = tonumber(firstText) :: number
+	local step = tonumber(stepText) :: number
+	local last = tonumber(lastText) :: number
+	if step == 0 then
+		return fail("seq", "a step of zero never reaches the end")
+	end
+
+	-- The epsilon is not decoration: (0.3 - 0) / 0.1 is 2.9999999999999996 in
+	-- doubles, and flooring that drops the last value of `seq 0 0.1 0.3`.
+	local count = math.floor((last - first) / step + 1e-9) + 1
+	-- A step pointing away from the end is empty, not an error — `seq 5 1` prints
+	-- nothing in every shell that has it.
+	if count <= 0 then
+		return ""
+	end
+	if count > MAX_SEQ then
+		return fail("seq", string.format("%d values, and the cap is %d — a sequence " ..
+			"cut short is the wrong sequence, so this refuses rather than truncating",
+			count, MAX_SEQ))
+	end
+
+	local decimals = math.max(decimalsOf(firstText), decimalsOf(stepText), decimalsOf(lastText))
+	local format = if decimals > 0 then "%." .. decimals .. "f" else "%d"
+	local out: { string } = {}
+	local width = 0
+	-- first + index * step, never an accumulator: adding 0.1 to itself ten times
+	-- does not arrive at 1.
+	for index = 0, count - 1 do
+		local text = string.format(format, first + index * step)
+		out[index + 1] = text
+		width = math.max(width, #text)
+	end
+	if flags["-w"] then
+		for index, text in ipairs(out) do
+			if #text < width then
+				-- The zeros go after the sign, or -1 pads to 0-1.
+				local sign, digits = text:match("^(%-?)(.*)$")
+				out[index] = sign .. string.rep("0", width - #text) .. digits
+			end
+		end
+	end
+	return table.concat(out, valueOf(values, "-s") or "\n")
 end
 
 HANDLERS.cd = function(self, argv)
@@ -6126,6 +6222,18 @@ function Shell.selfTest(probe: any): (boolean, string?)
 	probe.cwd = textFixture
 
 	local checks: { { line: string, want: string, why: string } } = {
+		-- seq exists to feed `for i in $(seq 1 20)`, so what has to hold is that a
+		-- negative operand survives the FLAG parser: `-1` is a step, not a flag,
+		-- and `-0.5` used to be taken apart into -0, -. and -5 before the numeric
+		-- guard in partition learned about decimal points.
+		{ line = "seq 5", want = "1\n2\n3\n4\n5", why = "one operand is the LAST" },
+		{ line = "seq 5 -1 1", want = "5\n4\n3\n2\n1", why = "a negative step is an operand" },
+		{ line = "seq 2 -0.5 1", want = "2.0\n1.5\n1.0", why = "a negative decimal step" },
+		{ line = "seq -w -s , 8 10", want = "08,09,10", why = "seq -w pads, -s joins" },
+		{ line = "seq 5 1", want = "", why = "a step pointing away from the end is empty" },
+		-- The whole point: one command producing the words the next consumes.
+		{ line = "for i in $(seq 1 3); do echo n$i; done", want = "n1\nn2\nn3",
+		  why = "seq feeds a counted loop" },
 		{ line = "sed -n '2,4p' Sample.luau", want = "beta\ngamma\ndelta",
 		  why = "sed address range" },
 		{ line = "sed -n '3p' Sample.luau", want = "gamma", why = "single-line address" },
@@ -6406,6 +6514,11 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			{ line = "tail -f Sample.luau", want = "never returns" },
 			{ line = "find / -exec ls", want = "`run` tool" },
 			{ line = "find / -user me", want = "no owner" },
+			-- A truncated sequence is the WRONG sequence, and a loop built from one
+			-- silently does the wrong number of things, so the cap refuses.
+			{ line = "seq 1 5000", want = "5000 values" },
+			{ line = "seq 1 0 5", want = "step of zero" },
+			{ line = "seq -f %g 5", want = "printf" },
 			{ line = "cp -l a b", want = "exactly one Parent" },
 			{ line = "mv -i a b", want = "nobody at a terminal" },
 			{ line = "chmod 755 Sample.luau", want = "user/group/other" },

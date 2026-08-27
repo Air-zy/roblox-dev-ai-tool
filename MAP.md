@@ -150,13 +150,13 @@ main.lua                        window, toolbar, popups, usage panel
 | Lines | Region |
 |---:|---|
 | 1-67 | header, requires, aliases |
-| 68-979 | parsing: `tokenize:94`, `partition:238`, `extractHeredoc:415`, `takeRedirect:475`, `SPECS:588` |
-| 980-4415 | HANDLERS — 38 commands + private helpers |
-| 4416-5218 | the GitHub calls, `materialize:4520` (pull and clone share it), and `HANDLERS.git:4596` — add/clone/commit/config/diff/log/pull/reset/show/status |
-| 5219-5252 | `Shell.COMMANDS:5226` |
-| 5253-5765 | pipelines, statements, loops, `$(...)`: `runCommand:5253` |
-| 5766-5817 | `Shell.run:5766` -> `runLine` |
-| 5818-end | `Shell.selfTest:5818` |
+| 68-979 | parsing: `tokenize:94`, `partition:238`, `extractHeredoc:420`, `takeRedirect:480`, `SPECS:610` |
+| 980-4518 | HANDLERS — 39 commands + private helpers |
+| 4519-5321 | the GitHub calls, `materialize:4623` (pull and clone share it), and `HANDLERS.git:4699` — add/clone/commit/config/diff/log/pull/reset/show/status |
+| 5322-5355 | `Shell.COMMANDS:5329` |
+| 5356-5868 | pipelines, statements, loops, `$(...)`: `runCommand:5356` |
+| 5869-5920 | `Shell.run:5869` -> `runLine` |
+| 5921-end | `Shell.selfTest:5921` |
 
 `tokenize`/`partition` and the diff core are pure text and are the next
 extractions; `HANDLERS` is not (below).
