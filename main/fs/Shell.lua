@@ -6273,6 +6273,19 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			sourceFailure = "an identical write changed the source"
 			break
 		end
+		-- The syntax check, in both directions, because only one of them fails
+		-- loudly. A checker wired up wrong tends to return nil for everything,
+		-- which passes the valid case silently and ships a write path that can
+		-- never report anything: the missing `end` is the half that catches it.
+		if Fs.syntaxErrors("local x = 1\nreturn x\n") ~= nil then
+			sourceFailure = "valid Luau was reported as a syntax error"
+			break
+		end
+		local broken = Fs.syntaxErrors("local function f()\n\tprint(1)\n")
+		if broken == nil or not broken:find("Expected 'end'", 1, true) then
+			sourceFailure = "a missing `end` was not caught: " .. tostring(broken)
+			break
+		end
 	until true
 	sourceFixture:Destroy()
 	if sourceFailure then

@@ -135,6 +135,58 @@ function Fs.writeSource(inst: Instance, text: string): string?
 	return (not ok) and tostring(err) or nil
 end
 
+-- Syntax check, through Luau's own grammar.
+--
+-- vendor/LuauParser is a port of Luau's Ast/src/Parser.cpp, so what comes back
+-- here is what Studio itself would say, word for word, rather than an
+-- approximation that drifts every time the language grows. Syntax ONLY: type
+-- errors are analysis-time, luau-analyze is a separate binary, and no pure-Luau
+-- checker in a plugin reaches them.
+--
+-- Required on first use rather than at load. It is 10 500 lines across three
+-- modules and a session that only reads files never pays for compiling them.
+local Parser: any = nil
+
+-- How many errors are worth carrying back. The parser recovers and keeps going,
+-- so one stray token can produce a screenful, and everything after the first is
+-- usually cascade rather than a second real mistake.
+local MAX_SYNTAX_ERRORS = 3
+
+-- Returns nil when the source parses, or the errors as text.
+function Fs.syntaxErrors(source: string): string?
+	if not Parser then
+		Parser = require(script.Parent.Parent:WaitForChild("vendor"):WaitForChild("LuauParser")) :: any
+	end
+	-- pcall'd, and a throw is swallowed rather than reported. This runs AFTER a
+	-- write that already landed, so a checker that breaks must not turn a
+	-- successful write into a failure: saying nothing is the correct way for it
+	-- to fail.
+	local called, parsed, result = pcall(Parser.parse, source)
+	if not called or parsed or type(result) ~= "table" then
+		return nil
+	end
+	local errors = result.errors
+	if type(errors) ~= "table" or #errors == 0 then
+		return nil
+	end
+
+	local out: { string } = {}
+	for index, entry in ipairs(errors) do
+		if index > MAX_SYNTAX_ERRORS then
+			out[#out + 1] = string.format("… %d more", #errors - MAX_SYNTAX_ERRORS)
+			break
+		end
+		-- Positions are VECTORS, not tables: .x is the line and .y the column,
+		-- both 0-based. Reading them as .line/.column silently yields nil and
+		-- every error reports "line nil".
+		local at = entry.location and entry.location.begin
+		out[#out + 1] = at
+			and string.format("line %d:%d: %s", at.x + 1, at.y + 1, tostring(entry.message))
+			or tostring(entry.message)
+	end
+	return table.concat(out, "\n")
+end
+
 -- Splitting with gmatch("[^\n]*"), which is what head, tail, grep and wc all
 -- used: yields an extra empty match after every newline. That silently doubled
 -- every line number grep reported and padded head/tail with blank lines. One

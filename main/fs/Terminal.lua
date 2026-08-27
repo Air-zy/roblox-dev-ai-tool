@@ -50,6 +50,7 @@ local formatValue     = Fs.formatValue
 local countOccurrences = Fs.countOccurrences
 local splitPath       = Fs.splitPath
 local displayName     = Fs.displayName
+local syntaxErrors    = Fs.syntaxErrors
 
 local Terminal = {}
 Terminal.__index = Terminal
@@ -535,6 +536,22 @@ function Terminal:ensureScript(path: string): (Instance?, string?)
 	end)
 end
 
+-- Append a syntax check to a write that has ALREADY landed. Never a reason to
+-- reject one.
+--
+-- Appending cannot break anything: a false positive costs the model one line of
+-- noise, where refusing the write on one would make a file unwritable with no
+-- way around it from the agent's side. It also leaves a deliberately broken
+-- intermediate state legal, which a sequence of edits sometimes needs before the
+-- last one closes it back up.
+--
+-- Both write paths route through here, and they are the only two that change
+-- source: `sed -i` writes through :write, and cp/mv/rm never touch it.
+local function withSyntax(message: string, source: string): string
+	local bad = syntaxErrors(source)
+	return bad and (message .. "\nsyntax error:\n" .. bad) or message
+end
+
 -- write: replace a script's entire source, creating the script if it is missing.
 function Terminal:write(path: string?, content: string?): (string?, string?)
 	if content == nil then
@@ -568,9 +585,9 @@ function Terminal:write(path: string?, content: string?): (string?, string?)
 	-- and the observed-mtime journal would miss the most common edit there is.
 	Fs.touch(target)
 
-	return string.format("%s %s (%d lines)", created and "created" or "wrote",
+	return withSyntax(string.format("%s %s (%d lines)", created and "created" or "wrote",
 		instancePath(target),
-		#splitLines(Fs.normaliseNewlines(content :: string))), nil
+		#splitLines(Fs.normaliseNewlines(content :: string))), content :: string), nil
 end
 
 -- multiedit: apply substring replacements in order, all or nothing.
@@ -636,8 +653,8 @@ function Terminal:multiedit(path: string?, edits: { any }?): (string?, string?)
 	if writeErr then return nil, writeErr end
 	Fs.touch(target)
 
-	return string.format("edited %s (%d changes, -%d/+%d lines)",
-		instancePath(target), #edits, removed, added), nil
+	return withSyntax(string.format("edited %s (%d changes, -%d/+%d lines)",
+		instancePath(target), #edits, removed, added), updated), nil
 end
 
 -- edit: the single-replacement case. Same semantics, same undo record.

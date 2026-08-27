@@ -19,3 +19,5 @@ I MIGHT BE WRONG ABOUT THESE CHOICES
 **BUT it's a *lexer*, not a parser.** Catches unfinished strings, bad numbers, bad comments. **Cannot** catch missing `end` — that needs structural tracking. My recommendation: use Highlighter for live tokenization, then roll a ~100-line token-stack validator on top of its token stream (track `function/if/for/while/do/repeat/(`/`[`/`{` openings, pop on closers, report unclosed at EOF). Covers ~80% of "forgot an `end`" errors.
 
 **For full type checking inside a plugin: no pure-Luau solution exists.** Either shell out to `luau-analyze` (not lightweight) or skip it.
+
+⭐ vantoanvh/LuauParser — #1 for full parsing / structural syntax errors (active, full Luau v0.735 coverage, but needs a 2-line require patch since it uses pesde's @self alias which Roblox Studio doesn't natively resolve)

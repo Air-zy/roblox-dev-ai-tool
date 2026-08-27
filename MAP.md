@@ -37,6 +37,7 @@ main.lua                        window, toolbar, popups, usage panel
       text/Regex                BRE/ERE engine
       text/Sed                  sed engine
       git/Git                   object ids, path mapping, working-tree walk
+      vendor/LuauParser         Luau grammar; the syntax check on write
 ```
 
 ## Where does X happen
@@ -87,7 +88,8 @@ main.lua                        window, toolbar, popups, usage panel
 | ls / cat / stat / find / grep / tree | `Terminal.lua:113 / 133 / 206 / 250 / 315 / 402` |
 | a walk stays off the main thread's back | `Fs.lua:645` `Fs.breather` — one call per node in `Terminal:find:281`, `:grep:348`, `:tree:426` and `ls -R` (`Shell.lua:1183`) |
 | the root listing collapses empty services | `Shell.lua:1178` `hideEmpty`; `ls -a /` is the complete form |
-| write / multiedit | `Terminal.lua:515 / 562` |
+| write / multiedit | `Terminal.lua:556 / 603` |
+| the syntax check on a write | `Fs.lua:156` `Fs.syntaxErrors`, appended by `Terminal.lua:550` `withSyntax`. Never rejects a write, only annotates one |
 | Luau is executed | `studio/Exec.lua:424` `Exec.run`; PROLOGUE at `:56`, every entry one physical line |
 | the run guard (off by default) | `studio/Exec.lua:31` `setRunGuard`, backed by `Settings.allowRun` |
 | free models | `studio/Catalog.lua:186` `search`, `:247` `load` |
@@ -111,13 +113,14 @@ main.lua                        window, toolbar, popups, usage panel
 
 | File | Lines | Owns |
 |---|---:|---|
-| `fs/Shell.lua` | 6581 | The command line. Still the biggest — see below. |
+| `fs/Shell.lua` | 6588 | The command line. The biggest thing here we actually wrote — see below. |
 | `agent/Agent.lua` | 1352 | Turn loop, conversation state, trimming, stop. |
 | `ui/Console.lua` | 1355 | Bubbles, thinking drawers, tool-call blocks, the detached sink. |
 | `text/Regex.lua` | 957 | BRE/ERE engine. Requires nothing. |
+| `vendor/LuauParser.lua` | 7718 | VENDORED, do not edit. Luau's own Parser.cpp ported to Luau. Two patched require lines, see the header. `LuauSyntax` 1043 and `LuauConfusables` 1790 sit beside it. |
 | `main.lua` | 1116 | Widget, toolbar, popups. Owns `plugin`, hands it to Provider / Sessions / Settings / Git — the only five that touch it. |
-| `fs/Terminal.lua` | 811 | Commands as tree operations. No parsing. |
-| `fs/Fs.lua` | 791 | Paths, `.Source`, undo, mtime, globs, mode bits. |
+| `fs/Terminal.lua` | 829 | Commands as tree operations. No parsing. |
+| `fs/Fs.lua` | 843 | Paths, `.Source`, undo, mtime, globs, mode bits. |
 | `agent/providers/OpenRouter.lua` | 842 | chat/completions, and the translation both ways. |
 | `agent/providers/Anthropic.lua` | 824 | One request. Knows nothing about turns. |
 | `agent/providers/Stream.lua` | 391 | The socket, the retries, the latches. One copy. |
