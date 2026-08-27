@@ -197,9 +197,21 @@ returns the hunks already in unified format. There is no clone of a whole histor
 and no local objects, so checkout and rebase have nothing to work with and say so.
 
 `git clone owner/repo [dest]` is the other direction: someone else's repository
-read into this place. Only the scripts come across — a DataModel has nowhere to
-put a README — and `--branch` takes a branch or a tag, defaulting to whatever the
-repository's HEAD is. Rojo's init convention is honoured, so `src/init.luau`
+read into this place. A github.com URL works wherever a slug does, so what is on
+the clipboard is what you paste, and `--branch` takes a branch or a tag,
+defaulting to whatever the repository's HEAD is. Scripts come across by default
+and `-A` takes the rest with them: .Source holds any text, so a README arrives as
+a ModuleScript named README.md that cat, grep and sed read with no special case,
+and it commits back under its own name. The default is scripts only for the sake
+of requests rather than capability — one blob apiece against sixty an hour
+unauthenticated, and Knit is 61 files of which 6 are Luau. A file with no
+extension at all is left behind even under -A: `LICENSE` as an Instance name
+cannot be told from a script's, so taking it would rename it to LICENSE.luau on
+the way back out. With no destination it clones into the cwd the way git
+does, except at the root, where nothing can be created beside a service: there it
+lands in /ServerStorage/tmp instead, which is also the right place for a
+repository nobody has decided where to keep yet. The path is in the output either
+way, and `mv` moves it. Rojo's init convention is honoured, so `src/init.luau`
 makes src itself the ModuleScript and a cloned library is one you can require.
 That, and curl, are why there is no unzip here.
 
@@ -224,6 +236,21 @@ grep is BRE, `.` is a metacharacter there exactly as it is everywhere else:
 `grep game.Workspace` also matches `gameXWorkspace`, and `\.` or `-F` is how you
 ask for the literal.
 
+A command that finds nothing exits 1, the way it does in bash, and a command
+that failed exits 2. Keeping those apart is what makes `grep X f || echo miss`
+fall back and `[ -f X ] && cat X` guard, while still letting `grep X f | wc -l`
+run wc rather than stopping the pipeline the moment a search came back empty. A
+pipeline still stops on a real error, because there is no stderr here and the
+message would flow on as data. One divergence stays: grep prints `no matches`
+where bash prints nothing, so a piped count is 1 rather than 0 and `grep -c` is
+the number to pipe.
+
+`test` and `[` are that guard. `-e -f -d -s` ask about a path, `-z -n = !=` about
+a string, `-eq -ne -lt -le -gt -ge` about numbers, and `!` negates. There is no
+`if`: `[ x ] && a || b` is the form, and `[ x ] && [ y ]` chains, which is why
+`-a` and `-o` are refused with that as the reason. `-r -w -x` are refused too —
+an Instance has no permissions, and `-f` is the readable question.
+
 Each command declares the flags it takes, in SPECS. A flag that has no meaning
 against a DataModel is refused with the reason rather than a list of what is
 allowed: ls -o says an Instance has no owner, tail -f says these handlers run
@@ -247,6 +274,12 @@ splicing happens on the text of the line and tokenize would read those as syntax
 seq(1) does, with -s for the separator and -w to zero-pad, and it refuses past a
 thousand values rather than truncating, since half a sequence is the wrong
 sequence and the loop built from one quietly does the wrong number of things.
+
+`!` before a pipeline inverts its status, which is worth something now that a
+miss reports one: `! grep -q X f && echo absent`. `cd -` goes back to wherever
+the last cd came from. Globs are expanded by whichever command takes paths —
+every one that iterates them does, and the three that walk from a single root
+(grep, du, tree) say so rather than answering for whichever match sorted first.
 
 There are still no variables beyond a loop's own, no arithmetic and no
 backticks. HOWEVER we will try to make this a real shell harness (so all args and

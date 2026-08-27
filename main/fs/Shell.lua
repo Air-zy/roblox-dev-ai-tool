@@ -571,6 +571,22 @@ local function fail(prefix: string, err: any): string
 	return prefix .. ": " .. tostring(err)
 end
 
+-- Ran fine, found nothing. In bash that is exit 1 and an ERROR is exit 2, and
+-- keeping them apart is load-bearing in both directions at once: `grep X f ||
+-- echo miss` has to see a false status, and `grep X f | wc -l` has to still run
+-- wc. One flag could only ever give one of those, and it gave neither — a miss
+-- set nothing at all, so `||` never fired after a grep that found nothing while
+-- `grep -q` was the only spelling that worked.
+--
+-- So `failed` now means only "this errored, its output is a message", which is
+-- what stops a pipeline; `unmatched` means "the answer was no", which only
+-- `&&` and `||` read.
+local unmatched = false
+local function miss(message: string): string
+	unmatched = true
+	return message
+end
+
 local function applyRedirect(self: any, path: string, content: string, append: boolean): string
 	local target, err = self:ensureScript(path)
 	if not target then
@@ -1162,10 +1178,23 @@ end
 
 HANDLERS.cd = function(self, argv)
 	local _, _, operands = parse(argv)
-	if not operands[1] then
-		return "cd: requires a path"
+	local where = operands[1]
+	if not where then
+		-- bash goes home; there is no home here, and inventing one would mean
+		-- picking a container and calling it that. Through fail() so the status is
+		-- honest: this used to return the message as ordinary output, so `cd ||
+		-- echo lost` never fired.
+		return fail("cd", "requires a path — `cd /` is the root and `cd -` goes back")
 	end
-	local ok, err = self:cd(operands[1])
+	-- `cd -` returns to wherever the last successful cd came from, and bash
+	-- prints the new directory, which is what this returns anyway.
+	if where == "-" then
+		if not self.previous then
+			return fail("cd", "nothing to go back to yet")
+		end
+		where = instancePath(self.previous)
+	end
+	local ok, err = self:cd(where)
 	if not ok then
 		return fail("cd", err)
 	end
@@ -1492,6 +1521,29 @@ local function catRender(text: string, flags: { [string]: boolean }): string
 	return table.concat(out, "\n")
 end
 
+-- A glob for a command that takes exactly ONE path.
+--
+-- grep, du and tree each walk from a single root, so expanding a pattern and
+-- taking the first match would answer for one file and say nothing about the
+-- rest — a wrong answer wearing the shape of a right one. Several matches is a
+-- refusal instead, naming the spelling that does work. One match expands
+-- normally, so `grep foo Main*.luau` behaves.
+--
+-- Handlers that ITERATE their operands do not come through here: they call
+-- expandGlobs and take everything it returns, which is what bash does.
+local function oneGlobbed(self: any, cmd: string, path: string?,
+	alternative: string): (string?, string?)
+	if not path then
+		return nil, nil
+	end
+	local matched = expandGlobs(self, { path })
+	if #matched > 1 then
+		return nil, fail(cmd, string.format("%q matches %d paths and %s takes one — %s",
+			path, #matched, cmd, alternative))
+	end
+	return matched[1], nil
+end
+
 HANDLERS.cat = function(self, argv, stdin)
 	local flags, _, operands = parse(argv)
 	-- -e and -t are shorthand, exactly as in cat: -vE and -vT. Expanded here so
@@ -1546,6 +1598,8 @@ local STAT_FIELDS: { [string]: (Instance) -> string } = {
 
 HANDLERS.stat = function(self, argv)
 	local _, values, operands = parse(argv)
+	-- `stat *.luau` is a listing over every match, the same as ls.
+	operands = expandGlobs(self, operands)
 	local format = valueOf(values, "-c")
 	if format then
 		local out: { string } = {}
@@ -1819,6 +1873,12 @@ end
 HANDLERS.tree = function(self, argv)
 	local flags, values, operands = parse(argv)
 	local target, depth = takeCount(operands)
+	local globErr
+	target, globErr = oneGlobbed(self, "tree", target,
+		"a tree is drawn from one root; `tree .` covers everything under the cwd")
+	if globErr then
+		return globErr
+	end
 	depth = numberOf(values, "-L") or depth
 	local s, err = self:tree(target, depth, {
 		dirsOnly = flags["-d"],
@@ -1833,7 +1893,12 @@ end
 
 HANDLERS.du = function(self, argv)
 	local flags, values, operands = parse(argv)
-	local target, err = self:resolve(operands[1])
+	local only, globErr = oneGlobbed(self, "du", operands[1],
+		"`du -a .` sizes everything below a container in one walk")
+	if globErr then
+		return globErr
+	end
+	local target, err = self:resolve(only)
 	if not target then
 		return fail("du", err)
 	end
@@ -2263,7 +2328,7 @@ HANDLERS.find = function(self, argv)
 		end
 	end
 	if #found == 0 then
-		return "no matches"
+		return miss("no matches")
 	end
 
 	if deleting then
@@ -2340,13 +2405,141 @@ HANDLERS.which = function(self, argv)
 	return table.concat(out, "\n")
 end
 
+-- test / [ : a predicate with no output, only a status.
+--
+-- Worth having for one reason: `&&` and `||` already exist, so `[ -f Main.luau ]
+-- && cat Main.luau` needs no `if` and no change to the parser. One handler buys
+-- most of what `if` is for, which is why it comes first.
+--
+-- A false test is a MISS and not a failure, the same line grep draws: nothing
+-- went wrong, the answer was no. A malformed one IS a failure, which is bash's
+-- 2-versus-1 and the reason `[ -f ]` cannot read as "no".
+--
+-- Parsed straight off argv rather than through the spec gate, for find's reason:
+-- here the operators ARE the operands. `-eq` through partition is two bundled
+-- booleans, -e and -q, and `-f Main.luau` would eat the path as a flag's value.
+local TEST_OPS = "-e -f -d -s -z -n = != -eq -ne -lt -le -gt -ge, and ! to negate"
+
+local TEST_REFUSED: { [string]: string } = {
+	-- chmod here maps onto Disabled, Archivable and Locked, none of which is a
+	-- permission to read or write, so there is nothing for these to answer.
+	["-r"] = "there are no permissions on an Instance — `-e` asks whether it is " ..
+		"there and `-f` whether it has source",
+	["-w"] = "see -r",
+	["-x"] = "see -r",
+	["-L"] = "an Instance has exactly one Parent, so there is no link to follow",
+	["-h"] = "see -L",
+	-- POSIX deprecates both, and this shell already has the replacement.
+	["-a"] = "is deprecated even in bash; `[ x ] && [ y ]` chains two tests",
+	["-o"] = "is deprecated even in bash; `[ x ] || [ y ]` chains two tests",
+}
+
+local TEST_NUMERIC: { [string]: (number, number) -> boolean } = {
+	["-eq"] = function(a, b) return a == b end,
+	["-ne"] = function(a, b) return a ~= b end,
+	["-lt"] = function(a, b) return a < b end,
+	["-le"] = function(a, b) return a <= b end,
+	["-gt"] = function(a, b) return a > b end,
+	["-ge"] = function(a, b) return a >= b end,
+}
+
+HANDLERS.test = function(self, argv)
+	local name = argv[1]
+	local args: { string } = {}
+	table.move(argv, 2, #argv, 1, args)
+	-- `[` is the same command wearing brackets, and the closing one is REQUIRED:
+	-- without the check, `[ -f x` would silently answer a question nobody
+	-- finished asking.
+	if name == "[" then
+		if args[#args] ~= "]" then
+			return fail("[", "missing the closing `]`")
+		end
+		args[#args] = nil
+	end
+
+	local negate = false
+	while args[1] == "!" do
+		negate = not negate
+		table.remove(args, 1)
+	end
+	-- The only two exits that are not errors. Silence either way: a test that
+	-- printed anything would land in the output of every guard using it.
+	local function answer(value: boolean): string
+		return if value ~= negate then "" else miss("")
+	end
+
+	if #args == 0 then
+		-- bash: `test` alone is false, and `[ ! ]` is true. Not an error either
+		-- way, which is why this is here and not with the refusals.
+		return answer(false)
+	end
+	if #args == 1 then
+		return answer(args[1] ~= "")
+	end
+
+	if #args == 2 then
+		local op, operand = args[1], args[2]
+		if op == "-z" then return answer(operand == "") end
+		if op == "-n" then return answer(operand ~= "") end
+		local why = TEST_REFUSED[op]
+		if why then
+			return fail(name, op .. " " .. why)
+		end
+		if op == "-e" or op == "-f" or op == "-d" or op == "-s" then
+			local target = self:resolve(operand)
+			if not target then
+				-- A path that does not resolve is the answer "no", not an error.
+				return answer(false)
+			end
+			if op == "-e" then return answer(true) end
+			if op == "-f" then return answer(isScript(target)) end
+			if op == "-d" then return answer(not isScript(target)) end
+			-- -s is "has something in it", and what that means splits exactly where
+			-- `find -type` splits it: a script's something is its source, a
+			-- container's is its children.
+			return answer(if isScript(target)
+				then #(getSource(target) or "") > 0
+				else #target:GetChildren() > 0)
+		end
+		return fail(name, string.format("unknown operator %q — %s", op, TEST_OPS))
+	end
+
+	if #args == 3 then
+		local left, op, right = args[1], args[2], args[3]
+		if op == "=" or op == "==" then return answer(left == right) end
+		if op == "!=" then return answer(left ~= right) end
+		local compare = TEST_NUMERIC[op]
+		if compare then
+			local a, b = tonumber(left), tonumber(right)
+			if not a or not b then
+				-- bash calls this an error rather than a false, and it is right to:
+				-- `[ $x -eq 1 ]` on an empty x is a bug, not an answer.
+				return fail(name, string.format("%s compares numbers, and %q is not one",
+					op, if a then right else left))
+			end
+			return answer(compare(a, b))
+		end
+		local why = TEST_REFUSED[op]
+		if why then
+			return fail(name, op .. " " .. why)
+		end
+		return fail(name, string.format("unknown operator %q — %s", op, TEST_OPS))
+	end
+
+	return fail(name, string.format("takes 1 to 3 arguments, got %d — `[ x ] && [ y ]` " ..
+		"is how two tests join", #args))
+end
+
+-- Same handler, and it reads argv[1] to know which spelling it was given.
+HANDLERS["["] = HANDLERS.test
+
 -- `command -v NAME` is the portable "does this exist", and the answer is shorter
 -- here than in bash: with no PATH, a name either is a builtin or is nothing.
 --
--- A miss prints NOTHING and fails, which is the entire point of the form —
--- `command -v sed && sed ...` reads the status, not the text, and a message here
--- would land in the output of every guard that used it. `grep -q` sets `failed`
--- the same way for the same reason.
+-- A miss prints NOTHING and reports a false status, which is the entire point of
+-- the form — `command -v sed && sed ...` reads the status, not the text, and a
+-- message here would land in the output of every guard that used it. `grep -q`
+-- sets `unmatched` the same way for the same reason.
 --
 -- The bare `command NAME args` form never reaches here: runCommand strips the
 -- prefix, so the command that runs is the real one, with its own spec.
@@ -2379,7 +2572,7 @@ HANDLERS.command = function(_, argv)
 	end
 	if flags["-v"] then
 		if not what then
-			failed = true
+			unmatched = true
 			return ""
 		end
 		-- bash prints the path for an external command and the bare name for a
@@ -2527,7 +2720,12 @@ HANDLERS.grep = function(self, argv, stdin)
 		patterns = { pattern }
 		firstOperand = 2
 	end
-	local path = operands[firstOperand]
+	local path, globErr = oneGlobbed(self, "grep", operands[firstOperand],
+		"`grep -r --include='*.luau' PATTERN .` filters a walk, which is what a " ..
+		"pattern over files means here")
+	if globErr then
+		return globErr
+	end
 
 	-- The dialect, exactly as the real tools define it: plain grep is BRE, -E and
 	-- egrep are ERE, -F and fgrep are fixed strings, -P is ERE plus the
@@ -2631,7 +2829,7 @@ HANDLERS.grep = function(self, argv, stdin)
 			-- Nothing on stdout; the answer is the exit status, which is what `&&`
 			-- reads. Silence with a false status is the whole point of -q.
 			if matches == 0 then
-				failed = true
+				unmatched = true
 			end
 			return ""
 		end
@@ -2645,7 +2843,7 @@ HANDLERS.grep = function(self, argv, stdin)
 		-- only worth printing when asked for.
 		return #hits > 0
 			and formatHits(hits, false, flags["-n"] == true, before + after > 0)
-			or "no matches"
+			or miss("no matches")
 	end
 
 	local scope = {
@@ -2665,7 +2863,7 @@ HANDLERS.grep = function(self, argv, stdin)
 
 	if flags["-q"] then
 		if matches == 0 then
-			failed = true
+			unmatched = true
 		end
 		return ""
 	end
@@ -2696,7 +2894,7 @@ HANDLERS.grep = function(self, argv, stdin)
 
 	if #hits == 0 then
 		if flags["-c"] then
-			return "0"          -- a count, since that is what was asked for
+			return miss("0")    -- a count, since that is what was asked for
 		end
 		-- The nudge that used to live here explained that grep matched literal
 		-- text and pointed at -E. Both halves are gone: plain grep is BRE now, so
@@ -2711,11 +2909,11 @@ HANDLERS.grep = function(self, argv, stdin)
 			local found = insensitive and self:grep(insensitive, path,
 				{ invert = opts.invert }, scope)
 			if found and #found > 0 then
-				return string.format("no matches — %d with `grep -i` (grep is case-sensitive)",
-					#found)
+				return miss(string.format("no matches — %d with `grep -i` (grep is case-sensitive)",
+					#found))
 			end
 		end
-		return "no matches"
+		return miss("no matches")
 	end
 
 	if flags["-c"] then
@@ -2772,6 +2970,13 @@ end
 -- separates them, -b drops leading blanks, -f folds case. Written once because
 -- sort and uniq both need "the comparable part of this line" and their two
 -- answers drifting would make `sort | uniq` disagree with itself.
+-- The number `sort -n` compares: leading blanks, an optional sign, digits, and
+-- it stops at the first thing that is not one. Anything with no number in front
+-- is zero, which is how GNU orders a line of prose against a line of counts.
+local function numericPrefix(text: string): number
+	return tonumber(text:match("^%s*[-+]?%d*%.?%d+") or "") or 0
+end
+
 local function sortKey(line: string, flags: { [string]: boolean },
 	values: { [string]: { string } }): string
 	local key = line
@@ -2855,8 +3060,16 @@ HANDLERS.sort = function(self, argv, stdin)
 		local ka, kb = sortKey(a, flags, values), sortKey(b, flags, values)
 		if flags["-n"] then
 			-- A non-numeric line sorts as 0, which is what sort -n does rather
-			-- than erroring.
-			local na, nb = tonumber(ka) or 0, tonumber(kb) or 0
+			-- than erroring — and the value is read off the LEADING number, not
+			-- the whole line. Lua's tonumber demands the entire string be a
+			-- number, so "12 /Workspace/Thing" measured as 0 and fell through to
+			-- the lexical tiebreak below. That shape is not an edge case here: it
+			-- is exactly what du, wc and `grep -c` print, which is most of what
+			-- anyone pipes into `sort -n`.
+			--
+			-- No exponent, deliberately: GNU reads 1e3 as 1 under -n and wants -g
+			-- for the other reading.
+			local na, nb = numericPrefix(ka), numericPrefix(kb)
 			if na ~= nb then
 				return na < nb
 			end
@@ -3043,6 +3256,11 @@ end
 
 HANDLERS.touch = function(self, argv)
 	local flags, values, operands = parse(argv)
+	-- `touch *.luau` restamps what is already there. A pattern that matches
+	-- nothing passes through as bash leaves it, and touch then creates a script
+	-- under that literal name — which is bash's behaviour too, and the reason
+	-- nullglob exists there.
+	operands = expandGlobs(self, operands)
 	if #operands == 0 then
 		return fail("touch", "requires a name")
 	end
@@ -3233,6 +3451,13 @@ end
 HANDLERS.chmod = function(self, argv)
 	local flags, _, operands = parse(argv)
 	local mode = operands[1]
+	-- From the second: the first operand is the MODE, and `chmod +x *.luau` would
+	-- otherwise try to match `+x` against the children of the cwd.
+	if mode then
+		local targets = expandGlobs(self, table.move(operands, 2, #operands, 1, {}))
+		operands = { mode }
+		table.move(targets, 1, #targets, 2, operands)
+	end
 	if not mode or #operands < 2 then
 		return fail("chmod", "requires a mode and a path, as `chmod +x Main.luau`")
 	end
@@ -3479,10 +3704,14 @@ HANDLERS.sed = function(self, argv, stdin)
 		return fail("sed", "requires an expression, e.g. s/old/new/ or -n '10,40p'")
 	end
 
+	-- Globbed, and only from firstFile: operand one is the SCRIPT, and `sed -i
+	-- 's/a/b/' *.luau` is the single most common thing anyone asks sed to do.
+	-- Expanding the script too would try to match `s/a/b/` against the cwd.
 	local files: { string } = {}
 	for index = firstFile, #operands do
 		files[#files + 1] = operands[index]
 	end
+	files = expandGlobs(self, files)
 
 	-- Both refusals BEFORE anything is read, so a bad flag combination cannot
 	-- rewrite the first file and only then stop.
@@ -4762,8 +4991,8 @@ HANDLERS.git = function(self, argv)
 	if sub == "clone" then
 		local owner, repo = Git.parseSlug(operands[2])
 		if not owner or not repo then
-			return fail("git", string.format("`git clone <owner>/<repo> [dest]` — got %q",
-				tostring(operands[2] or "")))
+			return fail("git", string.format("`git clone <%s> [dest]` — got %q",
+				Git.SLUG_FORMS, tostring(operands[2] or "")))
 		end
 		-- HEAD is a ref the trees API resolves to the default branch, so nothing
 		-- has to guess between main and master, and the same slot takes a tag, so
@@ -4771,8 +5000,21 @@ HANDLERS.git = function(self, argv)
 		-- --ignore-space-change` in SPECS, and taking it would break that silently.
 		local ref = valueOf(values, "--branch") or "HEAD"
 		local cfg = { owner = owner, repo = repo, branch = ref }
-		-- git's own default is the repository's name, under the cwd.
-		local dest = operands[3] or repo
+		-- git's own default is the repository's name under the cwd, and that is
+		-- what this does — except at the DataModel root, where it cannot. The cwd
+		-- starts at `game`, a service is the shallowest thing that exists there,
+		-- and materialize refuses to invent a container beside one. So `git clone
+		-- owner/repo` typed as the first command of a session had every file come
+		-- back "not a service in this place" — a default that fails at the default
+		-- cwd is not a default.
+		--
+		-- The fallback is the scratch folder the run tool already names, which is
+		-- also the honest place for a repository nobody has decided where to keep
+		-- yet. Anywhere below the root, and for any named destination, git's rule
+		-- stands untouched, and the path is printed either way so the answer to
+		-- "where did it go" is in the output rather than in this comment.
+		local dest = operands[3]
+			or (if self:current() == game then "/ServerStorage/tmp/" .. repo else repo)
 		local existing = self:resolve(dest)
 		local occupied = existing and #existing:GetChildren() or 0
 		if occupied > 0 and not flags["-f"] then
@@ -4785,10 +5027,10 @@ HANDLERS.git = function(self, argv)
 		if not remote then
 			return fail("git", remoteErr)
 		end
-		local paths, notScripts = Git.scriptPaths(remote)
+		local paths, notScripts = Git.scriptPaths(remote, flags["-A"])
 		if #paths == 0 then
 			return fail("git", string.format("nothing to clone from %s/%s@%s — %d file%s and " ..
-				"not a script among them, and a DataModel has nowhere to put the rest",
+				"not a script among them; `git clone -A` takes the rest too",
 				owner, repo, ref, notScripts, notScripts == 1 and "" or "s"))
 		end
 		-- One blob request per file, against 60 an hour unauthenticated. A
@@ -4832,8 +5074,16 @@ HANDLERS.git = function(self, argv)
 				owner, repo, ref, base, written, written == 1 and "" or "s"),
 		}
 		if notScripts > 0 then
-			out[#out + 1] = string.format("%d non-script file%s skipped — nothing in a " ..
-				"DataModel holds one", notScripts, notScripts == 1 and "" or "s")
+			-- Two different facts, so two messages. Without -A the rest is simply
+			-- not asked for; WITH it, what is left cannot round-trip, and saying
+			-- "use -A" to somebody who just used it is the unhelpful kind of true.
+			out[#out + 1] = if flags["-A"]
+				then string.format("%d file%s skipped — a name with no extension cannot be " ..
+					"told from a script's, so it would commit back as .luau",
+					notScripts, notScripts == 1 and "" or "s")
+				else string.format("%d non-script file%s skipped — `git clone -A` takes them " ..
+					"too, as ModuleScripts holding their own text",
+					notScripts, notScripts == 1 and "" or "s")
 		end
 		for _, note in ipairs(failures) do
 			out[#out + 1] = "failed: " .. note
@@ -5354,7 +5604,7 @@ local STDIN_COMMANDS: { [string]: boolean } = {
 local runLoopStage: (any, { string }) -> (string, boolean)
 
 local function runCommand(self: any, argv: { string }, stdin: string?): (string, boolean)
-	failed = false
+	failed, unmatched = false, false
 	-- Before takeRedirect, which would otherwise steal a `>` out of the loop's
 	-- BODY: `for f in a; do echo $f > out.luau; done` is a redirect per
 	-- iteration, not one on the loop.
@@ -5413,12 +5663,14 @@ local function runCommand(self: any, argv: { string }, stdin: string?): (string,
 			cmd, table.concat(COMMANDS, " "))), false
 	end
 
-	local ok = not failed
+	local ok = not (failed or unmatched)
 	if redirect == DEV_NULL then
 		return "", ok        -- ran it, threw the output away
 	end
 	if redirect then
-		return applyRedirect(self, redirect, output, append), not failed
+		-- `failed` is read AGAIN because applyRedirect can set it: a write that
+		-- could not land is its own failure, on top of whatever the command said.
+		return applyRedirect(self, redirect, output, append), ok and not failed
 	end
 	return output, ok
 end
@@ -5431,11 +5683,17 @@ local function runPipeline(self: any, stages: { { string } }, stdin: string?): (
 	local output, ok = "", true
 	for _, stage in ipairs(stages) do
 		output, ok = runCommand(self, stage, input)
-		if not ok then
+		-- Stops on an ERROR, never on a merely false status. There is no stderr
+		-- here, so an error message flowing on would be read as data — but a stage
+		-- that found nothing did not error, and bash runs the next stage anyway.
+		-- `failed` still holds this stage's state: runCommand clears it on entry
+		-- and nothing has run since it returned.
+		if failed then
 			return output, false
 		end
 		input = output
 	end
+	-- The pipeline's status is the LAST stage's, as bash has it.
 	return output, ok
 end
 
@@ -5547,13 +5805,34 @@ local function runStatements(self: any, statements: { Statement },
 		local skip = (statement.joiner == "&&" and not lastOk)
 			or (statement.joiner == "||" and lastOk)
 		if not skip then
+			-- `! pipeline` inverts the STATUS and nothing else, which is bash's
+			-- own reading of it. Newly useful rather than newly possible: while a
+			-- miss reported no status there was nothing worth inverting, and now
+			-- `! grep -q X f && echo absent` is the natural way to ask.
+			--
+			-- The stage list is cloned rather than edited, so the parsed statement
+			-- is left as it was written.
+			local stages = statement.stages
+			local negate = stages[1] ~= nil and stages[1][1] == "!"
+			if negate then
+				stages = table.clone(stages)
+				stages[1] = table.move(stages[1], 2, #stages[1], 1, {})
+				if #stages[1] == 0 then
+					table.remove(stages, 1)
+				end
+				if #stages == 0 then
+					return fail("bash", "`!` inverts a command's status, so it needs one"), false
+				end
+			end
 			-- A heredoc body belongs to the last statement, the way a shell
 			-- attaches it to the command it followed.
-			local output, ok = runPipeline(self, statement.stages,
+			local output, ok = runPipeline(self, stages,
 				index == #statements and stdin or nil)
-			lastOk = ok
+			lastOk = if negate then not ok else ok
 			if #statements == 1 then
-				return output, ok
+				-- lastOk, not ok: on a lone `! cmd` the inversion is the whole
+				-- point, and returning the raw status would drop it.
+				return output, lastOk
 			end
 			-- With several commands the outputs need labelling, or there is no
 			-- telling which block came from which.
@@ -5821,10 +6100,16 @@ local function expandSubstitutions(self: any, line: string, depth: number): (str
 			if not inner then
 				return nil, "unclosed `$(`"
 			end
-			local text, ok = runLine(self, inner, depth + 1)
-			if not ok then
-				-- Splicing a refusal in as words is how `for f in $(grep ...)` would
-				-- come to iterate over the words of an error message.
+			local text = runLine(self, inner, depth + 1)
+			-- ERRORED, not merely false. Splicing a refusal in as words is how `for
+			-- f in $(grep ...)` would come to iterate over the words of an error
+			-- message — but a grep that found nothing did not refuse, and bash
+			-- iterates zero times there rather than aborting the line. Reading the
+			-- status instead would make every empty search a hard failure.
+			--
+			-- `failed` is the last command inside the substitution, which is the
+			-- one whose status bash would take.
+			if failed then
 				return nil, string.format("`$(%s)` failed — %s", inner, text)
 			end
 			local risk = quote == nil and UNQUOTED_RISK or QUOTED_RISK
@@ -6231,6 +6516,16 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		{ line = "seq 2 -0.5 1", want = "2.0\n1.5\n1.0", why = "a negative decimal step" },
 		{ line = "seq -w -s , 8 10", want = "08,09,10", why = "seq -w pads, -s joins" },
 		{ line = "seq 5 1", want = "", why = "a step pointing away from the end is empty" },
+		-- sort -n reads a LEADING number. Lua's tonumber wants the whole string
+		-- to be one, so every "12 something" line — which is what du, wc and
+		-- `grep -c` print, and most of what gets piped here — measured as 0 and
+		-- fell through to the lexical tiebreak. GNU puts the prose first at 0,
+		-- then 3, then 12; the broken reading put "12 b" before "3 a".
+		{ line = 'echo -e "12 b\\n3 a\\nbanana" | sort -n', want = "banana\n3 a\n12 b",
+		  why = "sort -n reads a leading number, not the whole line" },
+		-- ...and a plain sort of the same three is still lexical.
+		{ line = 'echo -e "12 b\\n3 a\\nbanana" | sort', want = "12 b\n3 a\nbanana",
+		  why = "sort without -n is lexical" },
 		-- The whole point: one command producing the words the next consumes.
 		{ line = "for i in $(seq 1 3); do echo n$i; done", want = "n1\nn2\nn3",
 		  why = "seq feeds a counted loop" },
@@ -6538,6 +6833,37 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			-- this would not be a slow grep. Luau cannot preempt, so it would
 			-- freeze Studio with no way out.
 			{ line = 'grep -E "(a+)+$" Runaway.luau', want = "too expensive" },
+			-- A miss is exit 1 and an error is exit 2, and both halves matter:
+			-- `||` has to fire after a grep that found nothing, and `&&` must not.
+			-- One flag doing both jobs meant `||` never fired at all.
+			{ line = "grep zzz Cased.luau || echo fellback", want = "fellback" },
+			-- Scoped to the fixture, not `/`: this one actually walks, and a
+			-- startup test has no business crawling somebody's whole place.
+			{ line = "find . -name zzzznope || echo fellback", want = "fellback" },
+			{ line = "[ -f nosuchscript.luau ] || echo fellback", want = "fellback" },
+			-- ...and a real match still succeeds, or `&&` is broken for everyone.
+			{ line = "grep -q Humanoid Cased.luau && echo ran", want = "ran" },
+			{ line = "[ -f Cased.luau ] && echo ran", want = "ran" },
+			{ line = "[ 2 -lt 10 ] && echo ran", want = "ran" },
+			{ line = "[ x = x ] && echo ran", want = "ran" },
+			{ line = "[ ! -f nosuchscript.luau ] && echo ran", want = "ran" },
+			-- `!` inverts a pipeline's status. Only worth anything now that a miss
+			-- reports one at all.
+			{ line = "! grep -q zzz Cased.luau && echo absent", want = "absent" },
+			{ line = "! [ -f Cased.luau ] || echo present", want = "present" },
+			{ line = "! grep -q Humanoid Cased.luau || echo found", want = "found" },
+			-- Globs reach the commands that were expanding them by hand, and the
+			-- ones that take a single path say so rather than silently answering
+			-- for whichever match sorted first.
+			{ line = "stat -c %n Sample.luau", want = "Sample" },
+			{ line = "grep Humanoid *.luau", want = "matches %d+ paths" },
+			{ line = "cd -", want = "nothing to go back" },
+			{ line = "cd", want = "requires a path" },
+			-- A malformed test is an ERROR, not a "no". Otherwise `[ -f ]` with a
+			-- forgotten argument silently takes the else branch forever.
+			{ line = "[ -f Cased.luau", want = "closing" },
+			{ line = "[ -r Cased.luau ]", want = "no permissions" },
+			{ line = "[ x -eq y ]", want = "compares numbers" },
 			-- An unknown s/// suffix used to be swallowed whole: `s/x/y/qqqzzz`
 			-- reported success and did the substitution anyway.
 			{ line = "echo test | sed 's/test/X/qqq'", want = "unknown flag" },
@@ -6563,6 +6889,11 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			{ line = "echo $(cat /nope)", want = "failed" },
 			{ line = "echo $(echo a", want = "unclosed" },
 			{ line = "grep zzz Cased.luau", want = "no matches" },
+			-- ...and a `$(...)` that found nothing must NOT be refused. bash
+			-- iterates zero times there; refusing turns every empty search into a
+			-- dead line, which is what reading the STATUS instead of the error
+			-- would have done once a miss started reporting one.
+			{ line = "echo $(grep zzz Cased.luau)", want = "^no matches" },
 			-- The case-sensitivity change has exactly one regression shape: a
 			-- search that used to work now finds nothing. It has to say so.
 			{ line = "grep HUMANOID Cased.luau", want = "grep %-i" },

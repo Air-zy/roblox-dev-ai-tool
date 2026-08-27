@@ -79,6 +79,10 @@ function Terminal:cd(path: string?): (boolean, string?)
 	if not target then
 		return false, err or "resolve failed"
 	end
+	-- Where `cd -` goes back to. Tracked HERE rather than in the handler so every
+	-- route into a directory change agrees on what "previous" means — and only on
+	-- a cd that succeeded, since a failed one never moved.
+	self.previous = self.cwd
 	self.cwd = target
 	return true, nil
 end
@@ -547,7 +551,14 @@ end
 --
 -- Both write paths route through here, and they are the only two that change
 -- source: `sed -i` writes through :write, and cp/mv/rm never touch it.
-local function withSyntax(message: string, source: string): string
+-- Skipped for a file that is not Luau. A cloned README lands in a ModuleScript
+-- because .Source is the only place text lives here, and running the parser over
+-- markdown reports a syntax error on every write of it — true, useless, and
+-- indistinguishable from one that matters.
+local function withSyntax(message: string, source: string, name: string?): string
+	if name and Fs.carriesExtension(name) then
+		return message
+	end
 	local bad = syntaxErrors(source)
 	return bad and (message .. "\nsyntax error:\n" .. bad) or message
 end
@@ -587,7 +598,8 @@ function Terminal:write(path: string?, content: string?): (string?, string?)
 
 	return withSyntax(string.format("%s %s (%d lines)", created and "created" or "wrote",
 		instancePath(target),
-		#splitLines(Fs.normaliseNewlines(content :: string))), content :: string), nil
+		#splitLines(Fs.normaliseNewlines(content :: string))), content :: string,
+		target.Name), nil
 end
 
 -- multiedit: apply substring replacements in order, all or nothing.
@@ -654,7 +666,7 @@ function Terminal:multiedit(path: string?, edits: { any }?): (string?, string?)
 	Fs.touch(target)
 
 	return withSyntax(string.format("edited %s (%d changes, -%d/+%d lines)",
-		instancePath(target), #edits, removed, added), updated), nil
+		instancePath(target), #edits, removed, added), updated, target.Name), nil
 end
 
 -- edit: the single-replacement case. Same semantics, same undo record.

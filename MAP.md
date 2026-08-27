@@ -113,13 +113,13 @@ main.lua                        window, toolbar, popups, usage panel
 
 | File | Lines | Owns |
 |---|---:|---|
-| `fs/Shell.lua` | 6588 | The command line. The biggest thing here we actually wrote — see below. |
+| `fs/Shell.lua` | 7342 | The command line. The biggest thing here we actually wrote — see below. |
 | `agent/Agent.lua` | 1352 | Turn loop, conversation state, trimming, stop. |
 | `ui/Console.lua` | 1355 | Bubbles, thinking drawers, tool-call blocks, the detached sink. |
 | `text/Regex.lua` | 957 | BRE/ERE engine. Requires nothing. |
 | `vendor/LuauParser.lua` | 7718 | VENDORED, do not edit. Luau's own Parser.cpp ported to Luau. Two patched require lines, see the header. `LuauSyntax` 1043 and `LuauConfusables` 1790 sit beside it. |
 | `main.lua` | 1168 | Widget, toolbar, popups, shell mode on the input row. Owns `plugin`, hands it to Provider / Sessions / Settings / Git — the only five that touch it. |
-| `fs/Terminal.lua` | 829 | Commands as tree operations. No parsing. |
+| `fs/Terminal.lua` | 839 | Commands as tree operations. No parsing. |
 | `fs/Fs.lua` | 843 | Paths, `.Source`, undo, mtime, globs, mode bits. |
 | `agent/providers/OpenRouter.lua` | 842 | chat/completions, and the translation both ways. |
 | `agent/providers/Anthropic.lua` | 824 | One request. Knows nothing about turns. |
@@ -149,14 +149,14 @@ main.lua                        window, toolbar, popups, usage panel
 
 | Lines | Region |
 |---:|---|
-| 1-67 | header, requires, aliases |
-| 68-979 | parsing: `tokenize:94`, `partition:238`, `extractHeredoc:420`, `takeRedirect:480`, `SPECS:610` |
-| 980-4518 | HANDLERS — 39 commands + private helpers |
-| 4519-5321 | the GitHub calls, `materialize:4623` (pull and clone share it), and `HANDLERS.git:4699` — add/clone/commit/config/diff/log/pull/reset/show/status |
-| 5322-5355 | `Shell.COMMANDS:5329` |
-| 5356-5868 | pipelines, statements, loops, `$(...)`: `runCommand:5356` |
-| 5869-5920 | `Shell.run:5869` -> `runLine` |
-| 5921-end | `Shell.selfTest:5921` |
+| 1-93 | header, requires, aliases |
+| 94-1030 | parsing: `tokenize:94`, `partition:238`, `extractHeredoc:420`, `takeRedirect:480`, `SPECS:626` |
+| 1031-4756 | HANDLERS — 41 commands + private helpers |
+| 4757-5571 | the GitHub calls, `materialize:4852` (pull and clone share it), and `HANDLERS.git:4928` |
+| 5572-5605 | `Shell.COMMANDS:5579` |
+| 5606-6153 | pipelines, statements, loops, `$(...)`: `runCommand:5606` |
+| 6154-6205 | `Shell.run:6154` -> `runLine` |
+| 6206-end | `Shell.selfTest:6206` |
 
 `tokenize`/`partition` and the diff core are pure text and are the next
 extractions; `HANDLERS` is not (below).

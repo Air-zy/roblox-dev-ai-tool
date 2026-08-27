@@ -492,10 +492,28 @@ function Fs.classFor(leaf: string): (string, string)
 	return class or "ModuleScript", bare or leaf
 end
 
+-- Does this name already read as a filename?
+--
+-- A ModuleScript is the only thing here with somewhere to put text, so a file
+-- that is not Luau — a README, a .json, a .toml — arrives as one with its own
+-- extension kept in the Name. `Main` is a script and wants `.luau` added;
+-- `README.md` is a file and already has its suffix.
+--
+-- The test is safe because classFor STRIPS script suffixes on the way in:
+-- nothing here is ever named `Main.luau`, so a dot that survived into a Name
+-- came from a file that was not a script in the first place.
+function Fs.carriesExtension(name: string): boolean
+	return name:find("%.[%w]+$") ~= nil and stripSuffix(name) == nil
+end
+
 -- What `ls` shows for an instance. Scripts get a `.luau` so a model reads them
--- as files; everything else is its own name.
+-- as files; everything else is its own name, and so is a script that arrived
+-- carrying one — `README.md.luau` would be a name nothing can open.
 function Fs.displayName(inst: Instance): string
-	return isScript(inst) and (inst.Name .. ".luau") or inst.Name
+	if isScript(inst) and not Fs.carriesExtension(inst.Name) then
+		return inst.Name .. ".luau"
+	end
+	return inst.Name
 end
 
 -- Does a name filter accept this instance? Every spelling a model might write:

@@ -102,19 +102,37 @@ function Git.setConfig(name: string, value: string): (boolean, string?)
 	return true
 end
 
--- `owner/repo` is how a repository is written everywhere else, so accept it as
--- one word rather than making two settings out of what is always copied as one.
--- Its own function because `git clone` takes the same word and this used to be a
--- pattern written inline, where a second caller would have become a second
--- pattern to keep right.
+-- `owner/repo` is how a repository is written everywhere else, so it is accepted
+-- as one word rather than made into two settings out of what is always copied as
+-- one — and every other spelling reduces to it here, so `git clone` and `git
+-- config remote` both get the reduction from one place. A URL is what is on the
+-- clipboard after visiting a repository; retyping it as a slug was a step that
+-- existed only because this refused to.
+--
+-- Only github.com is stripped, deliberately. Taking ANY host would turn
+-- `https://gitlab.com/a/b` into a clone of github.com/a/b: a wrong answer
+-- dressed as a working one. Left unmatched, the caller says what it accepts.
+--
+-- A /tree/<branch> or /blob/… URL does not match either, and that is the honest
+-- outcome: the branch in it would have to be silently dropped or silently
+-- obeyed, and `--branch` already spells it out loud.
+Git.SLUG_FORMS = "owner/repo, or a github.com URL"
+
 function Git.parseSlug(slug: string?): (string?, string?)
-	return tostring(slug or ""):match("^([%w%-%._]+)/([%w%-%._]+)$")
+	local text = tostring(slug or "")
+		:gsub("^%a[%w+.%-]*://", "")   -- https://
+		:gsub("^[^/:@]+@", "")         -- git@, in the scp-style form
+		:gsub("^www%.", "")
+		:gsub("^github%.com[:/]", "")
+		:gsub("%.git$", "")
+		:gsub("/+$", "")
+	return text:match("^([%w%-%._]+)/([%w%-%._]+)$")
 end
 
 function Git.setRemote(slug: string): (boolean, string?)
 	local owner, repo = Git.parseSlug(slug)
 	if not owner then
-		return false, string.format("expected owner/repo, got %q", slug)
+		return false, string.format("expected %s, got %q", Git.SLUG_FORMS, slug)
 	end
 	Git.setConfig("owner", owner)
 	Git.setConfig("repo", repo)
@@ -181,23 +199,38 @@ function Git.pathFor(inst: Instance): (string?, string?)
 	if inst.Name:find("/", 1, true) then
 		return nil, path .. ": the name contains \"/\", which is the path separator"
 	end
+	-- A name that already carries an extension keeps it: `README.md` came out of
+	-- a repository as a ModuleScript because .Source is the only place text lives
+	-- here, and appending .luau would commit it back under a name the repository
+	-- has never had. `Main` has no extension and gets the one its class implies.
+	if Fs.carriesExtension(inst.Name) then
+		return path, nil
+	end
 	return path .. suffix, nil
 end
 
 -- pathFor's inverse, for the one direction that reads a repository this place
--- did not write: which of a remote tree's paths can become an Instance at all.
+-- did not write: which of a remote tree's paths to bring across.
 --
--- A DataModel has nowhere to put a README, a .gitignore or a project.json, and
--- Fs.classFor answers ModuleScript for ANY unrecognised suffix, so an unfiltered
--- clone creates a ModuleScript named "README.md". The suffix check is what stops
--- that, and it is also what keeps the request count sane: one blob request per
--- file, against 60 an hour unauthenticated. Knit is 75 paths and 6 scripts.
-function Git.scriptPaths(remote: { [string]: string }): ({ string }, number)
+-- Everything CAN come across. Fs.classFor answers ModuleScript for any suffix it
+-- does not know, and .Source holds arbitrary text, so a README arrives as a
+-- ModuleScript named `README.md` that cat, grep, sed and head all read with no
+-- special case — and carriesExtension keeps the name honest on the way back out.
+--
+-- The default is still scripts only, and the reason is requests, not capability:
+-- one blob apiece against 60 an hour unauthenticated, and Knit is 61 files of
+-- which 6 are Luau. A default that spends ten times the budget to fetch a
+-- .gitignore is the wrong default; `-A` is there for when the rest is wanted.
+function Git.scriptPaths(remote: { [string]: string }, all: boolean?): ({ string }, number)
 	local kept: { string } = {}
 	local skipped = 0
+	-- -A still stops at a file with NO extension. `LICENSE` as an Instance name is
+	-- exactly what a script called LICENSE looks like, so nothing downstream can
+	-- tell the two apart and pathFor would commit it back as LICENSE.luau —
+	-- renaming a file the repository never renamed. Skipped and counted instead.
 	for path in pairs(remote) do
 		local leaf = path:match("[^/]+$") or path
-		if Fs.stripScriptSuffix(leaf) then
+		if Fs.stripScriptSuffix(leaf) or (all and Fs.carriesExtension(leaf)) then
 			kept[#kept + 1] = path
 		else
 			skipped += 1
@@ -767,10 +800,30 @@ function Git.selfTest(): (boolean, string?)
 	-- clone reads a slug, a foreign tree and Rojo's init convention, and all
 	-- three of those are pure. The slug pattern is shared with `git config
 	-- remote`, so one of these failing is both of them broken.
-	if Git.parseSlug("Sleitnick/Knit") ~= "Sleitnick" then
-		return false, "a plain owner/repo did not parse"
+	-- Every spelling that has to reduce to the same two words. The URL is what is
+	-- actually on the clipboard, so it is not a convenience: refusing it was a
+	-- retyping step with a typo in it waiting to happen.
+	for _, form in ipairs({
+		"Sleitnick/Knit", "https://github.com/Sleitnick/Knit",
+		"https://github.com/Sleitnick/Knit.git", "https://github.com/Sleitnick/Knit/",
+		"https://www.github.com/Sleitnick/Knit", "github.com/Sleitnick/Knit",
+		"git@github.com:Sleitnick/Knit.git",
+	}) do
+		local owner, repo = Git.parseSlug(form)
+		if owner ~= "Sleitnick" or repo ~= "Knit" then
+			return false, string.format("%q parsed as %s/%s", form, tostring(owner), tostring(repo))
+		end
 	end
-	for _, bad in ipairs({ "Knit", "a/b/c", "", "a b/c" }) do
+	for _, bad in ipairs({
+		"Knit", "a/b/c", "", "a b/c",
+		-- A host that is not GitHub must NOT reduce: this module speaks to
+		-- api.github.com and nothing else, so accepting it would clone a
+		-- different project of the same name and look like it worked.
+		"https://gitlab.com/Sleitnick/Knit",
+		-- Names a branch, which would have to be silently dropped or silently
+		-- obeyed; `--branch` says it out loud instead.
+		"https://github.com/Sleitnick/Knit/tree/main",
+	}) do
 		if Git.parseSlug(bad) then
 			return false, string.format("%q parsed as a slug", bad)
 		end
@@ -779,13 +832,28 @@ function Git.selfTest(): (boolean, string?)
 	-- Fs.classFor answers ModuleScript for every suffix it does not know, so the
 	-- filter has to be the suffix test itself. Without it a clone creates a
 	-- ModuleScript named README.md, and spends a request fetching it first.
-	local kept, notScripts = Git.scriptPaths({
+	local tree = {
 		["src/init.luau"] = "a", ["src/Knit.client.luau"] = "b",
 		["README.md"] = "c", ["default.project.json"] = "d", ["LICENSE"] = "e",
-	})
+	}
+	local kept, notScripts = Git.scriptPaths(tree)
 	if #kept ~= 2 or kept[1] ~= "src/Knit.client.luau" or notScripts ~= 3 then
 		return false, string.format("scriptPaths kept %d of the right 2 and skipped %d of 3",
 			#kept, notScripts)
+	end
+	-- -A takes the files too, as ModuleScripts holding their own text — but NOT
+	-- LICENSE. A name with no extension is indistinguishable from a script's, so
+	-- pathFor would commit it back as LICENSE.luau, renaming a file the
+	-- repository never renamed. The round trip is the property, not the count.
+	local everything, unnameable = Git.scriptPaths(tree, true)
+	if #everything ~= 4 or unnameable ~= 1 or everything[1] ~= "README.md" then
+		return false, string.format("scriptPaths -A kept %d of the right 4 and skipped %d of 1",
+			#everything, unnameable)
+	end
+	for _, path in ipairs(everything) do
+		if path == "LICENSE" then
+			return false, "an extensionless file was taken, and it cannot commit back"
+		end
 	end
 
 	-- An init file means the CONTAINER is the script, which is the difference
