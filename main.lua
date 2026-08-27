@@ -945,7 +945,37 @@ Agent.Initialize(term, function(busy: boolean)
 		Sessions.save()
 	end
 end, Sessions.save)
-Commands.Initialize(term, toggleSettings, toggleFind)
+
+-- Shell mode: the input row talks to the terminal instead of to Claude.
+--
+-- This is what a shell panel would have been, minus the panel. The console is
+-- already a scrollback, the input row is already a line editor, and `cmd` lines
+-- already render with a `$` in the accent colour, so a second window would have
+-- been a second copy of all three. What was actually missing is that every line
+-- needed a `/sh ` in front of it and there was nowhere to see the cwd.
+--
+-- The cwd lives in the PLACEHOLDER rather than in front of each echoed line: it
+-- is one place, always current, and it costs nothing per line of output.
+local shellMode = false
+local IDLE_PLACEHOLDER = inputBox.PlaceholderText
+
+-- Read fresh every time, because `cd` moves it and a cached prompt is a wrong
+-- one. One function rather than the string twice: entering the shell and running
+-- a line both need it, and the two would drift.
+local function shellPrompt(): string
+	return term:pwd() .. "  ( exit or /sh leaves · " .. #Terminal.COMMANDS .. " commands )"
+end
+
+local function setShellMode(on: boolean?)
+	shellMode = if on == nil then not shellMode else on
+	inputBox.PlaceholderText = if shellMode then shellPrompt() else IDLE_PLACEHOLDER
+	Console.appendLine(if shellMode
+		then "shell — every line goes to the terminal until `exit`"
+		else "shell closed", "system")
+	inputBox:CaptureFocus()
+end
+
+Commands.Initialize(term, toggleSettings, toggleFind, setShellMode)
 
 local function submit(text: string)
 	inputBox.Text = ""
@@ -954,6 +984,22 @@ local function submit(text: string)
 	-- live one back on screen before anything is appended to it. A no-op unless a
 	-- peek is up.
 	Sessions.endPeek()
+	-- Slash commands still work in the shell — /clear and /model are not things
+	-- to have to leave for — so this only claims the lines that are not one.
+	if shellMode and text:sub(1, 1) ~= "/" then
+		if text == "exit" then
+			setShellMode(false)
+			return
+		end
+		-- The `$` and the colour come from Console's `cmd` kind, which is what
+		-- Commands.handle already prints slash lines with.
+		Console.appendLine(text, "cmd")
+		Commands.runShell(text)
+		-- `cd` moves it, so the prompt is rebuilt rather than left as it was.
+		inputBox.PlaceholderText = shellPrompt()
+		inputBox:CaptureFocus()
+		return
+	end
 	if not Commands.handle(text) then
 		Agent.send(text, Provider.auth.isLoggedIn)
 	end
@@ -1011,8 +1057,14 @@ inputBox.FocusLost:Connect(function(enterPressed: boolean, cause: InputObject?)
 		inputBox:CaptureFocus()
 		-- After CaptureFocus, not before: focusing moves the caret itself.
 		task.defer(function() inputBox.CursorPosition = index + 1 end)
-	elseif Agent.isBusy() then
+	elseif Agent.isBusy() and not shellMode then
 		-- The draft stays put and nothing is sent; typing carries on.
+		--
+		-- Shell mode is exempt: the line goes to the terminal and never near the
+		-- turn that is streaming, and being able to `ls` while it works is most of
+		-- the reason to be in the shell at all. Nothing reaches Claude from here
+		-- either way — submit routes every non-slash line to the terminal while
+		-- the mode is on, and a slash line was never Claude's to begin with.
 		inputBox:CaptureFocus()
 	else
 		-- Same space, at the end this time.

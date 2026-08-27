@@ -12,12 +12,19 @@
 -- exactly what Rojo does. "In-memory" does. A model that wants to know what the
 -- objects are gets it from `ls /`, pulled, not pushed.
 --
+-- "with network" is there to undo what that same clause costs. "Real bash shell"
+-- implies no sandbox; "in-memory vfs" implies one, and that reading takes curl,
+-- wget and git off the table before any of them is tried. The failure is silent —
+-- a model that has concluded there is no network never calls one and never sees
+-- a refusal — so it is the one capability worth stating rather than leaving to
+-- `help`, which only answers a question that gets asked.
+--
 -- Everything else that would go here lives in an error message instead, where it
 -- costs nothing until a call actually needs it. `help` covers what used to be
 -- "and more": the command list is derived, so it cannot go stale here.
 return {
 	name = "bash",
-	description = "real bash shell over a live in-memory vfs",
+	description = "real bash shell over a live in-memory vfs, with network",
 	input_schema = {
 		type = "object",
 		properties = { command = { type = "string" } },

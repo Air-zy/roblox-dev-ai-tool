@@ -118,7 +118,7 @@ main.lua                        window, toolbar, popups, usage panel
 | `ui/Console.lua` | 1355 | Bubbles, thinking drawers, tool-call blocks, the detached sink. |
 | `text/Regex.lua` | 957 | BRE/ERE engine. Requires nothing. |
 | `vendor/LuauParser.lua` | 7718 | VENDORED, do not edit. Luau's own Parser.cpp ported to Luau. Two patched require lines, see the header. `LuauSyntax` 1043 and `LuauConfusables` 1790 sit beside it. |
-| `main.lua` | 1116 | Widget, toolbar, popups. Owns `plugin`, hands it to Provider / Sessions / Settings / Git — the only five that touch it. |
+| `main.lua` | 1168 | Widget, toolbar, popups, shell mode on the input row. Owns `plugin`, hands it to Provider / Sessions / Settings / Git — the only five that touch it. |
 | `fs/Terminal.lua` | 829 | Commands as tree operations. No parsing. |
 | `fs/Fs.lua` | 843 | Paths, `.Source`, undo, mtime, globs, mode bits. |
 | `agent/providers/OpenRouter.lua` | 842 | chat/completions, and the translation both ways. |
@@ -136,9 +136,9 @@ main.lua                        window, toolbar, popups, usage panel
 | `ui/Find.lua` | 423 | Conversation search + the find panel. |
 | `ui/Markdown.lua` | 346 | Markdown to labels. |
 | `text/Sed.lua` | 329 | sed engine. Pure text. |
-| `main/Commands.lua` | 256 | Slash commands. |
+| `main/Commands.lua` | 279 | Slash commands, and `runShell`, shared by `/sh` and shell mode. |
 | `studio/Props.lua` | 200 | API dump. The only network I/O in fs. |
-| `git/Git.lua` | 650 | Object ids, the path mapping, the index, the tree payload. No I/O — the requests live in Shell beside curl's. |
+| `git/Git.lua` | 818 | Object ids, the path mapping, the index, the tree payload, the remote-tree filters clone reads. No I/O — the requests live in Shell beside curl's. |
 | `util/Sha256.lua` | 181 | For PKCE. |
 | `agent/Tools.lua` | 118 | Registry + dispatch. |
 | `ui/Theme.lua` | 99 | Colours and `make`. |
@@ -151,12 +151,12 @@ main.lua                        window, toolbar, popups, usage panel
 |---:|---|
 | 1-67 | header, requires, aliases |
 | 68-979 | parsing: `tokenize:94`, `partition:238`, `extractHeredoc:415`, `takeRedirect:475`, `SPECS:588` |
-| 980-4459 | HANDLERS — 38 commands + private helpers |
-| 4460-4865 | `HANDLERS.git:4460` — config/add/reset/commit/log/pull/status/diff, and the GitHub calls |
-| 4866-4927 | `Shell.COMMANDS:4866` |
-| 4928-5467 | pipelines, statements, loops, `$(...)`: `runCommand:4928` |
-| 5468-5519 | `Shell.run:5468` -> `runLine` |
-| 5520-end | `Shell.selfTest:5520` |
+| 980-4415 | HANDLERS — 38 commands + private helpers |
+| 4416-5218 | the GitHub calls, `materialize:4520` (pull and clone share it), and `HANDLERS.git:4596` — add/clone/commit/config/diff/log/pull/reset/show/status |
+| 5219-5252 | `Shell.COMMANDS:5226` |
+| 5253-5765 | pipelines, statements, loops, `$(...)`: `runCommand:5253` |
+| 5766-5817 | `Shell.run:5766` -> `runLine` |
+| 5818-end | `Shell.selfTest:5818` |
 
 `tokenize`/`partition` and the diff core are pure text and are the next
 extractions; `HANDLERS` is not (below).

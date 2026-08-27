@@ -24,15 +24,32 @@ local Commands = {}
 local term: any = nil
 local openSettings: ((boolean?) -> ())? = nil
 local openFind: ((boolean?, string?) -> ())? = nil
+local toggleShell: ((boolean?) -> ())? = nil
 
 function Commands.Initialize(
 	terminal: any,
 	settingsToggle: ((boolean?) -> ())?,
-	findToggle: ((boolean?, string?) -> ())?
+	findToggle: ((boolean?, string?) -> ())?,
+	shellToggle: ((boolean?) -> ())?
 )
 	term = terminal
 	openSettings = settingsToggle
 	openFind = findToggle
+	toggleShell = shellToggle
+end
+
+-- One line through the shell, with its output appended. Shared by `/sh <cmd>`
+-- and by shell mode, which are the same act with and without a prefix — two
+-- copies is how the one that prints blank lines comes to differ from the one
+-- that does not.
+--
+-- The ECHO is deliberately not here. Commands.handle already prints the slash
+-- line it was given, and shell mode prints its own; doing it in both places is
+-- how `/sh ls` came to show up twice.
+function Commands.runShell(line: string)
+	for out in term:shell(line):gmatch("[^\n]+") do
+		Console.appendLine(out, "info")
+	end
 end
 
 -- Handlers
@@ -185,23 +202,29 @@ handlers["/clear"] = function()
 	Sessions.clear()
 end
 
--- Read-only passthrough to the terminal Claude uses. The whole line goes through
--- Terminal:shell, so quoting, flags, globs and `;` all behave exactly as they do
--- for Claude, there is no second parser here to drift from the first.
+-- The same terminal Claude uses, and now the same powers. The whole line goes
+-- through Terminal:shell, so quoting, flags, globs and `;` all behave exactly as
+-- they do for Claude, there is no second parser here to drift from the first.
 --
--- The read-only check lives in Terminal, next to the handler table that knows
--- which commands mutate, and it is applied per command rather than per line, so
--- `pwd; rm /Workspace` cannot smuggle a write past it. Keeping writes out means
--- every mutation still arrives through Claude with an undo recording.
+-- It was read-only until it was not. The reason given was that a mutation should
+-- arrive through Claude carrying an undo recording, and withUndo turned out to
+-- live in the handlers rather than on Claude's path, so a write from here was
+-- always recorded the same. What was left was that changes stayed in the
+-- transcript — worth something, but not worth the owner of the place having less
+-- reach over it than the agent working on it, when Explorer already hands them a
+-- Delete key with no transcript at all.
 handlers["/sh"] = function(_, raw)
 	local rest = raw:match("^/sh%s+(.+)$")
+	-- Bare `/sh` used to be a usage error. It stays in the shell instead: every
+	-- line typed after it goes to the terminal until `exit`, which is the whole
+	-- of what a shell panel would have been. No second text box, no second
+	-- scrollback, no second history — the input row and the console already are
+	-- both of those, and a plugin widget delivers no arrow keys to build a third.
 	if not rest then
-		Console.appendLine("Usage: /sh <command>   e.g. /sh ls /Workspace", "error")
+		if toggleShell then toggleShell() end
 		return
 	end
-	for line in term:shell(rest, true):gmatch("[^\n]+") do
-		Console.appendLine(line, "info")
-	end
+	Commands.runShell(rest)
 end
 
 handlers["/settings"] = function()
@@ -226,7 +249,7 @@ Commands.SLASH_COMMANDS = {
 	{ cmd = "/model",    desc = "Switch model" },
 	{ cmd = "/provider", desc = "Switch between Claude and OpenRouter" },
 	{ cmd = "/settings", desc = "Open the settings panel" },
-	{ cmd = "/sh",       desc = "Run a read-only terminal command" },
+	{ cmd = "/sh",       desc = "Run a terminal command, or bare to stay in the shell" },
 	{ cmd = "/find",     desc = "Search this chat, thinking included" },
 	{ cmd = "/clear",    desc = "Clear output + conversation" },
 	{ cmd = "/help",     desc = "Show all commands" },

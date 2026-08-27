@@ -100,6 +100,22 @@ edit and multiedit swap unique substrings, write replaces a whole .Source
 and loads free models. run is off by default since it runs at plugin permission
 level with no timeout.
 
+`/sh <command>` runs that same shell yourself, through the same Terminal the
+agent holds, so `cd` in one moves the other. Bare `/sh` stays there: every line
+typed after it goes to the terminal until `exit`, with the cwd on the input row
+and `$` in front of what you ran. That is a shell panel without the panel — the
+console is already the scrollback and the input row is already the line editor,
+so a second window would have been a second copy of both, and a plugin widget
+delivers no arrow keys to hang a history off anyway. Slash commands still work
+inside it, and a shell line is not blocked while a turn is streaming, since it
+never goes near the turn. It used to refuse anything that
+writes, on the reasoning that a mutation should arrive through Claude carrying
+an undo recording — but the recording lives in the handlers, not on Claude's
+path, so a write from either side was always recorded the same. What the
+restriction actually bought was that every change stayed in the transcript,
+which is not worth the owner of a place having less reach over it than the agent
+working on it. Explorer already hands you a Delete key with no transcript at all.
+
 run takes code, or a path to a script holding it. The path form exists so a
 probe can be written once and iterated with edit instead of resent whole; the
 source is inlined where code would go, so the file's own print is captured and
@@ -163,6 +179,29 @@ it costs no request. Refused is the half of wget that is wget: -r -m -p walk lin
 to rebuild a tree, and a DataModel is not a tree to rebuild into. Everything about
 the request itself is the same code curl runs, so the two cannot drift on what a
 404 means or which hosts are refused.
+
+git speaks to GitHub's API rather than git's wire protocol, which is why a commit
+is three requests and needs neither zlib nor a packfile: the object model is
+already JSON, and the engine hashes SHA-1 natively, so the ids are real git ids
+and get checked against the ones the host reports. `git config remote owner/repo`
+and a fine-grained token with Contents access is the whole setup. status and diff
+compare the place against the remote by blob id, add/reset keep an index of paths,
+commit builds the tree and moves the branch, and pull writes files back in —
+refusing to overwrite an uncommitted change unless -f says so, and never deleting
+anything. `git status` shows the index as its own section and `git diff --staged`
+renders it, since the index is what commit sends and it is the one thing worth
+reading before making one. `git log` takes a path to narrow it to the commits that
+touched one file, and `git show <sha> [path]` prints a commit with the host's own
+rendering of its patch — the only read here that does no diffing, because GitHub
+returns the hunks already in unified format. There is no clone of a whole history
+and no local objects, so checkout and rebase have nothing to work with and say so.
+
+`git clone owner/repo [dest]` is the other direction: someone else's repository
+read into this place. Only the scripts come across — a DataModel has nowhere to
+put a README — and `--branch` takes a branch or a tag, defaulting to whatever the
+repository's HEAD is. Rojo's init convention is honoured, so `src/init.luau`
+makes src itself the ModuleScript and a cloned library is one you can require.
+That, and curl, are why there is no unzip here.
 
 Paths are what you would expect. / is game, . and .. do the usual, service names
 at the root ignore case but everything below it does not. Scripts are listed

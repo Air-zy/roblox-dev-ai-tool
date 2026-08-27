@@ -776,9 +776,7 @@ end
 -- reading it in the order the code runs is easier than reading it alphabetically.
 local Shell = require(script.Parent:WaitForChild("Shell"))
 
--- Run a `bash` line. `readOnly` is for /sh, where the human types the line
--- directly and mutations should stay Claude's, every write it makes carries an
--- undo recording.
+-- Run a `bash` line.
 -- run and catalog live in studio/, no shell command reaches either, so they
 -- were sharing a file with code they have nothing to do with. Terminal keeps
 -- the method names so tools/ and the self-test are unchanged.
@@ -799,8 +797,8 @@ function Terminal:catalogLoad(assetId: number?, parentPath: string?): (string?, 
 	return Catalog.load(self, assetId, parentPath)
 end
 
-function Terminal:shell(line: string?, readOnly: boolean?): string
-	return Shell.run(self, line, readOnly)
+function Terminal:shell(line: string?): string
+	return Shell.run(self, line)
 end
 
 -- Exported so /help can print the real command set instead of a hand-written

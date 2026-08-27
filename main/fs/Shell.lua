@@ -511,16 +511,33 @@ local UNSUPPORTED: { [string]: string } = {
 	ps = "no processes; `ls /Workspace` or the run tool is what you want",
 	kill = "no processes",
 	man = "no man pages; `help` lists the commands and `help NAME` gives one's flags",
+	-- Reached from two directions and neither of them wants the full command
+	-- list: a model typing it has finished and thinks it has to close something,
+	-- and a person typing it has left shell mode already or is not in it. Named
+	-- so both get one line instead of thirty-five.
+	exit = "nothing to exit — there is no session here; `exit` on its own line " ..
+		"leaves the widget's shell mode, and a tool call simply ends when it returns",
+	quit = "nothing to quit; see `exit`",
 	-- Generates completions, and nothing here completes: no terminal, no tab. Its
 	-- one useful action, "what commands exist", is what `help` answers. Named
 	-- rather than left to "unknown command" because a model reaching for it wants
 	-- that list and would otherwise get it by accident, from a failure.
 	compgen = "no completion here; `help` lists the commands and `help NAME` gives one's flags",
 	-- Named with their replacements, because both are reached for as the fallback
-	-- after something else was missing, and "use the run tool" is the answer that
-	-- sends a read-only session into a write-capable one. curl and wget were on
-	-- this list for exactly that reason until they became commands.
+	-- after something else was missing, and the answer nobody wants there is "use
+	-- the run tool", which executes arbitrary Luau at plugin permission to do what
+	-- a pipe already does. curl and wget were on this list for the same reason
+	-- until they became commands.
 	awk = "no awk; `sed -n '10,40p'` prints a line range and `grep -A/-B/-C` gives context",
+	-- Named with the redirect for the same reason curl and wget were, back when
+	-- they were only on this list: an archive is reached for as the way to get a
+	-- library in, and there is a direct one. Deflate is not written here — a
+	-- DataModel holds Instances, not files, so an unpacked archive would still
+	-- have nowhere to land except the scripts inside it, which is what clone
+	-- fetches on its own.
+	unzip = "no archives here; `git clone <owner>/<repo> [dest]` reads a repository's " ..
+		"scripts straight into the place, which is what a release zip was going to be for",
+	tar = "no archives here; see `unzip`",
 	xargs = "no xargs; `for f in $(grep -rl Foo); do ... $f; done` runs a command " ..
 		"per item, and a filter can be piped straight into grep/head/tail/wc/sort/uniq/sed/tr",
 	-- A loop is claimed as a whole pipeline stage, so `for` never reaches here as
@@ -711,15 +728,19 @@ local SPECS: { [string]: FlagSpec } = {
 			["--with-filename"] = "bool:-H" },
 		why = { ["-z"] = NO_NUL, ["-Z"] = NO_NUL },
 	},
-	-- Only what `git diff` reads, since it is the one subcommand here that takes
-	-- flags at all. Subcommands arrive as OPERANDS, so `status` and `config` need
-	-- nothing declared. -b/-i/-w reach diffKey and -U reaches unified, the same
-	-- four `diff` itself honours, because the same two functions render both.
+	-- Subcommands arrive as OPERANDS, so `status` and `config` need nothing
+	-- declared. -b/-i/-w reach diffKey and -U reaches unified, the same four
+	-- `diff` itself honours, because the same two functions render both.
+	--
+	-- --branch has no short form here, and that is deliberate rather than an
+	-- omission: git spells it -b, and -b is already --ignore-space-change above.
+	-- Moving it would leave `git diff -b` parsing as a flag that wants a value.
 	git = {
 		bool = "biwAf", value = "Umn",
 		long = { ["--unified"] = "value:-U", ["--ignore-case"] = "bool:-i",
 			["--ignore-all-space"] = "bool:-w", ["--ignore-space-change"] = "bool:-b",
-			["--all"] = "bool:-A", ["--message"] = "value:-m", ["--force"] = "bool:-f" },
+			["--all"] = "bool:-A", ["--message"] = "value:-m", ["--force"] = "bool:-f",
+			["--branch"] = "value", ["--staged"] = "bool", ["--cached"] = "bool" },
 	},
 	-- No flags, which is a real answer: bash's three all ask for prose this help
 	-- does not carry, so each is refused by name rather than silently accepted
@@ -2232,8 +2253,7 @@ end
 -- the same way for the same reason.
 --
 -- The bare `command NAME args` form never reaches here: runCommand strips the
--- prefix, so the command that runs is the real one, with its own spec and its
--- own read-only status.
+-- prefix, so the command that runs is the real one, with its own spec.
 HANDLERS.command = function(_, argv)
 	local flags, _, operands = parse(argv)
 	local name = operands[1]
@@ -4378,12 +4398,37 @@ end
 -- over SHA-1 natively, so the ids are still real git ids and can be checked
 -- against the ones the host reports.
 --
--- Only the READ half lives here so far — config, status, diff. They need no
--- write token, which means they can be run against any public repository, and
--- they are what proves the id comparison end to end before anything is pushed.
+-- The reads need no write token, which means they run against any public
+-- repository, and they are what proves the id comparison end to end before
+-- anything is pushed. commit is the other half and needs one.
 --
 -- Subcommands are OPERANDS, not flags, so SPECS.git declares only the flags the
 -- subcommands themselves take. Placed after httpRequest because it needs it.
+--
+-- Every subcommand this handler answers, written once. The two messages that
+-- name them had both gone stale in the same direction — they still advertised
+-- config/status/diff long after add, commit, log, pull and reset landed, which
+-- is a model reading "this cannot commit" off a string and never trying. See
+-- Shell.COMMANDS, derived one level up for exactly this reason; a table-driven
+-- dispatch would derive this too, but every branch below closes over flags,
+-- values, operands and remoteConfig, so it is a rewrite to fix a list. The
+-- self-test walks these instead and fails on any name with no branch behind it.
+local GIT_SUBS = { "add", "clone", "commit", "config", "diff", "log", "pull", "reset",
+	"show", "status" }
+local GIT_SUB_LIST = table.concat(GIT_SUBS, " ")
+-- One response header, whatever case the engine handed it back in. RequestAsync
+-- does not document whether it normalises them, and a check that matches only
+-- `x-ratelimit-remaining` would silently never fire against a host that spells
+-- it `X-RateLimit-Remaining`, which is exactly how GitHub spells it.
+local function headerValue(response: any, wanted: string): string?
+	for name, value in pairs(response.Headers or {}) do
+		if name:lower() == wanted then
+			return tostring(value)
+		end
+	end
+	return nil
+end
+
 local function githubCall(url: string, method: string, body: string?): (any?, string?, number?)
 	local response, err = httpRequest({
 		url = url, method = method, headers = Git.headers(), body = body, timeoutFlag = "-m",
@@ -4397,6 +4442,19 @@ local function githubCall(url: string, method: string, body: string?): (any?, st
 	if code == 404 then
 		return nil, "not found — check the owner, repo and branch, or whether the " ..
 			"token can see a private repository", code
+	elseif (code == 403 or code == 429) and headerValue(response, "x-ratelimit-remaining") == "0" then
+		-- A spent rate limit arrives as a 403 — lately also a 429 — shaped exactly
+		-- like a rejected token, so without this the answer is "your token is
+		-- wrong" to somebody whose token is fine. Clone is what makes it the
+		-- likely failure rather than a curiosity: one request per file, against
+		-- sixty an hour with no token at all.
+		local reset = tonumber(headerValue(response, "x-ratelimit-reset") or "")
+		local minutes = reset and math.max(1, math.ceil((reset - os.time()) / 60))
+		return nil, string.format("GitHub's rate limit is spent%s — %s",
+			minutes and string.format(", resets in ~%d min", minutes) or "",
+			Git.token() == ""
+				and "that is 60 requests an hour without one; `git config token <pat>` raises it to 5000"
+				or "there is a ceiling with a token too, and this window is done"), code
 	elseif code == 401 or code == 403 then
 		return nil, Git.token() == ""
 			and "unauthorized, and no token is set — `git config token <pat>` for a private repo"
@@ -4457,11 +4515,96 @@ local function remoteBlob(cfg: any, sha: string): (string?, string?)
 	return text, nil
 end
 
+-- Fetched files into the DataModel: containers first, then sources, all inside
+-- one undo recording. Shared by pull and clone, which differ in WHICH paths they
+-- hand over and not at all in what happens to them here — a second copy of this
+-- is a second place for the service guard or the undo wrapper to be quietly
+-- wrong in one direction and right in the other.
+--
+-- Paths are root-relative with no leading slash, the shape remoteTree returns.
+-- Clone prefixes its destination onto them before calling, so the walk below is
+-- the same walk either way.
+local function materialize(self: any, files: { { path: string, source: string } },
+	label: string): (number, { string }, string?)
+	local written = 0
+	local failures: { string } = {}
+	-- Which containers are themselves a script, from the init files in the batch.
+	-- Consumed as the walk reaches them, so an init file is never also written as
+	-- a child under the container it became — whichever order the two arrive in.
+	local initFor = Git.initContainers(files)
+	local consumed: { [string]: boolean } = {}
+	local _, undoErr = withUndo(label, function()
+		for _, item in ipairs(files) do
+			-- Containers first. The leading segment is a service and already
+			-- exists; anything else missing at the top would mean inventing a
+			-- container directly under the DataModel root, which this refuses
+			-- rather than quietly polluting the place.
+			local segments: { string } = {}
+			for segment in item.path:gmatch("[^/]+") do
+				segments[#segments + 1] = segment
+			end
+			local walked = ""
+			local blocked: string? = nil
+			for index = 1, #segments - 1 do
+				local parentPath = walked == "" and "/" or walked
+				walked ..= "/" .. segments[index]
+				local init = initFor[walked]
+				if not self:resolve(walked) then
+					if index == 1 then
+						blocked = walked .. " is not a service in this place"
+						break
+					end
+					-- Born the right class rather than made a Folder and converted:
+					-- a ClassName cannot be changed, and reparenting a subtree into
+					-- a replacement is a bigger operation than this is worth.
+					local _, createErr = self:create(init and init.class or "Folder",
+						segments[index], parentPath)
+					if createErr then
+						blocked = createErr
+						break
+					end
+				end
+				-- Just created or already there, the source goes into the container
+				-- itself. A container that is NOT a script is the one shape this
+				-- cannot fix, and writing the init file as an ordinary child there
+				-- would leave a module nothing can require and say nothing about it.
+				if init and not consumed[init.path] then
+					consumed[init.path] = true
+					local target = self:resolve(walked)
+					if target and isScript(target) then
+						local _, initErr = self:write(walked, init.source)
+						if initErr then
+							failures[#failures + 1] = init.path .. ": " .. tostring(initErr)
+						else
+							written += 1
+						end
+					else
+						failures[#failures + 1] = string.format("%s: %s is not a script here, " ..
+							"and an init file means the container IS the script — remove or " ..
+							"rename it and run this again", init.path, walked)
+					end
+				end
+			end
+			if blocked then
+				failures[#failures + 1] = item.path .. ": " .. blocked
+			elseif not consumed[item.path] then
+				local _, writeErr = self:write("/" .. item.path, item.source)
+				if writeErr then
+					failures[#failures + 1] = item.path .. ": " .. tostring(writeErr)
+				else
+					written += 1
+				end
+			end
+		end
+	end)
+	return written, failures, undoErr
+end
+
 HANDLERS.git = function(self, argv)
 	local flags, values, operands = parse(argv)
 	local sub = operands[1]
 	if not sub or sub == "" then
-		return fail("git", "needs a subcommand — `config`, `status` or `diff`")
+		return fail("git", "needs a subcommand — " .. GIT_SUB_LIST)
 	end
 	local usable, why = Git.available()
 	if not usable then
@@ -4508,6 +4651,100 @@ HANDLERS.git = function(self, argv)
 		return string.format("%s  %s", name, name == "token" and "(set)" or value)
 	end
 
+	-- clone: a repository this place did not write, read into it.
+	--
+	-- The one subcommand that reads a repo other than the configured one, which
+	-- is why it builds its own cfg instead of going through remoteConfig — and
+	-- why it leaves the configured remote ALONE. Real git sets a remote up on
+	-- clone; here that setting is the place's own push target, and repointing it
+	-- because somebody read a library is how the next commit lands in the wrong
+	-- repository.
+	--
+	-- A configured token still rides along in Git.headers. That is the host that
+	-- issued it, so nothing reaches anywhere new, and it is what makes a private
+	-- repository and the 5000/hr limit work.
+	if sub == "clone" then
+		local owner, repo = Git.parseSlug(operands[2])
+		if not owner or not repo then
+			return fail("git", string.format("`git clone <owner>/<repo> [dest]` — got %q",
+				tostring(operands[2] or "")))
+		end
+		-- HEAD is a ref the trees API resolves to the default branch, so nothing
+		-- has to guess between main and master, and the same slot takes a tag, so
+		-- --branch pins a version. Long form only: -b is already `git diff
+		-- --ignore-space-change` in SPECS, and taking it would break that silently.
+		local ref = valueOf(values, "--branch") or "HEAD"
+		local cfg = { owner = owner, repo = repo, branch = ref }
+		-- git's own default is the repository's name, under the cwd.
+		local dest = operands[3] or repo
+		local existing = self:resolve(dest)
+		local occupied = existing and #existing:GetChildren() or 0
+		if occupied > 0 and not flags["-f"] then
+			return fail("git", string.format("%s already has %d child%s — `git clone -f` " ..
+				"writes into it anyway", instancePath(existing :: Instance), occupied,
+				occupied == 1 and "" or "ren"))
+		end
+
+		local remote, remoteErr = remoteTree(cfg)
+		if not remote then
+			return fail("git", remoteErr)
+		end
+		local paths, notScripts = Git.scriptPaths(remote)
+		if #paths == 0 then
+			return fail("git", string.format("nothing to clone from %s/%s@%s — %d file%s and " ..
+				"not a script among them, and a DataModel has nowhere to put the rest",
+				owner, repo, ref, notScripts, notScripts == 1 and "" or "s"))
+		end
+		-- One blob request per file, against 60 an hour unauthenticated. A
+		-- repository this size is a place rather than a library, and pull is
+		-- already the way to take a whole one on — this is a redirect, not a wall.
+		if #paths > MAX_LIST then
+			return fail("git", string.format("%s/%s has %d scripts and each one is its own " ..
+				"request. That is a place, not a library: `git config remote %s/%s` then " ..
+				"`git pull` is how a whole repository comes across",
+				owner, repo, #paths, owner, repo))
+		end
+
+		-- An existing destination is normalised through the DataModel, which is
+		-- what turns `.`, `..` and a case-folded service name into the one path
+		-- the walk can build on. One that does not exist yet has no such answer
+		-- and is taken as written.
+		local base = existing and instancePath(existing)
+			or (dest:sub(1, 1) == "/" and dest or (self:pwd() .. "/" .. dest))
+		base = base:gsub("//+", "/"):gsub("^/", ""):gsub("/$", "")
+		local prefix = base == "" and "" or (base .. "/")
+
+		-- Fetched before anything is written, for the reason pull does it: a
+		-- yield inside an open undo recording, and a half-applied clone that
+		-- cannot be taken back in one step.
+		local fetched: { { path: string, source: string } } = {}
+		for _, path in ipairs(paths) do
+			local text, blobErr = remoteBlob(cfg, remote[path])
+			if not text then
+				return fail("git", string.format("%s: %s (nothing has been written)",
+					path, tostring(blobErr)))
+			end
+			fetched[#fetched + 1] = { path = prefix .. path, source = text }
+		end
+
+		local written, failures, undoErr = materialize(self, fetched, "agent: git clone " .. repo)
+		if undoErr then
+			return fail("git", undoErr)
+		end
+		local out: { string } = {
+			string.format("Cloned %s/%s@%s into /%s — %d file%s",
+				owner, repo, ref, base, written, written == 1 and "" or "s"),
+		}
+		if notScripts > 0 then
+			out[#out + 1] = string.format("%d non-script file%s skipped — nothing in a " ..
+				"DataModel holds one", notScripts, notScripts == 1 and "" or "s")
+		end
+		for _, note in ipairs(failures) do
+			out[#out + 1] = "failed: " .. note
+		end
+		return table.concat(out, "\n")
+	end
+
 	-- Staging records PATHS, never content: `git commit` reads each one's source
 	-- at the moment it commits, which is what keeps the index a list of strings
 	-- instead of the object database this design does without.
@@ -4529,11 +4766,22 @@ HANDLERS.git = function(self, argv)
 		if #named > 0 then
 			-- Validated against the working tree, which needs no request: a typo
 			-- staged silently would surface three steps later as a missing file.
+			--
+			-- Which is also why a DELETION cannot be named here, only staged with
+			-- -A. A path that is not in the working tree is either a file someone
+			-- removed or a name someone mistyped, and this end cannot tell the two
+			-- apart without asking the remote. Guessing "deletion" is the
+			-- expensive way to be wrong: treePayload turns a staged-but-absent
+			-- path into `"sha": null`, and the commit deletes it on the remote.
+			-- The old wording sent the reader to `git status`, which lists
+			-- deletions this then refused.
 			local working = Git.walk(game)
 			for _, path in ipairs(named) do
 				if not working[path] then
-					return fail("git", string.format("%q is not a script here — " ..
-						"`git status` lists what can be staged", path))
+					return fail("git", string.format("%q is not a script here, so naming it " ..
+						"cannot stage it — a named path is checked against what IS here, " ..
+						"which is what stops a typo from committing a deletion. " ..
+						"`git add -A` stages the real ones", path))
 				end
 			end
 			Git.stage(named)
@@ -4673,7 +4921,13 @@ HANDLERS.git = function(self, argv)
 			return fail("git", configErr)
 		end
 		local count = numberOf(values, "-n") or 20
-		local data, logErr = githubJson(Git.logUrl(cfg, math.min(count, MAX_LIST)))
+		-- A path narrows the log to the commits that touched it, which is the
+		-- question the whole log cannot answer: when did THIS change. Encoded
+		-- here, where HttpService already lives, because an instance name may
+		-- carry a space and the query would end at it.
+		local only = operands[2]
+		local data, logErr = githubJson(Git.logUrl(cfg, math.min(count, MAX_LIST),
+			only and HttpService:UrlEncode(only) or nil))
 		if not data then
 			return fail("git", logErr)
 		end
@@ -4688,7 +4942,135 @@ HANDLERS.git = function(self, argv)
 				tostring(entry.sha):sub(1, 7), tostring(author.date or ""):sub(1, 10),
 				tostring(author.name or "?"), subject)
 		end
-		return #out > 0 and table.concat(out, "\n") or "no commits"
+		-- A path nothing has touched comes back as an empty list rather than a 404,
+		-- so the empty answer has to name what was asked or it reads as "this
+		-- repository has no commits".
+		if #out == 0 then
+			return only and ("no commits touch " .. only) or "no commits"
+		end
+		return table.concat(out, "\n")
+	end
+
+	-- show: one commit, with the host's own rendering of its patch. The only
+	-- read here that does no diffing — GitHub returns each file's hunks already
+	-- in unified format, so this is one request where `git diff` is one blob per
+	-- file plus the comparison.
+	if sub == "show" then
+		local sha = operands[2]
+		if not sha or sha == "" then
+			return fail("git", "`git show <sha> [path]` — `git log` lists the shas, and " ..
+				"the short form it prints is enough")
+		end
+		local cfg, configErr = remoteConfig()
+		if not cfg then
+			return fail("git", configErr)
+		end
+		local data, showErr = githubJson(Git.commitUrl(cfg, HttpService:UrlEncode(sha)))
+		if not data then
+			return fail("git", showErr)
+		end
+		local commit = data.commit or {}
+		local author = commit.author or {}
+		local out: { string } = {
+			"commit " .. tostring(data.sha),
+			string.format("Author: %s <%s>", tostring(author.name or "?"),
+				tostring(author.email or "")),
+			"Date:   " .. tostring(author.date or ""),
+			"",
+		}
+		-- Indented four, which is how git renders a message and what keeps a body
+		-- line starting with `-` from reading as a diff line further down.
+		for _, line in ipairs(splitLines(tostring(commit.message or ""))) do
+			out[#out + 1] = "    " .. line
+		end
+		local stats = data.stats or {}
+		out[#out + 1] = ""
+		out[#out + 1] = string.format("%d file%s changed, +%d -%d", #(data.files or {}),
+			#(data.files or {}) == 1 and "" or "s", tonumber(stats.additions) or 0,
+			tonumber(stats.deletions) or 0)
+		out[#out + 1] = ""
+
+		local files = data.files or {}
+		-- A named file, git's `git show <sha> -- <path>` without the separator no
+		-- shell here needs. It is also what makes the budget below a redirect
+		-- rather than a wall.
+		local only = operands[3]
+		if only then
+			local matched: { any } = {}
+			for _, file in ipairs(files) do
+				if tostring(file.filename) == only
+					or tostring(file.previous_filename or "") == only then
+					matched[#matched + 1] = file
+				end
+			end
+			if #matched == 0 then
+				local names: { string } = {}
+				for index, file in ipairs(files) do
+					if index > 20 then
+						names[#names + 1] = string.format("… %d more", #files - 20)
+						break
+					end
+					names[#names + 1] = tostring(file.filename)
+				end
+				return fail("git", string.format("%s does not touch %q — it touches %s",
+					tostring(data.sha):sub(1, 7), only, table.concat(names, " ")))
+			end
+			files = matched
+		end
+		-- The headers cost one line each and are what the path form needs, so they
+		-- are always printed; the PATCHES spend a budget. This is the one read
+		-- here that is otherwise unbounded — twenty files at five hundred lines is
+		-- ten thousand into a context window, which is the cost MAX_CAT_LINES
+		-- exists to stop one file from spending.
+		--
+		-- ponytail: 400 lines, sitting near `cat`'s own 1000 for a single file
+		-- while covering several. Raise it if `git show <sha> <path>` turns out to
+		-- be the common call rather than the escape hatch.
+		local budget = 400
+		local spent = 0
+		-- The `a/`, `b/` and /dev/null spellings are `git diff`'s own, three
+		-- branches up, so the two commands render a change the same way even
+		-- though only one of them computed it.
+		for index, file in ipairs(files) do
+			if index > 20 then
+				out[#out + 1] = string.format("… %d more files in this commit", #files - 20)
+				break
+			end
+			local name = tostring(file.filename)
+			local was = tostring(file.previous_filename or name)
+			local status = tostring(file.status)
+			out[#out + 1] = string.format("diff --git a/%s b/%s", was, name)
+			out[#out + 1] = "--- " .. (status == "added" and "/dev/null" or ("a/" .. was))
+			out[#out + 1] = "+++ " .. (status == "removed" and "/dev/null" or ("b/" .. name))
+			-- The host omits the patch for a file it will not render — a binary, or
+			-- one simply too large. A header with nothing under it would read as an
+			-- empty diff, which is the opposite of what happened.
+			if not file.patch then
+				out[#out + 1] = string.format("  (%s, +%d -%d; the host renders no patch for this one)",
+					status, tonumber(file.additions) or 0, tonumber(file.deletions) or 0)
+			else
+				local lines = splitLines(tostring(file.patch))
+				if spent >= budget then
+					out[#out + 1] = string.format("  (%d lines; `git show %s %s` for it)",
+						#lines, tostring(data.sha):sub(1, 7), name)
+				elseif spent + #lines > budget then
+					local room = budget - spent
+					for cut = 1, room do
+						out[#out + 1] = lines[cut]
+					end
+					out[#out + 1] = string.format("  (… %d more lines; `git show %s %s` for the file)",
+						#lines - room, tostring(data.sha):sub(1, 7), name)
+					spent = budget
+				else
+					table.move(lines, 1, #lines, #out + 1, out)
+					spent += #lines
+				end
+			end
+		end
+		if #files == 0 then
+			out[#out + 1] = "no file list — the host omits one for a commit of more than 300 files"
+		end
+		return table.concat(out, "\n")
 	end
 
 	if sub == "pull" then
@@ -4728,46 +5110,7 @@ HANDLERS.git = function(self, argv)
 			fetched[#fetched + 1] = { path = path, source = text }
 		end
 
-		local written, failures = 0, {}
-		local _, undoErr = withUndo("agent: git pull", function()
-			for _, item in ipairs(fetched) do
-				-- Containers first. The leading segment is a service and already
-				-- exists; anything else missing at the top would mean inventing a
-				-- container directly under the DataModel root, which this refuses
-				-- rather than quietly polluting the place.
-				local segments: { string } = {}
-				for segment in item.path:gmatch("[^/]+") do
-					segments[#segments + 1] = segment
-				end
-				local walked = ""
-				local blocked: string? = nil
-				for index = 1, #segments - 1 do
-					local parentPath = walked == "" and "/" or walked
-					walked ..= "/" .. segments[index]
-					if not self:resolve(walked) then
-						if index == 1 then
-							blocked = walked .. " is not a service in this place"
-							break
-						end
-						local _, createErr = self:create("Folder", segments[index], parentPath)
-						if createErr then
-							blocked = createErr
-							break
-						end
-					end
-				end
-				if blocked then
-					failures[#failures + 1] = item.path .. ": " .. blocked
-				else
-					local _, writeErr = self:write("/" .. item.path, item.source)
-					if writeErr then
-						failures[#failures + 1] = item.path .. ": " .. tostring(writeErr)
-					else
-						written += 1
-					end
-				end
-			end
-		end)
+		local written, failures, undoErr = materialize(self, fetched, "agent: git pull")
 		if undoErr then
 			return fail("git", undoErr)
 		end
@@ -4807,7 +5150,7 @@ HANDLERS.git = function(self, argv)
 		local status = Git.compare(working, remote)
 
 		if sub == "status" then
-			return Git.formatStatus(cfg, status, skipped, MAX_LIST)
+			return Git.formatStatus(cfg, status, Git.staged(), skipped, MAX_LIST)
 		end
 
 		-- diff: a named path, or everything that changed. Deletions are part of
@@ -4821,6 +5164,11 @@ HANDLERS.git = function(self, argv)
 					"file on the remote — `git status` lists what changed", path))
 			end
 			wanted[1] = path
+		elseif flags["--staged"] or flags["--cached"] then
+			-- What commit would send, which is the one diff worth reading before
+			-- making one. Both spellings, because git answers to both and picking
+			-- a side would make the other look unsupported.
+			wanted = Git.staged()
 		else
 			table.move(status.modified, 1, #status.modified, 1, wanted)
 			table.move(status.deleted, 1, #status.deleted, #wanted + 1, wanted)
@@ -4834,14 +5182,25 @@ HANDLERS.git = function(self, argv)
 				out[#out + 1] = string.format("… %d more changed (name one to see it)", #wanted - 20)
 				break
 			end
-			local text, blobErr = remoteBlob(cfg, remote[path])
-			if not text then
-				return fail("git", blobErr)
+			-- A path the remote does not have is a file being ADDED, and it has no
+			-- side A to fetch. Guarded rather than assumed: blobUrl formats the sha
+			-- with %s, and Luau's string.format raises on nil rather than writing
+			-- "nil", so this used to throw outright for `git diff <new script>` —
+			-- and would throw on every added path once --staged started including
+			-- them.
+			local text = ""
+			if remote[path] then
+				local fetched, blobErr = remoteBlob(cfg, remote[path])
+				if not fetched then
+					return fail("git", blobErr)
+				end
+				text = fetched
 			end
 			-- A deleted path has no side B at all, so it diffs against nothing and
-			-- is named /dev/null, which is how git spells "this file is gone".
+			-- is named /dev/null, which is how git spells "this file is gone". An
+			-- added one is the same thing from the other end.
 			local mine = working[path]
-			local before = splitLines(text)
+			local before = remote[path] and splitLines(text) or {}
 			local after = mine and splitLines(mine.source) or {}
 			local script, diffErr = diffLines(before, after, function(line)
 				return diffKey(line, flags)
@@ -4849,7 +5208,8 @@ HANDLERS.git = function(self, argv)
 			if not script then
 				return fail("git", diffErr)
 			end
-			local body = unified(script, before, after, "a/" .. path,
+			local body = unified(script, before, after,
+				remote[path] and ("a/" .. path) or "/dev/null",
 				mine and ("b/" .. path) or "/dev/null", numberOf(values, "-U") or 3)
 			if body ~= "" then
 				out[#out + 1] = body
@@ -4860,7 +5220,7 @@ HANDLERS.git = function(self, argv)
 
 	return fail("git", string.format("no `git %s` here — this speaks to the host's API, " ..
 		"not git's wire protocol, so there is no local history to %s. " ..
-		"`config`, `status` and `diff` are what exists", sub, sub))
+		"What exists: %s", sub, sub, GIT_SUB_LIST))
 end
 
 local COMMANDS: { string } = {}
@@ -4881,34 +5241,6 @@ local METACHARACTERS: { [string]: boolean } = {
 }
 
 
--- Commands `/sh` is allowed to run. An allowlist rather than "anything not in a
--- MUTATES list": a command added later should be unavailable to the user-facing
--- shell until someone decides it is safe, rather than exposed by default. The
--- check is per command, not per line, so `;` cannot smuggle an rm past it.
-local READ_ONLY: { [string]: boolean } = {
-	cat = true, cd = true, diff = true, du = true, echo = true, file = true,
-	find = true, grep = true, egrep = true, fgrep = true, head = true, ls = true,
-	pwd = true, sed = true, stat = true, tail = true, tr = true, tree = true,
-	wc = true, which = true, basename = true, dirname = true, whoami = true,
-	-- Both only read the command tables. `command` is listed for its -v/-V forms;
-	-- the `command foo` form is stripped before this check, so what gets tested
-	-- is foo's own place on this list, not command's.
-	command = true, help = true,
-	-- Deliberately absent: `git`. This list is keyed by COMMAND NAME and
-	-- MUTATING_FLAGS matches a flag, so neither can say "status yes, commit no",
-	-- and `git` is one name covering both. Growing a third mechanism for one
-	-- command is the wrong order; /sh refuses the whole of git and that errs safe.
-}
-
--- The one flag that turns each read-only command into a mutating one. Kept as a
--- table so adding a destructive option to an allowlisted command is a visible
--- decision rather than something that lands by omission.
-local MUTATING_FLAGS: { [string]: { flag: string, why: string } } = {
-	sed  = { flag = "-i",      why = "sed -i writes to the script" },
-	sort = { flag = "-o",      why = "sort -o writes its result to a script" },
-	find = { flag = "-delete", why = "find -delete destroys instances" },
-}
-
 -- Commands that can consume a stream. Anything else in a pipeline is a mistake
 -- worth naming: `ls | ls` silently ignoring its input is how a wrong answer
 -- looks exactly like a right one.
@@ -4923,9 +5255,9 @@ local STDIN_COMMANDS: { [string]: boolean } = {
 -- Forward-declared: a `for` loop is a pipeline STAGE, so runCommand has to be
 -- able to reach it, and the loop body runs back through runTokens, which is
 -- defined below both of them.
-local runLoopStage: (any, { string }, boolean?) -> (string, boolean)
+local runLoopStage: (any, { string }) -> (string, boolean)
 
-local function runCommand(self: any, argv: { string }, readOnly: boolean?, stdin: string?): (string, boolean)
+local function runCommand(self: any, argv: { string }, stdin: string?): (string, boolean)
 	failed = false
 	-- Before takeRedirect, which would otherwise steal a `>` out of the loop's
 	-- BODY: `for f in a; do echo $f > out.luau; done` is a redirect per
@@ -4934,12 +5266,9 @@ local function runCommand(self: any, argv: { string }, readOnly: boolean?, stdin
 		if stdin then
 			return fail("bash", "for: a loop does not read input — pipe its output instead"), false
 		end
-		return runLoopStage(self, argv, readOnly)
+		return runLoopStage(self, argv)
 	end
 	local args, redirect, append = takeRedirect(argv)
-	if redirect and readOnly then
-		return fail("bash", "redirection is not available here — /sh is read-only"), false
-	end
 	if #args == 0 then
 		if redirect and redirect ~= DEV_NULL then
 			return applyRedirect(self, redirect, stdin or "", append), not failed
@@ -4950,9 +5279,9 @@ local function runCommand(self: any, argv: { string }, readOnly: boolean?, stdin
 	-- `command foo args` runs foo with shell functions and aliases bypassed. There
 	-- are neither here, so it is exactly `foo args` — stripped rather than handled
 	-- inside HANDLERS.command, so that everything below sees the REAL command:
-	-- its flag spec, its read-only status, its stdin eligibility. Handling it in
-	-- the handler would have meant re-entering dispatch with all three already
-	-- decided against the wrong name.
+	-- its flag spec and its stdin eligibility. Handling it in the handler would
+	-- have meant re-entering dispatch with both already decided against the wrong
+	-- name.
 	--
 	-- A dash after `command` is the -v/-V question instead, which is a command in
 	-- its own right and goes to the handler. A loop, not an `if`, because bash
@@ -4963,30 +5292,6 @@ local function runCommand(self: any, argv: { string }, readOnly: boolean?, stdin
 	end
 
 	local cmd = args[1]
-	if readOnly and not READ_ONLY[cmd] then
-		return fail("bash", cmd .. " is not available here — /sh is read-only"), false
-	end
-	-- READ_ONLY is an allowlist of COMMANDS, and `sed` and `find` earned their
-	-- places there by only ever reading. One flag turns each into a mutating one,
-	-- so that flag has to be named explicitly, otherwise a single new option
-	-- quietly punches a hole in /sh, which exists so that every mutation arrives
-	-- through Claude with an undo recording attached.
-	local mutator = readOnly and MUTATING_FLAGS[cmd]
-	if mutator then
-		for _, arg in ipairs(args) do
-			-- Prefix, not equality: the flag can arrive bundled (`sed -in`) or with
-			-- its value glued on (`sort -oout.luau`), and this check must fail
-			-- CLOSED: refusing a read-only command that was not going to write is
-			-- a corrected turn, letting a write through is a hole in /sh.
-			--
-			-- Matched against the raw argument rather than the parsed flag set
-			-- because `find` has no spec: its -delete never becomes a flag, it is
-			-- parsed by the handler itself.
-			if arg:sub(1, #mutator.flag) == mutator.flag then
-				return fail("bash", mutator.why .. " — /sh is read-only"), false
-			end
-		end
-	end
 	if stdin and not STDIN_COMMANDS[cmd] then
 		return fail("bash", cmd .. " does not read input — pipe into cat, grep, head, tail, wc, sort, uniq, sed or tr"), false
 	end
@@ -5025,11 +5330,11 @@ end
 -- A pipeline: each stage's output becomes the next stage's input. A failing
 -- stage stops the pipeline rather than feeding an error message downstream as
 -- if it were data.
-local function runPipeline(self: any, stages: { { string } }, readOnly: boolean?, stdin: string?): (string, boolean)
+local function runPipeline(self: any, stages: { { string } }, stdin: string?): (string, boolean)
 	local input = stdin
 	local output, ok = "", true
 	for _, stage in ipairs(stages) do
-		output, ok = runCommand(self, stage, readOnly, input)
+		output, ok = runCommand(self, stage, input)
 		if not ok then
 			return output, false
 		end
@@ -5139,7 +5444,7 @@ end
 -- Run a statement list. `lastOk` seeds the `&&`/`||` chain, which matters when
 -- something ran before these statements did — see the loop below, where `done &&
 -- echo ok` has to know whether the loop failed.
-local function runStatements(self: any, statements: { Statement }, readOnly: boolean?,
+local function runStatements(self: any, statements: { Statement },
 	stdin: string?, lastOk: boolean): (string, boolean)
 	local outputs: { string } = {}
 	for index, statement in ipairs(statements) do
@@ -5148,7 +5453,7 @@ local function runStatements(self: any, statements: { Statement }, readOnly: boo
 		if not skip then
 			-- A heredoc body belongs to the last statement, the way a shell
 			-- attaches it to the command it followed.
-			local output, ok = runPipeline(self, statement.stages, readOnly,
+			local output, ok = runPipeline(self, statement.stages,
 				index == #statements and stdin or nil)
 			lastOk = ok
 			if #statements == 1 then
@@ -5274,16 +5579,16 @@ end
 
 -- Forward-declared: a loop body is run through the same entry point that
 -- detects a loop, which is what makes nesting work without a second parser.
-local runTokens: (any, { string }, boolean?, string?, boolean) -> (string, boolean)
+local runTokens: (any, { string }, string?, boolean) -> (string, boolean)
 
-local function runLoop(self: any, loop: Loop, readOnly: boolean?, lastOk: boolean): (string, boolean)
+local function runLoop(self: any, loop: Loop, lastOk: boolean): (string, boolean)
 	-- Globbed, because `for f in *.luau` is the whole reason to have this.
 	local words = expandGlobs(self, loop.words)
 	local outputs: { string } = {}
 	local ok = lastOk
 	for _, word in ipairs(words) do
 		local output
-		output, ok = runTokens(self, expandVar(loop.body, loop.name, word), readOnly, nil, true)
+		output, ok = runTokens(self, expandVar(loop.body, loop.name, word), nil, true)
 		if output ~= "" then
 			outputs[#outputs + 1] = output
 		end
@@ -5303,7 +5608,7 @@ end
 -- `cd x; for ...` all fall out of that: the statement and pipeline machinery
 -- already knows what to do with a stage, and each of those shapes used to need
 -- its own branch up here, or was refused outright.
-function runLoopStage(self: any, argv: { string }, readOnly: boolean?): (string, boolean)
+function runLoopStage(self: any, argv: { string }): (string, boolean)
 	local loop, loopErr = parseLoop(argv)
 	if not loop then
 		return fail("bash", loopErr or ("for: " .. LOOP_SYNTAX)), false
@@ -5316,11 +5621,7 @@ function runLoopStage(self: any, argv: { string }, readOnly: boolean?): (string,
 	if #rest > 0 then
 		return fail("bash", "for: unexpected " .. rest[1] .. " after `done`"), false
 	end
-	if redirect and readOnly then
-		return fail("bash", "redirection is not available here — /sh is read-only"), false
-	end
-
-	local output, ok = runLoop(self, loop, readOnly, true)
+	local output, ok = runLoop(self, loop, true)
 	if redirect == DEV_NULL then
 		return "", ok
 	end
@@ -5335,13 +5636,13 @@ function runLoopStage(self: any, argv: { string }, readOnly: boolean?): (string,
 	return output, ok
 end
 
-function runTokens(self: any, argv: { string }, readOnly: boolean?, stdin: string?,
+function runTokens(self: any, argv: { string }, stdin: string?,
 	lastOk: boolean): (string, boolean)
-	return runStatements(self, parseStatements(argv), readOnly, stdin, lastOk)
+	return runStatements(self, parseStatements(argv), stdin, lastOk)
 end
 
 -- Forward-declared: `$(...)` runs a whole line of its own.
-local runLine: (any, string?, boolean?, number) -> (string, boolean)
+local runLine: (any, string?, number) -> (string, boolean)
 
 -- The closing `)` of a `$(`, skipping quoted text and nested parens. A plain
 -- paren count is not enough, and the command that made this necessary is the one
@@ -5403,8 +5704,7 @@ local QUOTED_RISK = "[\"\\]"
 -- the upgrade path past it.
 local MAX_SUBSTITUTION_DEPTH = 4
 
-local function expandSubstitutions(self: any, line: string, readOnly: boolean?,
-	depth: number): (string?, string?)
+local function expandSubstitutions(self: any, line: string, depth: number): (string?, string?)
 	if not line:find("$(", 1, true) then
 		return line, nil
 	end
@@ -5425,7 +5725,7 @@ local function expandSubstitutions(self: any, line: string, readOnly: boolean?,
 			if not inner then
 				return nil, "unclosed `$(`"
 			end
-			local text, ok = runLine(self, inner, readOnly, depth + 1)
+			local text, ok = runLine(self, inner, depth + 1)
 			if not ok then
 				-- Splicing a refusal in as words is how `for f in $(grep ...)` would
 				-- come to iterate over the words of an error message.
@@ -5463,16 +5763,21 @@ end
 -- Run a `bash` line. Split out from dispatch so the tokenizer and the command
 -- table can be tested without going through tool_use plumbing.
 --
--- `readOnly` is for /sh, where the human types the line directly and mutations
--- should stay Claude's, every write it makes carries an undo recording.
-function Shell.run(self: any, line: string?, readOnly: boolean?): string
-	local output = runLine(self, line, readOnly, 0)
+-- /sh and the bash tool are the same call. There used to be a `readOnly` flag
+-- that only /sh passed, refusing every command that mutates — on the reasoning
+-- that a write should arrive through Claude carrying an undo recording. The
+-- second half was never true: withUndo lives in the handlers, so a write from
+-- either caller was recorded identically, and what the flag actually bought was
+-- that changes stayed in the transcript. That is not worth taking the Delete key
+-- off the person who owns the place, and Studio hands them one anyway.
+function Shell.run(self: any, line: string?): string
+	local output = runLine(self, line, 0)
 	return output
 end
 
 -- The body of Shell.run, plus the recursion depth `$(...)` needs, and the exit
 -- status it needs to refuse splicing the text of a failure.
-function runLine(self: any, line: string?, readOnly: boolean?, depth: number): (string, boolean)
+function runLine(self: any, line: string?, depth: number): (string, boolean)
 	local commandLine, stdin, heredocErr = extractHeredoc(line or "")
 	if heredocErr then
 		return "bash: " .. heredocErr, false
@@ -5494,7 +5799,7 @@ function runLine(self: any, line: string?, readOnly: boolean?, depth: number): (
 		:gsub("%d?>&%-", " ")       -- 2>&-  close stderr
 		:gsub("%d?>&%d", " ")       -- 2>&1, 1>&2, >&2
 
-	local expanded, subErr = expandSubstitutions(self, commandLine, readOnly, depth)
+	local expanded, subErr = expandSubstitutions(self, commandLine, depth)
 	if not expanded then
 		return "bash: " .. tostring(subErr), false
 	end
@@ -5510,7 +5815,7 @@ function runLine(self: any, line: string?, readOnly: boolean?, depth: number): (
 		end
 	end
 
-	return runTokens(self, argv, readOnly, stdin, true)
+	return runTokens(self, argv, stdin, true)
 end
 
 -- Self-test
@@ -6462,28 +6767,33 @@ function Shell.selfTest(probe: any): (boolean, string?)
 	if Shell.run(probe, "git config"):match("token%s+gh") then
 		return false, "git config printed the token instead of whether one is set"
 	end
-
-	-- One flag can turn an allowlisted read-only command into a mutating one, and
-	-- /sh exists so that every mutation arrives through Claude with an undo
-	-- recording attached. Each of these has to be refused however the allowlist
-	-- reads, including with the flag bundled or its value glued on.
-	for _, line in ipairs({
-		"sed -i s/a/b/ x.luau", "sed -in s/a/b/ x.luau",
-		"sort -o out.luau x.luau", "sort -oout.luau x.luau",
-		"find / -name X -delete",
-		-- `command` is on the read-only allowlist, so the prefix strip is the only
-		-- thing standing between it and a hole in /sh: what gets tested has to be
-		-- the command that actually runs, not the word in front of it.
-		"command rm /x", "command command rm /x",
-	}) do
-		if not Shell.run(probe, line, true):match("read%-only") then
-			return false, "not blocked in read-only mode: " .. line
+	-- GIT_SUBS is a hand-written list beside a hand-written dispatch, which is
+	-- how the old messages came to advertise three subcommands out of eight. A
+	-- name with no branch behind it falls through to "no `git X` here", so
+	-- walking the list catches the drift the derivation cannot. Each name fails
+	-- for its OWN reason here (no remote, no message, no slug) and none of those
+	-- is the fallthrough. Skipped without EncodingService, where every subcommand
+	-- returns the same one message before reaching its branch.
+	if Git.available() then
+		for _, sub in ipairs(GIT_SUBS) do
+			if Shell.run(probe, "git " .. sub):match("no `git " .. sub .. "` here") then
+				return false, "GIT_SUBS lists " .. sub .. ", which no branch answers"
+			end
+		end
+		-- What clone and show read BEFORE they reach the network, so a call with
+		-- the argument missing names the shape instead of spending a request to
+		-- come back with "not found".
+		for _, case in ipairs({
+			{ line = "git clone", want = "owner" },
+			{ line = "git clone nope", want = "owner" },
+			{ line = "git show", want = "sha" },
+		}) do
+			if not Shell.run(probe, case.line):match(case.want) then
+				return false, case.line .. " did not name what it wanted"
+			end
 		end
 	end
-	-- chmod writes, so it must not be on the read-only allowlist at all.
-	if not Shell.run(probe, "chmod +x x.luau", true):match("read%-only") then
-		return false, "chmod is not blocked in read-only mode"
-	end
+
 
 	-- The observed-mtime journal. There is no timestamp on an Instance, so this
 	-- is the only thing -t, -newer and -mmin have to sort on, and the case that

@@ -104,8 +104,15 @@ end
 
 -- `owner/repo` is how a repository is written everywhere else, so accept it as
 -- one word rather than making two settings out of what is always copied as one.
+-- Its own function because `git clone` takes the same word and this used to be a
+-- pattern written inline, where a second caller would have become a second
+-- pattern to keep right.
+function Git.parseSlug(slug: string?): (string?, string?)
+	return tostring(slug or ""):match("^([%w%-%._]+)/([%w%-%._]+)$")
+end
+
 function Git.setRemote(slug: string): (boolean, string?)
-	local owner, repo = slug:match("^([%w%-%._]+)/([%w%-%._]+)$")
+	local owner, repo = Git.parseSlug(slug)
 	if not owner then
 		return false, string.format("expected owner/repo, got %q", slug)
 	end
@@ -177,6 +184,55 @@ function Git.pathFor(inst: Instance): (string?, string?)
 	return path .. suffix, nil
 end
 
+-- pathFor's inverse, for the one direction that reads a repository this place
+-- did not write: which of a remote tree's paths can become an Instance at all.
+--
+-- A DataModel has nowhere to put a README, a .gitignore or a project.json, and
+-- Fs.classFor answers ModuleScript for ANY unrecognised suffix, so an unfiltered
+-- clone creates a ModuleScript named "README.md". The suffix check is what stops
+-- that, and it is also what keeps the request count sane: one blob request per
+-- file, against 60 an hour unauthenticated. Knit is 75 paths and 6 scripts.
+function Git.scriptPaths(remote: { [string]: string }): ({ string }, number)
+	local kept: { string } = {}
+	local skipped = 0
+	for path in pairs(remote) do
+		local leaf = path:match("[^/]+$") or path
+		if Fs.stripScriptSuffix(leaf) then
+			kept[#kept + 1] = path
+		else
+			skipped += 1
+		end
+	end
+	table.sort(kept)
+	return kept, skipped
+end
+
+export type InitContainer = { class: string, path: string, source: string }
+
+-- Rojo's one convention that changes the SHAPE of what arrives: `src/init.luau`
+-- does not mean a ModuleScript named init inside a folder named src, it means
+-- the folder src IS that ModuleScript. Written the literal way, a cloned library
+-- lands as Knit/src/init and `require(Packages.Knit.src)` finds a Folder.
+--
+-- Keyed by the container's ABSOLUTE path, the form resolve takes, because the
+-- caller looks these up while walking a path it is building segment by segment.
+-- A file with no directory above it is absent from the result: that would name a
+-- service, and a service cannot be a script.
+--
+-- The test is stripScriptSuffix and never classFor, which answers ModuleScript
+-- for every suffix it does not know and would take init.md for one of these.
+function Git.initContainers(files: { { path: string, source: string } }): { [string]: InitContainer }
+	local containers: { [string]: InitContainer } = {}
+	for _, item in ipairs(files) do
+		local dir, leaf = item.path:match("^(.+)/([^/]+)$")
+		if dir and Fs.stripScriptSuffix(leaf) == "init" then
+			local class = Fs.classFor(leaf)
+			containers["/" .. dir] = { class = class, path = item.path, source = item.source }
+		end
+	end
+	return containers
+end
+
 export type Entry = { sha: string, inst: Instance, source: string }
 
 -- The working tree: every script under `root`, by the path it would have in the
@@ -242,7 +298,8 @@ end
 -- `git status`, rendered. Here rather than in the handler because it is pure:
 -- the handler's half is one request, and a formatter behind a request is a
 -- formatter nothing can test.
-function Git.formatStatus(cfg: Config, status: Status, skipped: { string }, cap: number): string
+function Git.formatStatus(cfg: Config, status: Status, staged: { string },
+	skipped: { string }, cap: number): string
 	local head = string.format("On branch %s (%s/%s)", cfg.branch, cfg.owner, cfg.repo)
 	if Git.isClean(status) and #skipped == 0 then
 		return head .. "\nnothing to commit, working tree clean"
@@ -258,16 +315,47 @@ function Git.formatStatus(cfg: Config, status: Status, skipped: { string }, cap:
 				or ("  " .. path)
 		end
 	end
-	-- No staged section. Nothing stages yet, and an empty heading claiming
-	-- otherwise would be a promise this cannot keep.
-	if #status.modified > 0 or #status.deleted > 0 then
-		out[#out + 1] = "Changes not staged for commit:"
-		list(status.modified, "modified:")
-		list(status.deleted, "deleted:")
+	-- This section used to be absent, with a comment saying nothing stages yet.
+	-- Staging arrived and the comment did not move, so `git add -A` was followed
+	-- by a status that filed every staged path under "not staged" — and the index
+	-- is what commit actually sends, which made the one thing worth reviewing the
+	-- one thing that could not be seen.
+	--
+	-- A staged path that is no longer changed appears nowhere, which is what git
+	-- does with one: the index here holds paths and not content, so "staged and
+	-- identical to the remote" and "not staged" cannot be told apart, and the
+	-- commit it produces is a no-op either way.
+	local inIndex: { [string]: boolean } = {}
+	for _, path in ipairs(staged) do
+		inIndex[path] = true
 	end
-	if #status.added > 0 then
+	local function split(paths: { string }): ({ string }, { string })
+		local yes: { string } = {}
+		local no: { string } = {}
+		for _, path in ipairs(paths) do
+			local into = inIndex[path] and yes or no
+			into[#into + 1] = path
+		end
+		return yes, no
+	end
+	local stagedModified, modified = split(status.modified)
+	local stagedAdded, added = split(status.added)
+	local stagedDeleted, deleted = split(status.deleted)
+
+	if #stagedModified + #stagedAdded + #stagedDeleted > 0 then
+		out[#out + 1] = "Changes to be committed:"
+		list(stagedModified, "modified:")
+		list(stagedAdded, "new file:")
+		list(stagedDeleted, "deleted:")
+	end
+	if #modified > 0 or #deleted > 0 then
+		out[#out + 1] = "Changes not staged for commit:"
+		list(modified, "modified:")
+		list(deleted, "deleted:")
+	end
+	if #added > 0 then
 		out[#out + 1] = "Untracked files:"
-		list(status.added)
+		list(added)
 	end
 	-- Named, never dropped. A script missing from a commit with nothing said
 	-- about it is the worst outcome this module can produce.
@@ -491,9 +579,22 @@ function Git.newCommitUrl(cfg: Config): string
 	return string.format("%s/repos/%s/%s/git/commits", Git.HOST, cfg.owner, cfg.repo)
 end
 
-function Git.logUrl(cfg: Config, count: number): string
-	return string.format("%s/repos/%s/%s/commits?sha=%s&per_page=%d",
+-- `path` narrows the log to the commits that touched one file. Handed over
+-- ALREADY ENCODED: an instance name may carry a space, and the encoder is on
+-- HttpService, which this module deliberately does not hold — every request it
+-- describes is made by Shell.
+function Git.logUrl(cfg: Config, count: number, path: string?): string
+	local url = string.format("%s/repos/%s/%s/commits?sha=%s&per_page=%d",
 		Git.HOST, cfg.owner, cfg.repo, cfg.branch, count)
+	return path and (url .. "&path=" .. path) or url
+end
+
+-- One commit in full. The only endpoint here that returns a diff ALREADY
+-- COMPUTED — the host renders each file's patch in unified format — which is why
+-- `git show` costs one request and no diffing, where `git diff` costs one blob
+-- apiece and does the work locally.
+function Git.commitUrl(cfg: Config, sha: string): string
+	return string.format("%s/repos/%s/%s/commits/%s", Git.HOST, cfg.owner, cfg.repo, sha)
 end
 
 -- Which remote paths differ from what is here. Pull fetches exactly these, and
@@ -642,6 +743,73 @@ function Git.selfTest(): (boolean, string?)
 	end
 	if #Git.chunkPayload({ sample[1] }, 1) ~= 1 then
 		return false, "an entry over budget was dropped instead of taking its own chunk"
+	end
+
+	-- The index is what commit sends, so a status that files a staged path under
+	-- "not staged" is a review of the wrong thing. It did exactly that for as
+	-- long as staging has existed.
+	local shown = Git.formatStatus(
+		{ owner = "o", repo = "r", branch = "main" },
+		{ modified = { "a.luau", "b.luau" }, added = { "c.luau" }, deleted = { "d.luau" } },
+		{ "a.luau", "c.luau" }, {}, 100)
+	if not shown:match("Changes to be committed:\n  modified:   a%.luau\n  new file:   c%.luau") then
+		return false, "staged paths did not reach the committed section:\n" .. shown
+	end
+	if not shown:match("Changes not staged for commit:\n  modified:   b%.luau\n  deleted:    d%.luau") then
+		return false, "unstaged paths did not stay unstaged:\n" .. shown
+	end
+	-- A staged new file is not untracked any more, and showing it in both places
+	-- is how a reader double-counts what a commit is about to do.
+	if shown:find("Untracked files:", 1, true) then
+		return false, "a staged new file was also listed as untracked:\n" .. shown
+	end
+
+	-- clone reads a slug, a foreign tree and Rojo's init convention, and all
+	-- three of those are pure. The slug pattern is shared with `git config
+	-- remote`, so one of these failing is both of them broken.
+	if Git.parseSlug("Sleitnick/Knit") ~= "Sleitnick" then
+		return false, "a plain owner/repo did not parse"
+	end
+	for _, bad in ipairs({ "Knit", "a/b/c", "", "a b/c" }) do
+		if Git.parseSlug(bad) then
+			return false, string.format("%q parsed as a slug", bad)
+		end
+	end
+
+	-- Fs.classFor answers ModuleScript for every suffix it does not know, so the
+	-- filter has to be the suffix test itself. Without it a clone creates a
+	-- ModuleScript named README.md, and spends a request fetching it first.
+	local kept, notScripts = Git.scriptPaths({
+		["src/init.luau"] = "a", ["src/Knit.client.luau"] = "b",
+		["README.md"] = "c", ["default.project.json"] = "d", ["LICENSE"] = "e",
+	})
+	if #kept ~= 2 or kept[1] ~= "src/Knit.client.luau" or notScripts ~= 3 then
+		return false, string.format("scriptPaths kept %d of the right 2 and skipped %d of 3",
+			#kept, notScripts)
+	end
+
+	-- An init file means the CONTAINER is the script, which is the difference
+	-- between a library that requires and one that does not.
+	local inits = Git.initContainers({
+		{ path = "Pkg/src/init.luau", source = "return 1" },
+		{ path = "Pkg/src/Other.luau", source = "return 2" },
+		{ path = "Pkg/svc/init.server.luau", source = "return 3" },
+		{ path = "Pkg/notes/init.md", source = "hi" },
+		{ path = "init.luau", source = "return 4" },
+	})
+	if not inits["/Pkg/src"] or inits["/Pkg/src"].class ~= "ModuleScript" then
+		return false, "src/init.luau did not make src the ModuleScript"
+	end
+	if not inits["/Pkg/svc"] or inits["/Pkg/svc"].class ~= "Script" then
+		return false, "init.server.luau did not carry its class through"
+	end
+	if inits["/Pkg/notes"] then
+		return false, "init.md was taken for a script"
+	end
+	-- A file with no directory above it would name a SERVICE as the container,
+	-- and a service cannot be a script.
+	if inits["/"] or inits[""] then
+		return false, "a top-level init.luau claimed a container"
 	end
 
 	return true
