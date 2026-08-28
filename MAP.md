@@ -32,8 +32,8 @@ main.lua                        window, toolbar, popups, usage panel
       fs/Shell                  command line: tokens, flags, pipes, HANDLERS
       fs/Fs                     paths, .Source, undo, mtime, globs
       studio/Props              property names + defaults (API dump)
-      studio/Exec               executes Luau      (run tool only)
-      studio/Catalog            free models        (catalog tool only)
+      studio/Exec               executes Luau      (run tool only, required on first use)
+      studio/Catalog            free models        (catalog tool only, required on first use)
       text/Regex                BRE/ERE engine
       text/Sed                  sed engine
       git/Git                   object ids, path mapping, working-tree walk
@@ -91,7 +91,7 @@ main.lua                        window, toolbar, popups, usage panel
 | write / multiedit | `Terminal.lua:556 / 603` |
 | the syntax check on a write | `Fs.lua:156` `Fs.syntaxErrors`, appended by `Terminal.lua:550` `withSyntax`. Never rejects a write, only annotates one |
 | Luau is executed | `studio/Exec.lua:424` `Exec.run`; PROLOGUE at `:56`, every entry one physical line |
-| the run guard (off by default) | `studio/Exec.lua:31` `setRunGuard`, backed by `Settings.allowRun` |
+| the run guard (off by default) | `studio/Exec.lua:31` `setRunGuard`, backed by `Settings.allowRun`, held in `Terminal` until Exec loads |
 | free models | `studio/Catalog.lua:186` `search`, `:247` `load` |
 | regex compiled / matched | `text/Regex.lua:772` `compile`, `:743` `Program:find` |
 | sed parsed / applied | `text/Sed.lua:195` `parseSedCommand`, `:102` `substitute` |
@@ -164,10 +164,12 @@ extractions; `HANDLERS` is not (below).
 ## Conventions
 
 - Every mutation goes through `Fs.withUndo`. Bypassing it is data loss.
-- `selfTest` is a convention, not a framework: `Regex`, `Props`, `Markdown`,
-  `Sessions`, `Find`, `Console`, `Shell`, `Agent`, `Exec`, `Catalog`, `Git` and
-  `Terminal` export one, and `main.lua` runs them at startup. A module that gains logic gains a selfTest,
-  and `Terminal.selfTest` chains the fs-side ones.
+- `selfTest` is a convention, not a framework: `Sha256`, `Regex`, `Props`,
+  `Markdown`, `Sessions`, `Find`, `Console`, `Shell`, `Agent`, `Exec`, `Catalog`,
+  `Git` and `Terminal` export one, and `/selftest` in `Commands` runs them — on
+  demand, not at startup, where ~1800 lines of them ran on the frame the widget
+  opened. A module that gains logic gains a selfTest, and `Terminal.selfTest`
+  chains the fs-side ones.
 - Scripts render as `name.luau`. `Fs.displayName` adds it, `Fs.resolve` strips
   it, name matching tries both.
 - `Exec`'s PROLOGUE entries are each one physical line — its length is the

@@ -26,20 +26,17 @@ local UserInputService = game:GetService("UserInputService")
 -- reaches for a folder it does not live in when it genuinely crosses layers,
 -- which is why this is the only file that names all four.
 local agent = script:WaitForChild("agent")
-local util  = script:WaitForChild("util")
 local fs     = script:WaitForChild("fs")
 local git    = script:WaitForChild("git")
 local studio = script:WaitForChild("studio")
 local ui    = script:WaitForChild("ui")
 
-local Sha256   = require(util:WaitForChild("Sha256"))   :: any
 local Provider = require(agent:WaitForChild("Provider")) :: any
 local Props    = require(studio:WaitForChild("Props"))  :: any
 local Fs       = require(fs:WaitForChild("Fs"))         :: any
 local Terminal = require(fs:WaitForChild("Terminal"))   :: any
 local Git      = require(git:WaitForChild("Git"))       :: any
 local Theme    = require(ui:WaitForChild("Theme"))
-local Markdown = require(ui:WaitForChild("Markdown"))
 local Console  = require(ui:WaitForChild("Console"))
 local Find     = require(ui:WaitForChild("Find"))
 local Settings = require(ui:WaitForChild("Settings"))
@@ -1093,30 +1090,18 @@ inputBox.Focused:Connect(function()
 end)
 
 -- Startup
+--
+-- The self-tests used to run here, all of them, on the frame the widget opens:
+-- about 1800 lines of test code, thirty-odd Instances built and torn down, and
+-- half a dozen plugin-setting writes, before anything was on screen. That was
+-- the startup cost, and it re-proved on every open what had not changed since
+-- the last open. They live behind `/selftest` now — the same set, none of it
+-- trimmed, run when something has actually been edited.
+--
+-- What stays here is the two things that are not tests: the API dump has to be
+-- warm before the first `cat`, and the mtime journal only knows about what
+-- happened after it started watching.
 task.spawn(function()
-	local SHA_VECTORS = {
-		{ input = "",    expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
-		{ input = "abc", expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" },
-	}
-	for _, vector in ipairs(SHA_VECTORS) do
-		if Sha256.hex(vector.input) ~= vector.expected then
-			warn("[agent] SHA-256 self-test FAILED")
-			break
-		end
-	end
-
-	local markdownOk, markdownErr = Markdown.selfTest()
-	if not markdownOk then
-		warn("[agent] Markdown self-test FAILED: " .. tostring(markdownErr))
-	end
-
-	-- Before the banner and before restoreLast, both of which put content on
-	-- screen: this one clears the console as part of what it checks.
-	local consoleOk, consoleErr = Console.selfTest()
-	if not consoleOk then
-		warn("[agent] Console self-test FAILED: " .. tostring(consoleErr))
-	end
-
 	Console.appendLine(NAME, "system")
 	if Provider.auth.isLoggedIn() then
 		Console.appendLine("Logged in. Type /help for commands, or just start typing.", "info")
@@ -1138,31 +1123,6 @@ task.spawn(function()
 	-- Start observing modification times. Nothing before this point has one, so
 	-- the earlier this runs the more of the session `ls -t` can answer for.
 	Fs.watch()
-
-	local shellOk, shellErr = Terminal.selfTest()
-	if not shellOk then
-		warn("[agent] Terminal self-test FAILED: " .. tostring(shellErr))
-	end
-	local propsOk, propsErr = Props.selfTest()
-	if not propsOk then
-		warn("[agent] Property lookup self-test FAILED: " .. tostring(propsErr))
-	end
-	local agentOk, agentErr = Agent.selfTest()
-	if not agentOk then
-		warn("[agent] Context trimming self-test FAILED: " .. tostring(agentErr))
-	end
-	local providerOk, providerErr = Provider.selfTest()
-	if not providerOk then
-		warn("[agent] Provider self-test FAILED: " .. tostring(providerErr))
-	end
-	local sessionsOk, sessionsErr = Sessions.selfTest()
-	if not sessionsOk then
-		warn("[agent] Session storage self-test FAILED: " .. tostring(sessionsErr))
-	end
-	local findOk, findErr = Find.selfTest()
-	if not findOk then
-		warn("[agent] Conversation search self-test FAILED: " .. tostring(findErr))
-	end
 end)
 
 print("[agent] Loaded.")

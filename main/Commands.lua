@@ -18,6 +18,13 @@ local Provider = require(agent:WaitForChild("Provider"))
 local Agent = require(agent:WaitForChild("Agent"))
 local Terminal = require(script.Parent:WaitForChild("fs"):WaitForChild("Terminal"))
 local Tools = require(agent:WaitForChild("Tools"))
+-- The four the self-test runner needs and nothing else did. Commands already
+-- reaches into every layer by definition, which is the reason the runner lives
+-- here rather than being handed in as a fifth callback from main.
+local Markdown = require(ui:WaitForChild("Markdown"))
+local Find = require(ui:WaitForChild("Find"))
+local Props = require(script.Parent:WaitForChild("studio"):WaitForChild("Props"))
+local Sha256 = require(script.Parent:WaitForChild("util"):WaitForChild("Sha256")) :: any
 
 local Commands = {}
 
@@ -227,6 +234,64 @@ handlers["/sh"] = function(_, raw)
 	Commands.runShell(rest)
 end
 
+-- Every module's selfTest, run on demand.
+--
+-- These all used to run in main's startup task: roughly 1800 lines of test code,
+-- some thirty Instances created and destroyed, and half a dozen plugin-setting
+-- writes, on the frame the widget opens. That was the startup lag, and it bought
+-- a check at the one moment nothing had changed since the last time it passed.
+--
+-- Nothing is deleted, and the set is not trimmed either. A test that never runs
+-- rots, so this is one command away rather than gone — and running a "cheap
+-- subset" is the version that quietly stops covering things while still looking
+-- like it covers them.
+--
+-- Terminal's entry pulls in Shell, and Shell's pulls in Regex, Sed and Git, so
+-- four of the biggest are behind one name here.
+local SELF_TESTS: { { name: string, run: () -> (boolean, string?) } } = {
+	{ name = "sha256",    run = Sha256.selfTest },
+	{ name = "markdown",  run = Markdown.selfTest },
+	{ name = "terminal",  run = Terminal.selfTest },
+	{ name = "props",     run = Props.selfTest },
+	{ name = "agent",     run = Agent.selfTest },
+	{ name = "provider",  run = Provider.selfTest },
+	{ name = "sessions",  run = Sessions.selfTest },
+	{ name = "find",      run = Find.selfTest },
+	-- Last, and on its own line in the code as well as in the run: its check ends
+	-- by clearing the console, because what it is testing IS the console. The
+	-- conversation is redrawn from storage straight after.
+	{ name = "console",   run = Console.selfTest },
+}
+
+handlers["/selftest"] = function()
+	local failures: { string } = {}
+	local passed = 0
+	for _, entry in ipairs(SELF_TESTS) do
+		-- pcall, because a self-test that THROWS would otherwise take the rest of
+		-- the suite with it and report nothing at all.
+		local ran, ok, err = pcall(entry.run)
+		if not ran then
+			failures[#failures + 1] = entry.name .. " threw: " .. tostring(ok)
+		elseif not ok then
+			failures[#failures + 1] = entry.name .. ": " .. tostring(err)
+		else
+			passed += 1
+		end
+	end
+	-- console's test leaves the screen empty; put the conversation back before
+	-- anything is printed into it.
+	Sessions.restoreLast()
+	if #failures == 0 then
+		Console.appendLine(string.format("selftest: %d passed", passed), "info")
+		return
+	end
+	Console.appendLine(string.format("selftest: %d passed, %d FAILED",
+		passed, #failures), "error")
+	for _, note in ipairs(failures) do
+		Console.appendLine("  " .. note, "error")
+	end
+end
+
 handlers["/settings"] = function()
 	if openSettings then openSettings(true) end
 end
@@ -249,6 +314,7 @@ Commands.SLASH_COMMANDS = {
 	{ cmd = "/model",    desc = "Switch model" },
 	{ cmd = "/provider", desc = "Switch between Claude and OpenRouter" },
 	{ cmd = "/settings", desc = "Open the settings panel" },
+	{ cmd = "/selftest", desc = "Run every module's self-test (redraws the console)" },
 	{ cmd = "/sh",       desc = "Run a terminal command, or bare to stay in the shell" },
 	{ cmd = "/find",     desc = "Search this chat, thinking included" },
 	{ cmd = "/clear",    desc = "Clear output + conversation" },

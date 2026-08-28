@@ -792,21 +792,62 @@ local Shell = require(script.Parent:WaitForChild("Shell"))
 -- run and catalog live in studio/, no shell command reaches either, so they
 -- were sharing a file with code they have nothing to do with. Terminal keeps
 -- the method names so tools/ and the self-test are unchanged.
-local Exec = require(script.Parent.Parent:WaitForChild("studio"):WaitForChild("Exec"))
-local Catalog = require(script.Parent.Parent:WaitForChild("studio"):WaitForChild("Catalog"))
+--
+-- REQUIRED ON FIRST USE, not at the top. Loading Exec calls GetService for
+-- ServerStorage and LogService, and loading Catalog calls it for InsertService
+-- and MarketplaceService — four services a session that never executes a script
+-- or loads a model has no reason to touch, and `run` is off by default. The
+-- WaitForChild stays up here so the deferred require is a plain lookup and
+-- cannot yield inside a tool call.
+local studioFolder = script.Parent.Parent:WaitForChild("studio")
+local execScript = studioFolder:WaitForChild("Exec")
+local catalogScript = studioFolder:WaitForChild("Catalog")
 
-Terminal.setRunGuard = Exec.setRunGuard
+local execModule: any = nil
+local catalogModule: any = nil
+-- Held HERE rather than forwarded straight to Exec, which is what let the
+-- require move at all: main sets the guard while the widget is opening, so an
+-- alias to Exec.setRunGuard would have loaded Exec at startup — exactly the
+-- thing being avoided — for a value Exec does not read until something runs.
+local runGuard: (() -> boolean)? = nil
+
+local function exec(): any
+	if not execModule then
+		execModule = require(execScript)
+		if runGuard then
+			execModule.setRunGuard(runGuard)
+		end
+	end
+	return execModule
+end
+
+local function catalog(): any
+	if not catalogModule then
+		catalogModule = require(catalogScript)
+	end
+	return catalogModule
+end
+
+-- Set before Exec exists in the usual case, and after it in the self-test's, so
+-- both directions have to work: store it, and push it across if the module is
+-- already loaded.
+function Terminal.setRunGuard(guard: () -> boolean)
+	runGuard = guard
+	if execModule then
+		execModule.setRunGuard(guard)
+	end
+end
 
 function Terminal:run(path: string?): (string?, string?)
-	return Exec.run(self, path)
+	return exec().run(self, path)
 end
 
 function Terminal:catalogSearch(query: string?): (string?, string?)
-	return Catalog.search(self, query)
+	return catalog().search(self, query)
 end
 
 function Terminal:catalogLoad(assetId: number?, parentPath: string?): (string?, string?)
-	return Catalog.load(self, assetId, parentPath)
+	return catalog().load(self, assetId, parentPath)
 end
 
 function Terminal:shell(line: string?): string
@@ -826,11 +867,13 @@ function Terminal.selfTest(): (boolean, string?)
 		return false, "regex engine: " .. tostring(regexErr)
 	end
 
-	-- run and catalog test themselves; this only chains them.
-	local execOk, execErr = Exec.selfTest(Terminal.new(game))
+	-- run and catalog test themselves; this only chains them. Testing them is
+	-- also what LOADS them now, which is the right way round: /selftest is a
+	-- deliberate act, where opening the widget was not.
+	local execOk, execErr = exec().selfTest(Terminal.new(game))
 	if not execOk then return false, execErr end
 
-	local catOk, catErr = Catalog.selfTest()
+	local catOk, catErr = catalog().selfTest()
 	if not catOk then return false, catErr end
 
 	return Shell.selfTest(Terminal.new(game))

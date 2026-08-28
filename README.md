@@ -374,12 +374,20 @@ tools, and Stop or Escape ends it.
 
 ## Self-tests
 
-They run at startup and print to Output: Sha256 against known vectors, PKCE
-against the RFC 7636 vector, retry classification and backoff, tool-argument
-repair, both providers' request translation, Markdown parsing plus every
-streaming prefix leaving RichText balanced, Terminal across its commands, flags
-and globs, and Props against the API dump.
+`/selftest` runs them: Sha256 against the FIPS vectors, PKCE against the RFC 7636
+vector, retry classification and backoff, tool-argument repair, both providers'
+request translation, Markdown parsing plus every streaming prefix leaving
+RichText balanced, Terminal across its commands, flags and globs, Regex, Sed and
+Git underneath it, and Props against the API dump. Every provider's tests run,
+not only the live one — a translation bug in the provider you are not using would
+otherwise surface the moment you switched, which is the worst time to find one.
 
-Every provider's tests run, not only the live one — a translation bug in the
-provider you are not using would otherwise surface the moment you switched,
-which is the worst time to find one.
+They used to run at startup, all of them, on the frame the widget opened: about
+1800 lines of test code, thirty-odd Instances built and torn down, and half a
+dozen plugin-setting writes, before anything was on screen. Nothing has changed
+between two opens of a plugin you did not edit, so that cost bought nothing and
+is gone. The set is not trimmed, only moved — a "cheap subset" is the version
+that quietly stops covering things while still looking like it covers them.
+
+Console's test is last because what it tests is the console, and it finishes by
+clearing it; the conversation is redrawn from storage immediately after.

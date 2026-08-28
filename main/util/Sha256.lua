@@ -172,10 +172,29 @@ local function hmac(key: string, message: string): string
 	return hash(keyOpad .. inner)
 end
 
+-- The two vectors from FIPS 180-4 that every SHA-256 implementation is checked
+-- against. They lived in main.lua's startup block, which made this the one
+-- module whose test was somewhere other than beside the code it checks — and the
+-- only one that could not be run on demand with the rest.
+local function selfTest(): (boolean, string?)
+	local vectors = {
+		{ input = "", expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+		{ input = "abc", expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" },
+	}
+	for _, vector in ipairs(vectors) do
+		local got = hex(vector.input)
+		if got ~= vector.expected then
+			return false, string.format("hex(%q) is %s", vector.input, got)
+		end
+	end
+	return true
+end
+
 return {
 	hash = hash,
 	hex = hex,
 	b64url = b64url,
 	base64url = base64url,
 	hmac = hmac,
+	selfTest = selfTest,
 }
