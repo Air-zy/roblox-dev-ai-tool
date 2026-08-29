@@ -394,7 +394,8 @@ local function runSource(self: any, code: string?, home: Instance?): (string?, s
 		-- changes nothing it would do differently.
 		table.insert(lines, "--- stale ---")
 		table.insert(lines, "edited since this session first loaded them, so the run above used " ..
-			"the old copy. `reload(<path>)` runs the current one:")
+			"the old copy. the `reload` tool replaces them with fresh ones, for every later " ..
+			"run too; `reload(<path>)` inside the chunk does one, for this run only:")
 		for _, path in ipairs(stale) do
 			table.insert(lines, "  " .. path)
 		end

@@ -96,8 +96,9 @@ any other command, so it can follow a `;`, sit behind `&&`, or feed a pipe with
 more statements after it. There is no `while`: nothing here changes between two
 iterations, so it would run zero times or forever.
 edit and multiedit swap unique substrings, write replaces a whole .Source
-(creating the script if it is missing), run executes Luau, and catalog searches
-and loads free models. run is off by default since it runs at plugin permission
+(creating the script if it is missing), run executes Luau, reload uncaches a
+module so the next require reads it again, and catalog searches and loads free
+models. run is off by default since it runs at plugin permission
 level with no timeout.
 
 `/sh <command>` runs that same shell yourself, through the same Terminal the
@@ -124,6 +125,22 @@ generated runner and not at the file — for running a real module in place,
 `reload(m)` inside a chunk is still the answer. Scratch scripts belong in
 /ServerStorage/tmp, which nothing creates for you. A chunk may return several
 values — `return nil, "why"` shows both, not just the nil.
+
+reload takes a list of module paths and swaps each for a clone of itself. It
+runs nothing: `require` caches per Instance and never re-runs a module, so one
+edited after it was first required keeps handing back the old value for the rest
+of the session, which is what a probe in /ServerStorage/tmp hits the second time
+it runs. A clone is a different Instance and therefore a different cache key, so
+putting it where the original was makes every later require of that path reach
+something that has never been run — this run and every one after it, which is
+what the in-chunk `reload(m)` cannot do. Clone takes descendants, so a package
+reloads whole and Rojo's init convention means naming the folder module is
+usually enough. Only what is listed is reloaded, and a module that merely
+requires one of these still holds the old copy's table, so the dependents belong
+in the list too. What it costs is identity: the original is destroyed, so the
+swap carries the editor's buffer rather than the .Source that Clone copies, and
+a path the cwd sits inside is refused rather than leaving the terminal somewhere
+that no longer exists.
 
 catalog loads through game:GetObjects, which does not sandbox anything, so
 scripts inside a model arrive live and able to run. LoadAssetAsync would strip

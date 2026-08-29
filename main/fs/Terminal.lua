@@ -781,6 +781,69 @@ function Terminal:copy(path: string?, destination: string?, name: string?): (str
 	return string.format("copied to %s", instancePath(copied :: Instance)), nil
 end
 
+-- reload: swap a module for a fresh clone of itself.
+--
+-- require() caches per Instance and never re-runs a module, so one edited after
+-- it was first required keeps handing back the old value for the rest of the
+-- session. A clone is a different Instance and therefore a different cache key:
+-- put it where the original was, and every later require of that path resolves
+-- to something that has never been run. Clone() takes descendants, so a package
+-- reloads whole.
+--
+-- Only what is listed. A module that merely REQUIRES one of these still holds
+-- the old copy's table, so list the dependents too, or their common parent.
+function Terminal:reload(paths: { string }?): (string?, string?)
+	if type(paths) ~= "table" or #paths == 0 then
+		return nil, "reload requires at least one path"
+	end
+	local done: { string } = {}
+	for index, path in ipairs(paths) do
+		if type(path) ~= "string" or path == "" then
+			return nil, string.format("path %d must be a non-empty string", index)
+		end
+		-- Resolved one at a time rather than up front: reloading a parent
+		-- destroys the children named later in the list, and by then the path
+		-- points at the fresh copy, which is the one to swap.
+		local target, err = self:resolve(path)
+		if not target then return nil, err end
+		if not target:IsA("ModuleScript") then
+			return nil, "not a module, nothing else is required: " .. instancePath(target)
+		end
+		local parent = target.Parent
+		if not parent then
+			return nil, "not in the tree: " .. instancePath(target)
+		end
+		-- Clone() returns nil rather than throwing here, so without this the
+		-- failure surfaces as a null-index further down.
+		if not target.Archivable then
+			return nil, string.format("%s is not Archivable and cannot be cloned", instancePath(target))
+		end
+		-- The original is destroyed, and a cwd inside it would become a detached
+		-- instance every later path resolves against. Rojo's init convention
+		-- makes a ModuleScript with children ordinary, so this is reachable.
+		if self.cwd == target or self.cwd:IsDescendantOf(target) then
+			return nil, "cd out of " .. instancePath(target) .. " first, reload destroys it"
+		end
+		local full = instancePath(target)
+		-- getSource, not the .Source that Clone() copies: a script open in the
+		-- editor with unsaved edits has two texts, and .Source is the one the
+		-- user is not looking at. Destroying the original closes that tab, so
+		-- reading the buffer here is what keeps those edits.
+		local source = getSource(target)
+		local _, swapErr = withUndo("agent: reload " .. target.Name, function()
+			local fresh = target:Clone()
+			if source then
+				(fresh :: any).Source = source
+			end
+			fresh.Parent = parent
+			target:Destroy()
+		end)
+		if swapErr then return nil, swapErr end
+		done[#done + 1] = full
+	end
+	return "reloaded:\n  " .. table.concat(done, "\n  "), nil
+end
+
 -- Shell facade
 -- Parsing and command dispatch live in Shell; this is the seam between "what a
 -- line means" and "what it does to the DataModel". Required down here rather
@@ -865,6 +928,36 @@ function Terminal.selfTest(): (boolean, string?)
 	local regexOk, regexErr = Regex.selfTest()
 	if not regexOk then
 		return false, "regex engine: " .. tostring(regexErr)
+	end
+
+	-- reload leaves a DIFFERENT instance at the path, carrying the same source.
+	-- That difference is the whole mechanism, since the require cache is keyed
+	-- on the instance; that a fresh key actually re-runs the module is Exec's
+	-- 1/1/2 probe. Detached fixture, so nothing lands in the open place.
+	local fixture = Instance.new("Folder")
+	local module = Instance.new("ModuleScript")
+	module.Name = "ReloadProbe"
+	module.Source = "return 1"
+	module.Parent = fixture
+	local reloadTerm = Terminal.new(fixture)
+	local _, reloadErr = reloadTerm:reload({ "ReloadProbe" })
+	if reloadErr then
+		return false, "reload failed: " .. tostring(reloadErr)
+	end
+	local fresh = fixture:FindFirstChild("ReloadProbe")
+	if not fresh or fresh == module then
+		return false, "reload left the same instance in place, so the cache key is unchanged"
+	end
+	if (fresh :: any).Source ~= "return 1" then
+		return false, "reload lost the module's source"
+	end
+	if module.Parent ~= nil then
+		return false, "reload left the old instance in the tree"
+	end
+	-- A path that is not a module is refused rather than swapped: Folders are
+	-- never required, so replacing one would be churn for nothing.
+	if reloadTerm:reload({ "/" }) then
+		return false, "reload accepted something that is not a module"
 	end
 
 	-- run and catalog test themselves; this only chains them. Testing them is
