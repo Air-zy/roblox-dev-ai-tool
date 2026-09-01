@@ -148,6 +148,41 @@ local function tokenize(line: string): ({ string }?, string?, { [number]: boolea
 			else
 				args[#args + 1] = c
 			end
+		elseif c == ">" then
+			-- A redirection operator is a word delimiter in bash whether or not it
+			-- is glued to what precedes it. Here it was an ordinary character, so
+			-- `echo hi>f.luau` tokenized as the single word `hi>f.luau` and printed
+			-- it: a redirect that wrote nothing, reported nothing, and produced
+			-- output that looked like it had worked. `echo hi> f.luau` was the same
+			-- failure with a space in it. Only the fully-spaced `echo hi > f.luau`
+			-- and the `>f.luau` form ever landed.
+			--
+			-- A bare `1` or `2` immediately in front of the arrow is part of the
+			-- OPERATOR, not an operand. Without that clause this fix would break
+			-- something worse than it repaired: `find x 2>/dev/null` would split
+			-- into `2` — searched for as a name — and a `>` aimed at /dev/null,
+			-- which silently discards the real output. Only an unquoted digit, so
+			-- `echo "2">f` still echoes the character.
+			local pending = table.concat(buf)
+			local stream = ""
+			if not sawQuote and (pending == "1" or pending == "2") then
+				stream = pending
+				buf = {}
+			end
+			flush()
+			local arrow = ">"
+			if line:sub(i + 1, i + 1) == ">" then
+				arrow = ">>"
+				i += 1
+			end
+			args[#args + 1] = stream .. arrow
+		elseif c == "<" then
+			-- Same delimiter rule as `>`, and it needs no stream digit or doubled
+			-- form: `2<` is not a thing anyone writes, and `<<` never reaches here
+			-- because extractHeredoc lifts every heredoc off the line before
+			-- tokenizing and refuses a `<<` it cannot find a delimiter for.
+			flush()
+			args[#args + 1] = "<"
 		elseif c == "\n" then
 			-- A newline ends a command, exactly as it does in a shell script.
 			-- It used to fall through to the whitespace branch below and act as
@@ -470,28 +505,61 @@ end
 -- find, and sync to disk.
 local DEV_NULL = "/dev/null"
 
--- Pull redirection out of argv: `> path`, `>> path`, glued or spaced.
+-- Pull redirection out of argv: `> path`, `>> path`, `2> path`, glued or spaced.
 --
--- `2>` and `&>` aim at a stderr stream that does not exist here, errors come
--- back as ordinary output, so they are dropped. Without that, `2>/dev/null` is
--- not a redirect token at all (it starts with a digit) and falls through as a
--- positional argument, which is how `find x 2>/dev/null` ends up searching for
--- an instance named "2>/dev/null" and reporting no matches.
-local function takeRedirect(argv: { string }): ({ string }, string?, boolean)
+-- `2>` USED to be recognised and thrown away, on the reasoning that there is no
+-- stderr stream to aim it at. Recognising it was necessary — otherwise the token
+-- falls through as a positional argument and `find x 2>/dev/null` searches for
+-- an instance literally named "2>/dev/null" — but throwing it away made
+-- `2>/dev/null` a lie: the most reflexive way there is to quiet a probe, quietly
+-- doing nothing, with the noise still in the output.
+--
+-- There is still no stderr STREAM, and there does not need to be one. `failed`
+-- already means "this errored and its whole output is the message" — that is the
+-- invariant the pipeline is built on — so when a command fails, its output IS
+-- stderr, and a `2>` target is somewhere to send it. Errors are the only thing
+-- that goes there; a command that succeeded has nothing for it.
+--
+-- `&>` is rewritten to `>` before tokenizing and never reaches here: both streams
+-- to one place is what already happens.
+local function takeRedirect(argv: { string }): ({ string }, string?, boolean, string?, boolean, string?)
 	local kept: { string } = {}
 	local target: string? = nil
 	local append = false
+	local errTarget: string? = nil
+	local errAppend = false
+	local inTarget: string? = nil
+	-- Which positions came out of quotes, tagged on by parseStatements. A quoted
+	-- `>` is a one-character ARGUMENT — `grep '>' f.luau` searches for it — and
+	-- reading it as an operator dropped the pattern and truncated the file being
+	-- searched, in silence. Same rule the METACHARACTERS gate applies to `<`.
+	local wasQuoted = (argv :: any).quoted or {}
 	local i = 1
 	while i <= #argv do
 		local arg = argv[i]
+		-- `glued` is always empty now that tokenize splits `>` off its own word,
+		-- and it is still read: this has to keep working on an argv assembled
+		-- anywhere other than the tokenizer, and a match that silently ignored
+		-- the tail would take the NEXT operand as the path instead.
 		local stream, arrow, glued = arg:match("^([12&]?)(>>?)(.*)$")
-		if arrow then
+		if arrow and wasQuoted[i] then
+			arrow = nil
+		end
+		if arg == "<" and not wasQuoted[i] then
+			-- `wc -l < f.luau`. The path is the next word; tokenize has already
+			-- split `<` off whatever it was glued to.
+			inTarget = argv[i + 1] or ""
+			i += 1
+		elseif arrow then
 			local path = glued
 			if path == "" then
 				path = argv[i + 1] or ""
 				i += 1
 			end
-			if stream ~= "2" and stream ~= "&" then
+			if stream == "2" then
+				errAppend = arrow == ">>"
+				errTarget = path
+			elseif stream ~= "&" then
 				append = arrow == ">>"
 				target = path
 			end
@@ -500,7 +568,7 @@ local function takeRedirect(argv: { string }): ({ string }, string?, boolean)
 		end
 		i += 1
 	end
-	return kept, target, append
+	return kept, target, append, errTarget, errAppend, inTarget
 end
 
 -- Bash commands with no DataModel equivalent. Naming them buys a fast, specific
@@ -533,7 +601,8 @@ local UNSUPPORTED: { [string]: string } = {
 	-- the run tool", which executes arbitrary Luau at plugin permission to do what
 	-- a pipe already does. curl and wget were on this list for the same reason
 	-- until they became commands.
-	awk = "no awk; `sed -n '10,40p'` prints a line range and `grep -A/-B/-C` gives context",
+	awk = "no awk; `cut -d: -f2` takes a column, `sed -n '10,40p'` a line range, " ..
+		"and `grep -A/-B/-C` gives context",
 	-- Named with the redirect for the same reason curl and wget were, back when
 	-- they were only on this list: an archive is reached for as the way to get a
 	-- library in, and there is a direct one. Deflate is not written here — a
@@ -544,7 +613,7 @@ local UNSUPPORTED: { [string]: string } = {
 		"scripts straight into the place, which is what a release zip was going to be for",
 	tar = "no archives here; see `unzip`",
 	xargs = "no xargs; `for f in $(grep -rl Foo); do ... $f; done` runs a command " ..
-		"per item, and a filter can be piped straight into grep/head/tail/wc/sort/uniq/sed/tr",
+		"per item, and a filter can be piped straight into grep/head/tail/wc/sort/uniq/cut/sed/tr",
 	-- A loop is claimed as a whole pipeline stage, so `for` never reaches here as
 	-- a command. `do` and `done` still can, stranded by a loop with no `for`, and
 	-- "unknown command" would print the entire command list beside each.
@@ -582,9 +651,49 @@ end
 -- what stops a pipeline; `unmatched` means "the answer was no", which only
 -- `&&` and `||` read.
 local unmatched = false
+-- Set alongside it when the returned string is PROSE about the miss rather than
+-- the answer itself — "no matches", and the `grep -i` nudge beside it.
+--
+-- Real grep prints nothing at all on a miss and says so through the exit status.
+-- There is no exit status here and no stderr, so the prose is the only way a
+-- person reading /sh learns anything happened — but a pipe is not a person, and
+-- `grep foo . | wc -l` answering 1 is the worst failure in this file: a wrong
+-- number, produced by the message that was supposed to be helpful, with nothing
+-- in the output to say so. `grep foo . | grep bar` was searching the words "no
+-- matches".
+--
+-- So: prose for the last stage, nothing for the ones feeding another command.
+-- runPipeline is where that split is made, because only it knows which stage is
+-- which. NOT every miss is prose — `grep -c` returning "0" found nothing AND is
+-- the number that was asked for, so it sets `unmatched` directly and never
+-- comes through here.
+local missText = false
 local function miss(message: string): string
 	unmatched = true
+	missText = message ~= ""
 	return message
+end
+
+-- Prose WITHOUT the false status. The two are separable and have to be: `ls` on
+-- an empty container SUCCEEDED — bash exits 0 and prints nothing — so
+-- `ls empty && echo ok` must run the echo, while the sentence explaining the
+-- emptiness must still not reach `wc -l` as if it were a row.
+--
+-- Folding this into miss() was a real regression, caught by asking what `&&`
+-- does after it: every empty directory would have read as a failed command.
+local function prose(message: string): string
+	missText = message ~= ""
+	return message
+end
+
+-- A note ABOUT the output rather than a line of it: "… 12 more matches", "… 30
+-- empty services not shown". Same problem as miss prose and the same answer —
+-- it is stderr with nowhere to go, so it rides on stdout for the last stage of
+-- a pipeline and is dropped for the rest. Appended by runPipeline, once, rather
+-- than by each handler, so there is one place that knows the rule.
+local trailer: string? = nil
+local function note(text: string)
+	trailer = text
 end
 
 local function applyRedirect(self: any, path: string, content: string, append: boolean): string
@@ -869,6 +978,20 @@ local SPECS: { [string]: FlagSpec } = {
 		long = { ["--no-create"] = "bool:-c", ["--date"] = "value:-d",
 			["--reference"] = "value:-r", ["--verbose"] = "bool:-v" },
 		why = { ["-h"] = NO_LINKS },
+	},
+	cut = {
+		bool = "s", value = "dfcb",
+		long = { ["--delimiter"] = "value:-d", ["--fields"] = "value:-f",
+			["--characters"] = "value:-c", ["--bytes"] = "value:-b",
+			["--only-delimited"] = "bool:-s", ["--output-delimiter"] = "value" },
+		-- -n and --complement are NOT declared. GNU accepts -n and ignores it,
+		-- but a letter declared and never read is the `rm -rf` bug in miniature,
+		-- and the rule here is that an unimplemented flag says so.
+		why = {
+			["-z"] = NO_NUL,
+			["-n"] = "keeps a multibyte character whole, and .Source is a byte " ..
+				"string — -b and -c are the same thing here, so there is nothing to split",
+		},
 	},
 	tr = {
 		bool = "cCdst",
@@ -1220,12 +1343,20 @@ local function lsSort(rows: { any }, flags: { [string]: boolean })
 			return -(Fs.mtime(row.inst) or -math.huge)
 		end
 	end
+	-- Computed ONCE per row, not inside the comparator. mtime is a table lookup
+	-- and did not care, but Fs.size on a container is #GetDescendants() — a walk
+	-- of the whole subtree — and table.sort calls its comparator O(n log n)
+	-- times. `ls -S /Workspace` on a place with a few thousand parts was walking
+	-- those parts thousands of times to order one listing, which made the flag
+	-- that exists to find the big thing the slowest command in the shell.
+	if rank then
+		for _, row in ipairs(rows) do
+			row.rank = rank(row)
+		end
+	end
 	table.sort(rows, function(a, b)
-		if rank then
-			local ra, rb = rank(a), rank(b)
-			if ra ~= rb then
-				return ra < rb
-			end
+		if rank and a.rank ~= b.rank then
+			return a.rank < b.rank
 		end
 		return a.name < b.name
 	end)
@@ -1425,18 +1556,29 @@ HANDLERS.ls = function(self, argv)
 		return fail("ls", walkErr)
 	end
 	if #out == 0 and emptyLabel then
-		return string.format("(%s) %s", glob and "no matches" or "empty", emptyLabel)
+		-- Prose either way, so `ls empty | wc -l` answers 0 rather than 1 for the
+		-- sentence saying it is empty — but the STATUS differs, and bash is where
+		-- the difference comes from. An empty directory is a success (exit 0); a
+		-- glob that matched nothing is an error (exit 2). Same sentence, and
+		-- `ls empty && echo ok` has to run the echo.
+		local text = string.format("(%s) %s", glob and "no matches" or "empty", emptyLabel)
+		return if glob then miss(text) else prose(text)
 	end
+	-- Both of these say what was left out and how to see it, so an absence is
+	-- never something the reader has to infer from a count that does not add up.
+	-- Notes rather than rows, so `ls | wc -l` counts entries and not commentary.
+	local notes: { string } = {}
 	if skipped > 0 then
-		out[#out + 1] = string.format("… %d more from %q on (narrow it: `ls %s/A*`, or `ls | grep <name>`)",
+		notes[#notes + 1] = string.format("… %d more from %q on (narrow it: `ls %s/A*`, or `ls | grep <name>`)",
 			skipped, firstDropped or "?", target or ".")
 	end
-	-- Says what was left out and how to see it, so an absence is never something
-	-- the reader has to infer from a count that does not add up.
 	if hidden > 0 then
-		out[#out + 1] = string.format(
+		notes[#notes + 1] = string.format(
 			"… %d empty services not shown (`ls -a /` lists them; each is still reachable by name)",
 			hidden)
+	end
+	if #notes > 0 then
+		note(table.concat(notes, "\n"))
 	end
 	return table.concat(out, "\n")
 end
@@ -1565,21 +1707,58 @@ HANDLERS.cat = function(self, argv, stdin)
 	end
 	operands = expandGlobs(self, operands)
 	if #operands <= 1 then
-		local s, err = self:cat(operands[1])
+		local s, err, truncated = self:cat(operands[1])
 		if not s then
 			return fail("cat", err)
 		end
+		-- A note, not a line of the file: see runPipeline. Appended, the marker was
+		-- counted by `cat big.luau | wc -l`; dropped, the truncation would vanish.
+		if truncated then
+			note(truncated)
+		end
 		return plain and s or catRender(s, flags)
 	end
-	-- Real cat concatenates; with several scripts a header is the only way to
-	-- tell where one ended.
+	-- Concatenated, with nothing between them, because that is what cat is named
+	-- for. It used to print head's `==> path <==` banner over each file, which is
+	-- wrong twice: no cat anywhere does it, and `cat a b > merged.luau` wrote the
+	-- banners INTO the script. A model reading the output could not tell whether
+	-- the header came from the file or from the shell.
+	--
+	-- The banner still exists where it belongs — `head -n 999999 a b` and `tail -n
+	-- +1 a b` both print it, from joinFiles — so nothing that wanted it lost it.
+	--
+	-- NOTHING between them: cat concatenates bytes, so a file not ending in a
+	-- newline really does join the next one's first line, and that is the answer.
+	-- Anything else here is this shell inventing a file's contents.
+	--
+	-- An unreadable file says so inline and the rest still concatenate, which is
+	-- cat's own behaviour minus the stream: cat sends that line to stderr and
+	-- carries on. `fail()` is deliberately NOT called — it stops the pipeline, and
+	-- `cat good.luau missing.luau | wc -l` has to still count the good one. The
+	-- cost is that the message travels as data, the same seam as every other
+	-- in-band status here; see FIDELITY.md §3.1. It gets its own newline because,
+	-- unlike a file, it is not text anyone chose the ending of.
 	local parts: { string } = {}
+	local notes: { string } = {}
 	for _, operand in ipairs(operands) do
-		local s, err = self:cat(operand)
-		local body = s and (plain and s or catRender(s, flags)) or ("cat: " .. tostring(err))
-		parts[#parts + 1] = string.format("==> %s <==\n%s", operand, body)
+		local s, err, truncated = self:cat(operand)
+		if truncated then
+			notes[#notes + 1] = truncated
+		end
+		if not s then
+			parts[#parts + 1] = "cat: " .. tostring(err) .. "\n"
+		elseif plain then
+			parts[#parts + 1] = s
+		else
+			-- catRender works line-wise and drops the trailing newline, so one goes
+			-- back on or the next file starts on the last line of this one.
+			parts[#parts + 1] = catRender(s, flags) .. "\n"
+		end
 	end
-	return table.concat(parts, "\n\n")
+	if #notes > 0 then
+		note(table.concat(notes, "\n"))
+	end
+	return table.concat(parts)
 end
 
 -- stat -c's format specifiers, limited to the fields that actually exist. %U/%G
@@ -1916,7 +2095,17 @@ HANDLERS.du = function(self, argv)
 
 	local lines: { string } = {}
 	local total = 0
+	-- The only recursive walk here that did not breathe. find, grep, tree and
+	-- `ls -R` all yield a frame when they have held the thread for one; du held
+	-- it for the whole walk, and it is the walk with the largest allocation per
+	-- node — `#GetDescendants()` builds a table holding a pointer to every
+	-- instance in the subtree to return one integer. On a big place that is a
+	-- multi-hundred-thousand-entry table per node with no frame in between for
+	-- the collector to run in, which is the shape that runs Studio out of memory
+	-- rather than merely making it slow.
+	local breathe = Fs.breather()
 	local function walk(inst: Instance, depth: number): number
+		breathe()
 		-- GetDescendants already gives the subtree size, so the recursion below is
 		-- only for the rows that get PRINTED. Recursing past maxDepth as well made
 		-- a bare `du /` walk the whole DataModel to produce one line of output.
@@ -1991,6 +2180,7 @@ local FIND_VALUE_TESTS: { [string]: boolean } = {
 	["-regex"] = true, ["-iregex"] = true, ["-type"] = true, ["-size"] = true,
 	["-newer"] = true, ["-mmin"] = true, ["-mtime"] = true, ["-inum"] = true,
 	["-perm"] = true, ["-maxdepth"] = true, ["-mindepth"] = true,
+	["-tag"] = true,
 }
 
 -- Named rather than skipped. Silently ignoring -maxdepth meant returning the
@@ -2056,7 +2246,18 @@ HANDLERS.find = function(self, argv)
 			-- reasonably search for `*.luau`, and no instance name has ever
 			-- contained that suffix, so matching only .Name meant the most natural
 			-- search in the whole harness silently returned nothing.
-			local matches = nameMatcher(value :: string)
+			--
+			-- `exact`, because that is what -name means: GNU matches the name
+			-- against a glob, and a glob with no wildcard matches one string.
+			-- Loose was the old behaviour and it over-reported — `-name Main` also
+			-- returned `mainframe` and `Remainder`, extra hits indistinguishable
+			-- from real ones. `find Handler`, the bare shorthand below, is still
+			-- forgiving; that one is this harness's own and is meant to be.
+			--
+			-- -i is finally the difference between the two. They were the same
+			-- function before, so one of the pair was a lie either way you read it.
+			local matches = nameMatcher(value :: string,
+				{ exact = true, caseSensitive = arg == "-name" })
 			add(function(inst)
 				return Fs.matchesName(inst, matches)
 			end)
@@ -2151,6 +2352,16 @@ HANDLERS.find = function(self, argv)
 				-- nor `-mmin +10`. It is unranked, not old.
 				return when ~= nil and compare((now - when) / scale)
 			end)
+		elseif arg == "-tag" then
+			-- CollectionService tags: a first-class DataModel concept that had no
+			-- spelling anywhere in the shell, so the only way to find everything
+			-- tagged Enemy was to already know where it was. Exact, not a glob:
+			-- HasTag takes the string, and a tag nobody has added is not a typo
+			-- worth guessing at.
+			local wanted = value :: string
+			add(function(inst)
+				return Fs.hasTag(inst, wanted)
+			end)
 		elseif arg == "-inum" then
 			local wanted = value :: string
 			add(function(inst)
@@ -2211,8 +2422,8 @@ HANDLERS.find = function(self, argv)
 			return fail("find", arg .. " " .. FIND_UNSUPPORTED[arg])
 		elseif arg:sub(1, 1) == "-" and #arg > 1 and not arg:match("^%-%d") then
 			return fail("find", string.format("%s is not supported — find takes -name, " ..
-				"-iname, -path, -regex, -type, -size, -empty, -perm, -inum, -newer, " ..
-				"-mmin, -mtime, -maxdepth, -mindepth, -not, -o and -delete", arg))
+				"-iname, -path, -regex, -type, -size, -empty, -perm, -inum, -tag, " ..
+				"-newer, -mmin, -mtime, -maxdepth, -mindepth, -not, -o and -delete", arg))
 		else
 			bare[#bare + 1] = arg
 		end
@@ -2334,8 +2545,24 @@ HANDLERS.find = function(self, argv)
 	if deleting then
 		-- Deepest first, so removing a parent cannot invalidate a child still on
 		-- the list. Destroy() takes the subtree with it.
+		--
+		-- Depths are measured once. instancePath walks to the root building a
+		-- string, and calling it from inside the comparator did that twice per
+		-- comparison — O(n log n) walks to order at most MAX_LIST entries. Real
+		-- depth rather than path length, too: length was a proxy that a long name
+		-- beside a deep path could invert, and the one thing this ordering has to
+		-- guarantee is that a child is never left behind its destroyed parent.
+		local depth: { [Instance]: number } = {}
+		for _, inst in ipairs(found) do
+			local levels, current = 0, inst.Parent
+			while current do
+				levels += 1
+				current = current.Parent
+			end
+			depth[inst] = levels
+		end
 		table.sort(found, function(a, b)
-			return #instancePath(a) > #instancePath(b)
+			return depth[a] > depth[b]
 		end)
 		local removed: { string } = {}
 		for _, inst in ipairs(found) do
@@ -2354,8 +2581,8 @@ HANDLERS.find = function(self, argv)
 		lines[#lines + 1] = instancePath(inst) .. "  [" .. inst.ClassName .. "]"
 	end
 	if skipped > 0 then
-		lines[#lines + 1] = string.format("… %d more matches (narrow the path or the pattern)",
-			skipped)
+		-- A note, not a result row: `find / -name '*.luau' | wc -l` counts files.
+		note(string.format("… %d more matches (narrow the path or the pattern)", skipped))
 	end
 	return table.concat(lines, "\n")
 end
@@ -2894,7 +3121,12 @@ HANDLERS.grep = function(self, argv, stdin)
 
 	if #hits == 0 then
 		if flags["-c"] then
-			return miss("0")    -- a count, since that is what was asked for
+			-- Found nothing AND the number that was asked for, so `unmatched` is set
+			-- by hand rather than through miss(): a miss's text is suppressed when
+			-- something is downstream, and `grep -c X . | sort -n` must still get
+			-- its zero. The one place where "nothing found" is legitimately data.
+			unmatched = true
+			return "0"
 		end
 		-- The nudge that used to live here explained that grep matched literal
 		-- text and pointed at -E. Both halves are gone: plain grep is BRE now, so
@@ -2961,7 +3193,9 @@ HANDLERS.grep = function(self, argv, stdin)
 	local body = formatHits(hits, showPath, true, before + after > 0)
 	local skipped = (hits :: any).skipped
 	if skipped then
-		body ..= string.format("\n… %d more matches (narrow the path or the pattern)", skipped)
+		-- A note, not a match: `grep -rn X . | wc -l` used to answer 101 for a
+		-- hundred hits, because the line saying so was counted as one of them.
+		note(string.format("… %d more matches (narrow the path or the pattern)", skipped))
 	end
 	return body
 end
@@ -4011,6 +4245,146 @@ HANDLERS.diff = function(self, argv)
 		end
 	end
 	return table.concat(out, "\n")
+end
+
+-- cut: the field-splitting that had no spelling here at all.
+--
+-- The gap it fills is narrow and real. `awk` is refused, and its stand-in was
+-- "use sed -n for a line range" — which answers a different question: a range
+-- picks ROWS, and every `awk '{print $2}'` anyone writes wants a COLUMN. There
+-- was no way to take the second field of anything, so a model reaching for one
+-- had to fall back to `run`, which executes arbitrary Luau to do what a filter
+-- does.
+--
+-- LIST syntax is cut's own: `1`, `1,3`, `2-`, `-3`, `2-4`, in any combination,
+-- and the output is always in FILE order with duplicates collapsed, never in the
+-- order written. `cut -f3,1` printing field 1 then 3 is not a quirk to preserve
+-- compatibility with; it is what cut does, and a model that expected reordering
+-- gets the same answer it would get anywhere else.
+local function parseList(spec: string): ({ { number } }?, string?)
+	if spec == "" then
+		return nil, "needs a list, as `-f1`, `-f2,4` or `-f2-`"
+	end
+	local ranges: { { number } } = {}
+	for part in spec:gmatch("[^,]+") do
+		local lo, hi = part:match("^(%d*)%-(%d*)$")
+		if lo then
+			-- `-3` is 1..3 and `2-` is 2..end; `-` alone is every field, which cut
+			-- rejects as ambiguous and so does this.
+			if lo == "" and hi == "" then
+				return nil, string.format("%q is not a range — write `-3`, `2-` or `2-4`", part)
+			end
+			ranges[#ranges + 1] = { tonumber(lo) or 1, tonumber(hi) or math.huge }
+		else
+			local single = tonumber(part)
+			if not single or single < 1 or single % 1 ~= 0 then
+				return nil, string.format("%q is not a field number — they start at 1", part)
+			end
+			ranges[#ranges + 1] = { single, single }
+		end
+	end
+	return ranges, nil
+end
+
+local function inList(ranges: { { number } }, index: number): boolean
+	for _, range in ipairs(ranges) do
+		if index >= range[1] and index <= range[2] then
+			return true
+		end
+	end
+	return false
+end
+
+HANDLERS.cut = function(self, argv, stdin)
+	local flags, values, operands = parse(argv)
+	-- Exactly one of -f/-c/-b, as cut requires. Defaulting to one of them would
+	-- make `cut 2 f.luau` silently pick an interpretation nobody asked for.
+	local mode: string? = nil
+	for _, letter in ipairs({ "-f", "-c", "-b" }) do
+		if values[letter] then
+			if mode then
+				return fail("cut", "only one of -f, -c or -b at a time")
+			end
+			mode = letter
+		end
+	end
+	if not mode then
+		return fail("cut", "needs -f (fields), -c (characters) or -b (bytes), " ..
+			"as `cut -d: -f2` or `cut -c1-40`")
+	end
+	local ranges, listErr = parseList(valueOf(values, mode) :: string)
+	if not ranges then
+		return fail("cut", listErr)
+	end
+
+	-- TAB, which is cut's default and the one worth stating: a model writing
+	-- `cut -f2` over space-separated text gets the whole line back and no error,
+	-- exactly as it would anywhere else. -d is how you say otherwise.
+	local delimiter = valueOf(values, "-d") or "\t"
+	if mode == "-f" and #delimiter ~= 1 then
+		return fail("cut", "-d takes a single character")
+	end
+	-- -s drops lines with no delimiter at all; without it cut passes them
+	-- through whole, which is its documented behaviour and surprises people.
+	local skipUndelimited = flags["-s"] == true
+	local outputDelimiter = valueOf(values, "--output-delimiter") or delimiter
+
+	local files, inputErr = inputs(self, expandGlobs(self, operands), stdin)
+	if not files then
+		return fail("cut", inputErr)
+	end
+
+	local parts: { { path: string?, body: string } } = {}
+	for _, file in ipairs(files) do
+		local out: { string } = {}
+		for _, line in ipairs(splitLines(file.text)) do
+			if mode ~= "-f" then
+				-- -c and -b are the same thing here: .Source is a byte string and
+				-- there is no multibyte-aware column to be had, so claiming they
+				-- differ would be inventing a distinction.
+				local picked: { string } = {}
+				for index = 1, #line do
+					if inList(ranges, index) then
+						picked[#picked + 1] = line:sub(index, index)
+					end
+				end
+				out[#out + 1] = table.concat(picked)
+			elseif not line:find(delimiter, 1, true) then
+				if not skipUndelimited then
+					out[#out + 1] = line
+				end
+			else
+				local fields: { string } = {}
+				-- A plain split, so an empty field between two delimiters is a real
+				-- field. This is where cut and awk part company and it is the whole
+				-- reason `cut -d:` works on `a::b`.
+				local from = 1
+				while true do
+					local at = line:find(delimiter, from, true)
+					if not at then
+						fields[#fields + 1] = line:sub(from)
+						break
+					end
+					fields[#fields + 1] = line:sub(from, at - 1)
+					from = at + 1
+				end
+				local picked: { string } = {}
+				for index, field in ipairs(fields) do
+					if inList(ranges, index) then
+						picked[#picked + 1] = field
+					end
+				end
+				out[#out + 1] = table.concat(picked, outputDelimiter)
+			end
+		end
+		parts[#parts + 1] = { path = file.path, body = table.concat(out, "\n") }
+	end
+	-- No `==> path <==` banner: cut is a filter, and coreutils prints none.
+	local rendered: { string } = {}
+	for _, part in ipairs(parts) do
+		rendered[#rendered + 1] = part.body
+	end
+	return table.concat(rendered, "\n")
 end
 
 HANDLERS.tr = function(self, argv, stdin)
@@ -5580,10 +5954,13 @@ Shell.COMMANDS = COMMANDS
 
 -- Shell metacharacters that survive tokenizing as their own token. Folding them
 -- into an argument silently is worse than saying they don't work. A QUOTED one
--- is exempt: `grep "<" f` is a pattern, not a redirection, which is what the
+-- is exempt: `grep "&" f` is a pattern, not a background job, which is what the
 -- quoted-position set from tokenize() is for.
+--
+-- `<` used to be in here. It is a real input redirection now, so the only thing
+-- left with no meaning is backgrounding.
 local METACHARACTERS: { [string]: boolean } = {
-	["<"] = true, ["&"] = true,
+	["&"] = true,
 }
 
 
@@ -5593,7 +5970,7 @@ local METACHARACTERS: { [string]: boolean } = {
 local STDIN_COMMANDS: { [string]: boolean } = {
 	cat = true, grep = true, egrep = true, fgrep = true,
 	head = true, tail = true, wc = true, sort = true, uniq = true,
-	sed = true, tr = true,
+	sed = true, tr = true, cut = true,
 }
 
 -- One command, already tokenized. `stdin` is a heredoc body or the previous
@@ -5604,7 +5981,7 @@ local STDIN_COMMANDS: { [string]: boolean } = {
 local runLoopStage: (any, { string }) -> (string, boolean)
 
 local function runCommand(self: any, argv: { string }, stdin: string?): (string, boolean)
-	failed, unmatched = false, false
+	failed, unmatched, missText, trailer = false, false, false, nil
 	-- Before takeRedirect, which would otherwise steal a `>` out of the loop's
 	-- BODY: `for f in a; do echo $f > out.luau; done` is a redirect per
 	-- iteration, not one on the loop.
@@ -5614,7 +5991,28 @@ local function runCommand(self: any, argv: { string }, stdin: string?): (string,
 		end
 		return runLoopStage(self, argv)
 	end
-	local args, redirect, append = takeRedirect(argv)
+	local args, redirect, append, errRedirect, errAppend, inRedirect = takeRedirect(argv)
+	-- `< path` replaces stdin. A pipe on the left loses to it, which is bash's
+	-- rule and the only one that can be right: the redirect is the more specific
+	-- instruction, and it was written after the pipe.
+	--
+	-- Read as a FILE — resolve, then its source — rather than through Terminal:cat,
+	-- which renders a non-script's properties. `wc -l < /Workspace` counting the
+	-- lines of a property dump is a number that means nothing.
+	if inRedirect then
+		if inRedirect == "" then
+			return fail("bash", "`<` needs a path to read from"), false
+		end
+		local target, resolveErr = self:resolve(inRedirect)
+		if not target then
+			return fail("bash", resolveErr), false
+		end
+		local source = getSource(target)
+		if not source then
+			return fail("bash", "not a script: " .. instancePath(target)), false
+		end
+		stdin = source
+	end
 	if #args == 0 then
 		if redirect and redirect ~= DEV_NULL then
 			return applyRedirect(self, redirect, stdin or "", append), not failed
@@ -5639,7 +6037,7 @@ local function runCommand(self: any, argv: { string }, stdin: string?): (string,
 
 	local cmd = args[1]
 	if stdin and not STDIN_COMMANDS[cmd] then
-		return fail("bash", cmd .. " does not read input — pipe into cat, grep, head, tail, wc, sort, uniq, sed or tr"), false
+		return fail("bash", cmd .. " does not read input — pipe into cat, grep, head, tail, wc, sort, uniq, cut, sed or tr"), false
 	end
 	-- Before the handler, so an unknown flag fails on its own terms instead of
 	-- surviving as an ignored flag and a stray positional argument.
@@ -5664,6 +6062,39 @@ local function runCommand(self: any, argv: { string }, stdin: string?): (string,
 	end
 
 	local ok = not (failed or unmatched)
+	-- `failed` means the output IS the error message, so a `2>` target is where
+	-- that message goes and stdout is left empty — which is what makes
+	-- `find /Nope -name x 2>/dev/null` finally quiet, and `cmd 2>err.luau` put the
+	-- reason somewhere readable. A command that did not fail has nothing to send:
+	-- `2>` is not allowed to eat a real answer.
+	if failed and errRedirect then
+		if errRedirect ~= DEV_NULL then
+			-- Written with `failed` cleared, so the only thing that can set it again
+			-- is this write, and a report of "could not save the error" is not
+			-- swallowed along with the error it was reporting.
+			local message = output
+			failed = false
+			local written = applyRedirect(self, errRedirect, message, errAppend)
+			if failed then
+				return written, false
+			end
+		end
+		output = ""
+		-- The two flags, set to what is now TRUE of this command rather than left
+		-- describing the moment before the redirect.
+		--
+		-- `failed` means "this errored and its output is the message". After the
+		-- message has been sent elsewhere that is no longer so — the output is
+		-- empty — and it is the reason runPipeline stops, which exists only to
+		-- keep an error from flowing on as data. With nothing to leak there is
+		-- nothing to stop for, and bash runs the rest of the pipeline anyway:
+		-- `find /Nope 2>/dev/null | wc -l` is 0, not an abandoned pipeline.
+		--
+		-- `unmatched` carries the false status onward, so `&&` still skips and
+		-- `||` still fires. Silencing an error must not make it look like success.
+		failed = false
+		unmatched = true
+	end
 	if redirect == DEV_NULL then
 		return "", ok        -- ran it, threw the output away
 	end
@@ -5681,7 +6112,14 @@ end
 local function runPipeline(self: any, stages: { { string } }, stdin: string?): (string, boolean)
 	local input = stdin
 	local output, ok = "", true
-	for _, stage in ipairs(stages) do
+	-- Trailers from EVERY stage, not just the last. They are this harness's
+	-- stderr, and in bash stderr reaches the terminal from any stage of a
+	-- pipeline while only stdout is piped onward. Dropping a non-final stage's
+	-- note would be worse than leaving it in the data: `cat big.luau | wc -l`
+	-- would answer 1000 with nothing anywhere to say the file has 3182 lines,
+	-- so the truncation would become invisible rather than merely mis-counted.
+	local notes: { string } = {}
+	for index, stage in ipairs(stages) do
 		output, ok = runCommand(self, stage, input)
 		-- Stops on an ERROR, never on a merely false status. There is no stderr
 		-- here, so an error message flowing on would be read as data — but a stage
@@ -5691,7 +6129,21 @@ local function runPipeline(self: any, stages: { { string } }, stdin: string?): (
 		if failed then
 			return output, false
 		end
+		if trailer then
+			notes[#notes + 1] = trailer
+		end
+		-- A miss's prose is not data, so a downstream stage gets nothing to read,
+		-- which is what real grep hands it. Not accumulated the way a trailer is:
+		-- "no matches" is grep's exit status spelled out, and bash prints nothing
+		-- at all for it — where a cap warning is a real thing that happened.
+		if index < #stages and missText then
+			output = ""
+		end
 		input = output
+	end
+	if #notes > 0 then
+		local tail = table.concat(notes, "\n")
+		output = if output == "" then tail else output .. "\n" .. tail
 	end
 	-- The pipeline's status is the LAST stage's, as bash has it.
 	return output, ok
@@ -5703,7 +6155,20 @@ local SEPARATORS: { [string]: boolean } = { [";"] = true, ["&&"] = true, ["||"] 
 
 type Statement = { joiner: string, stages: { { string } } }
 
+-- `quoted` is by position in `argv`, and the whole reason it is threaded this
+-- far is `takeRedirect`. A quoted `>` and an operator `>` are the same STRING by
+-- the time a stage is assembled, and telling them apart is not cosmetic:
+-- `grep '>' f.luau` used to lose its pattern to the redirect parser and write
+-- an empty f.luau — a command that searched for nothing, said nothing, and
+-- destroyed the file it was supposed to read.
+--
+-- Positions shift when argv is cut into stages, so the flag is copied onto each
+-- stage as it is built. It rides on the stage array the way `skipped` rides on
+-- a result list elsewhere here. Absent (a loop body rebuilt by expandVar) means
+-- "nothing known to be quoted", which is exactly the old behaviour rather than
+-- a new failure.
 local function parseStatements(argv: { string }): { Statement }
+	local wasQuoted = (argv :: any).quoted or {}
 	local statements: { Statement } = {}
 	local current: Statement = { joiner = ";", stages = { {} } }
 
@@ -5734,6 +6199,8 @@ local function parseStatements(argv: { string }): { Statement }
 			while i <= #argv do
 				local token = argv[i]
 				stage[#stage + 1] = token
+				;(stage :: any).quoted = (stage :: any).quoted or {}
+				;(stage :: any).quoted[#stage] = wasQuoted[i] or nil
 				if token == "for" then
 					depth += 1
 				elseif token == "done" then
@@ -5751,48 +6218,13 @@ local function parseStatements(argv: { string }): { Statement }
 			current.stages[#current.stages + 1] = {}
 		else
 			stage[#stage + 1] = arg
+			;(stage :: any).quoted = (stage :: any).quoted or {}
+			;(stage :: any).quoted[#stage] = wasQuoted[i] or nil
 		end
 		i += 1
 	end
 	flush()
 	return statements
-end
-
--- One token, written the way it would have to be written to survive tokenize
--- again. The echo used to join argv with plain spaces, so `grep -E 'a|b' f`
--- came back as `grep -E a|b f`: a line that means something else, and reads as
--- proof that the quotes were eaten before the search ran. They never were — the
--- tokenizer claims a quoted `|` before the pipeline split can see it, which the
--- tokenize cases above pin down — but the echo is all an agent has to go on, and
--- one that misrepresents its own input costs a turn on a workaround for a bug
--- that is not there. Same class of failure as a silently wrong answer.
-local function requote(token: string): string
-	if token ~= "" and not token:find("[%s'\"\\;|&]") then
-		return token
-	end
-	if not token:find("'") then
-		return "'" .. token .. "'"
-	end
-	-- Both kinds of quote in one token: double, with the four escapes that
-	-- DOUBLE_QUOTE_ESCAPES reads back.
-	return '"' .. token:gsub('[%$"\\`]', "\\%0") .. '"'
-end
-
-local function label(statement: Statement): string
-	local parts: { string } = {}
-	for _, stage in ipairs(statement.stages) do
-		-- Inside a loop group the `;` tokens are the loop's own punctuation, not
-		-- arguments, so quoting them would echo `do echo $f ';' done`. A QUOTED
-		-- `;` written as an argument inside a loop body is the one case this gets
-		-- wrong, and there is nothing here that takes one.
-		local loop = stage[1] == "for"
-		local rendered: { string } = {}
-		for _, token in ipairs(stage) do
-			rendered[#rendered + 1] = (loop and token == ";") and ";" or requote(token)
-		end
-		parts[#parts + 1] = table.concat(rendered, " ")
-	end
-	return table.concat(parts, " | ")
 end
 
 -- Run a statement list. `lastOk` seeds the `&&`/`||` chain, which matters when
@@ -5801,10 +6233,27 @@ end
 local function runStatements(self: any, statements: { Statement },
 	stdin: string?, lastOk: boolean): (string, boolean)
 	local outputs: { string } = {}
+	-- Whether the statement just run produced nothing but a miss's prose. Read by
+	-- the `||` branch below, and nowhere else.
+	local lastWasProse = false
 	for index, statement in ipairs(statements) do
 		local skip = (statement.joiner == "&&" and not lastOk)
 			or (statement.joiner == "||" and lastOk)
 		if not skip then
+			-- `grep X f || echo absent` is the idiomatic "is this missing?", and in
+			-- bash it prints exactly `absent`: grep's miss is an exit status, not
+			-- text. Here the miss carries prose, because a false status is
+			-- invisible to whoever is reading — but once the `||` branch actually
+			-- FIRES, that prose has been superseded by the fallback it triggered,
+			-- and printing `no matches` above `absent` is saying the same thing
+			-- twice in two vocabularies.
+			--
+			-- Only prose is dropped. A statement that produced real data and a
+			-- false status — `grep -c X f` returning "0" — keeps it, which is the
+			-- whole reason miss() and a bare `unmatched` are different things.
+			if statement.joiner == "||" and lastWasProse then
+				outputs[#outputs] = nil
+			end
 			-- `! pipeline` inverts the STATUS and nothing else, which is bash's
 			-- own reading of it. Newly useful rather than newly possible: while a
 			-- miss reported no status there was nothing worth inverting, and now
@@ -5834,9 +6283,29 @@ local function runStatements(self: any, statements: { Statement },
 				-- point, and returning the raw status would drop it.
 				return output, lastOk
 			end
-			-- With several commands the outputs need labelling, or there is no
-			-- telling which block came from which.
-			outputs[#outputs + 1] = string.format("$ %s\n%s", label(statement), output)
+			-- Concatenated, with nothing announcing which statement produced what.
+			-- `$ <command>` used to be printed over each block, on the reasoning
+			-- that several outputs need telling apart — but bash prints no such
+			-- thing, and the cost was paid on the commonest line there is:
+			-- `cd /Workspace && ls` came back as an empty labelled block for the
+			-- cd followed by a labelled listing, four lines of ceremony around one
+			-- answer, and `echo a; echo b` returned four lines where every shell on
+			-- earth returns two.
+			--
+			-- The label also carried a diagnostic — it re-quoted each token, so an
+			-- agent could see that `grep -E 'a|b'` had NOT had its quotes eaten.
+			-- That argument does not survive contact with when the label appeared:
+			-- only ever with two or more statements, and a single command, which is
+			-- where that worry actually arises, was never labelled at all. The
+			-- tokenizer cases above pin the same property down permanently, and
+			-- requote/label are gone with this.
+			--
+			-- Empty output contributes nothing, so a statement that printed
+			-- nothing leaves no blank line behind.
+			if output ~= "" then
+				outputs[#outputs + 1] = output
+			end
+			lastWasProse = missText and output ~= ""
 		end
 	end
 	return table.concat(outputs, "\n"), lastOk
@@ -6191,11 +6660,17 @@ function runLine(self: any, line: string?, depth: number): (string, boolean)
 	end
 	for index, arg in ipairs(argv) do
 		if METACHARACTERS[arg] and not quoted[index] then
-			return string.format("bash: %s is not supported — no input redirection or " ..
-				"backgrounding. `|` pipes, `;` `&&` `||` chain, `>` writes to a script.", arg), false
+			return string.format("bash: %s is not supported — nothing here runs in the " ..
+				"background, and there is no job table to put it in. `|` pipes, " ..
+				"`;` `&&` `||` chain, `>` writes and `<` reads.", arg), false
 		end
 	end
 
+	-- Carried on the array rather than as a parameter, so it survives runTokens
+	-- and runStatements without either of them having to know about it, and so a
+	-- loop body rebuilt by expandVar simply arrives without one. parseStatements
+	-- reads it off here and copies it per stage.
+	;(argv :: any).quoted = quoted
 	return runTokens(self, argv, stdin, true)
 end
 
@@ -6227,6 +6702,26 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		-- claimed was broken; it never was, and a regression here would break
 		-- every `grep -E` alternation, so it is worth pinning down.
 		{ line = 'grep -E "a|b" /', want = { "grep", "-E", "a|b", "/" } },
+		-- A redirection operator delimits a word whether or not it is glued to
+		-- one. All four spellings below are the same command in bash; here the
+		-- two glued ones used to tokenize as ordinary words, so `echo hi>f.luau`
+		-- printed `hi>f.luau` and wrote nothing at all.
+		{ line = "echo hi>f.luau", want = { "echo", "hi", ">", "f.luau" } },
+		{ line = "echo hi> f.luau", want = { "echo", "hi", ">", "f.luau" } },
+		{ line = "echo hi >f.luau", want = { "echo", "hi", ">", "f.luau" } },
+		{ line = "echo a>>b", want = { "echo", "a", ">>", "b" } },
+		-- ...but a bare 1 or 2 in front of the arrow belongs to the OPERATOR.
+		-- Split off as its own word, `find x 2>/dev/null` would search for an
+		-- instance named "2" and send the real output to the bit bucket.
+		{ line = "find x 2>/dev/null", want = { "find", "x", "2>", "/dev/null" } },
+		{ line = "echo 1>out.luau", want = { "echo", "1>", "out.luau" } },
+		-- A QUOTED digit is data, not a stream number.
+		{ line = 'echo "2">f.luau', want = { "echo", "2", ">", "f.luau" } },
+		-- `<` delimits a word on the same rule. It was refused outright before,
+		-- so `wc -l < f` — the reflexive spelling — failed the whole line.
+		{ line = "wc -l < f.luau", want = { "wc", "-l", "<", "f.luau" } },
+		{ line = "wc -l <f.luau", want = { "wc", "-l", "<", "f.luau" } },
+		{ line = "sort <a.luau >b.luau", want = { "sort", "<", "a.luau", ">", "b.luau" } },
 		-- Inside double quotes a backslash only escapes " \ $ and `. Eating it
 		-- indiscriminately turned `"^\t###"` into `^t###`, so the search ran
 		-- against a pattern nobody wrote and returned a confident "no matches".
@@ -6349,6 +6844,29 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		if nameMatcher(case.pattern)(case.name) ~= case.want then
 			return false, string.format("nameMatcher(%q)(%q) should be %s",
 				case.pattern, case.name, tostring(case.want))
+		end
+	end
+	-- ...and under `exact`, which is what `find -name` uses, a wildcard-free
+	-- pattern is the WHOLE name. The loose form over-reports, and its extra hits
+	-- look exactly like real ones, which is why the two forms exist separately.
+	for _, case in ipairs({
+		{ pattern = "Handler", name = "DamageHandler", want = false },
+		{ pattern = "Main", name = "mainframe", want = false },
+		{ pattern = "Main", name = "Remainder", want = false },
+		{ pattern = "Main", name = "Main", want = true },
+		{ pattern = "*.luau", name = "Main.luau", want = true },
+		{ pattern = "Main*", name = "MainMenu", want = true },
+		-- caseSensitive is the -name / -iname difference, and the only one.
+		{ pattern = "main", name = "Main", want = true },
+		{ pattern = "main", name = "Main", sensitive = true, want = false },
+		{ pattern = "Main", name = "Main", sensitive = true, want = true },
+		}) do
+		local matches = nameMatcher(case.pattern,
+			{ exact = true, caseSensitive = case.sensitive })
+		if matches(case.name) ~= case.want then
+			return false, string.format(
+				"nameMatcher(%q, exact, sensitive=%s)(%q) should be %s",
+				case.pattern, tostring(case.sensitive == true), case.name, tostring(case.want))
 		end
 	end
 
@@ -6497,6 +7015,19 @@ function Shell.selfTest(probe: any): (boolean, string?)
 	mixed.Name = "Mixed"
 	mixed.Source = "B\na\n"
 	mixed.Parent = textFixture
+	-- Delimited columns for cut. Colons rather than tabs so the fixture is
+	-- readable here, and an EMPTY middle field on the MIDDLE row, because a plain
+	-- split and a whitespace-collapsing one disagree about exactly that and cut
+	-- is the one that keeps it.
+	--
+	-- Three rows, not two, on purpose: with the empty field on the last row the
+	-- result ends in an empty line, and a trailing empty line is exactly what the
+	-- no-trailing-newline convention cannot represent (see FIDELITY.md §3.6). The
+	-- assertion would then be pinning that ambiguity rather than cut's behaviour.
+	local columns = Instance.new("ModuleScript")
+	columns.Name = "Columns"
+	columns.Source = "a:b:c\nd::f\ng:h:i\n"
+	columns.Parent = textFixture
 	-- A line built to make a nested quantifier blow up: every prefix of the a's
 	-- can be split between the inner and outer loop, and the final `!` means no
 	-- arrangement ever satisfies `$`. Unbounded, this is a frozen Studio.
@@ -6613,18 +7144,22 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		{ line = "grep -q alpha Sample.luau", want = "", why = "grep -q prints nothing" },
 		{ line = "grep -h alpha Sample.luau", want = "1: alpha", why = "grep -h drops the path" },
 
-		-- With several statements the echo is a RECONSTRUCTION from argv, so it has
-		-- to put the quoting back. Joined with plain spaces it printed `grep -E
-		-- alpha|beta`, and that echo — not the search, which ran correctly — is
-		-- what two separate bug reports read as the shell eating quotes.
+		-- Several statements concatenate, exactly as bash does, with nothing
+		-- announcing which produced what. The quoted `|` still reaches grep as one
+		-- token — that is the tokenizer's job and the cases above pin it down.
 		{ line = "echo one; grep -c -E 'alpha|beta' Sample.luau",
-		  want = "$ echo one\none\n$ grep -c -E 'alpha|beta' Sample.luau\n2",
+		  want = "one\n2",
 		  why = "the echo re-quotes what tokenize took apart" },
 
 		-- cat display flags.
 		{ line = "cat -n Cased.luau", want = "     1\tHumanoid\n     2\thumanoid",
 		  why = "cat -n numbers lines" },
 		{ line = "cat -E Cased.luau", want = "Humanoid$\nhumanoid$", why = "cat -E marks line ends" },
+		-- cat CONCATENATES. It used to print head's `==> path <==` banner over each
+		-- file, which no cat does and which `cat a b > merged.luau` wrote into the
+		-- script. The banner still exists on head/tail, where it belongs.
+		{ line = "cat Cased.luau Nums.luau", want = "Humanoid\nhumanoid\n10\n2\n30\n",
+		  why = "cat concatenates with no header between files" },
 
 		-- sort/uniq beyond -r and -u.
 		{ line = "sort -n Nums.luau", want = "2\n10\n30", why = "sort -n is numeric, not lexical" },
@@ -6709,11 +7244,11 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		-- nil global: `find -name` threw instead of matching.
 		-- Counted rather than listed: find walks GetChildren() order, so asserting
 		-- the exact list would pin creation order rather than the match.
-		{ line = "find . -name '*.luau' | wc -l", want = "6",
+		{ line = "find . -name '*.luau' | wc -l", want = "7",
 		  why = "find -name matches the .luau display name" },
 		-- `ls` only prints .luau, but resolve accepts `cat Main.lua`, so a filter
 		-- that refused .lua had the harness contradicting itself.
-		{ line = "find . -name '*.lua' | wc -l", want = "6",
+		{ line = "find . -name '*.lua' | wc -l", want = "7",
 		  why = "find -name matches .lua for the same scripts" },
 		{ line = "grep -rl beta . --include=*.lua", want = "/Sample",
 		  why = "--include=*.lua filters the same scripts as *.luau" },
@@ -6721,6 +7256,97 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		  why = "--exclude=*.lua excludes them too" },
 		{ line = "find . -name Sample", want = "/Sample  [ModuleScript]",
 		  why = "find -name matches the real name" },
+		-- -name is a GLOB, so a wildcard-free pattern is the whole name. It used
+		-- to be a case-insensitive substring, which quietly returned more than was
+		-- asked for, and the extra hits looked exactly like real ones.
+		{ line = "find . -name ample", want = "no matches",
+		  why = "-name is not a substring search" },
+		{ line = "find . -name sample", want = "no matches",
+		  why = "-name is case-sensitive" },
+		{ line = "find . -iname sample", want = "/Sample  [ModuleScript]",
+		  why = "-iname is the case-insensitive one, and now the only one" },
+		-- The bare form is this harness's own shorthand and stays forgiving.
+		{ line = "find ample", want = "/Sample  [ModuleScript]",
+		  why = "`find <pattern>` is still a loose substring search" },
+
+		-- A miss is PROSE, and prose is not data. `no matches` used to flow down
+		-- the pipe as if it were a result, so the single most natural way to ask
+		-- "how many?" answered 1 for none — a wrong number produced by the message
+		-- that exists to be helpful, with nothing in the output to say so.
+		{ line = "grep zzznope . | wc -l", want = "0",
+		  why = "a miss feeds the next stage nothing, the way real grep does" },
+		{ line = "find . -name zzznope | wc -l", want = "0",
+		  why = "find's miss is prose too" },
+		{ line = "grep zzznope Sample.luau", want = "no matches",
+		  why = "...but the last stage still says so, since there is no stderr" },
+		-- A fired `||` supersedes the prose that fired it. bash prints exactly
+		-- `absent` here — grep's miss is an exit status, not text — and saying
+		-- "no matches" above it is the same fact twice in two vocabularies.
+		{ line = "grep zzznope Sample.luau || echo absent", want = "absent",
+		  why = "a fired || replaces the miss prose that triggered it" },
+		-- ...but only PROSE is dropped. A false status carrying real data keeps
+		-- it, which is the whole reason miss() and a bare `unmatched` differ.
+		{ line = "grep -c zzznope Sample.luau || echo absent", want = "0\nabsent",
+		  why = "grep -c's zero is data and survives the fallback" },
+		-- The one miss that IS data: -c was asked for a number and 0 is the
+		-- number. Suppressing it would break `grep -c X . | sort -n`.
+		{ line = "grep -c zzznope Sample.luau | wc -l", want = "1",
+		  why = "grep -c's zero is the answer, not a note about it" },
+		-- An empty listing is prose for the same reason a miss is. `ls empty | wc -l`
+		-- has to answer 0, not 1 for the sentence saying it is empty.
+		{ line = "ls Sample.luau | wc -l", want = "0",
+		  why = "an empty listing feeds the next stage nothing" },
+		{ line = "ls Sample.luau", want = "(empty) /Sample [ModuleScript]",
+		  why = "...and still names what it resolved when nothing is downstream" },
+
+		-- A quoted `>` is a one-character pattern. Read as a redirect it took the
+		-- path with it, so this searched for nothing and TRUNCATED the file it was
+		-- pointed at — a silent wrong answer that also destroyed data.
+		{ line = "grep '>' Sample.luau", want = "no matches",
+		  why = "a quoted > is a pattern, not a redirection" },
+
+		-- `2>` used to be recognised and thrown away, so the most reflexive way
+		-- there is to quiet a probe did nothing and the noise stayed in the
+		-- output. `failed` already means "the output IS the error message", so
+		-- there was always somewhere to send it.
+		{ line = "cat nosuchscript.luau 2>/dev/null", want = "",
+		  why = "2>/dev/null discards a failure's message" },
+
+		-- `< path` replaces stdin. It used to be refused by the metacharacter
+		-- gate, which failed the whole line rather than the redirect, so the most
+		-- reflexive way to ask "how long is this file" did not work at all.
+		{ line = "wc -l < Sample.luau", want = "5", why = "< reads a file as stdin" },
+		{ line = "sort < Nums.luau | head -1", want = "10",
+		  why = "< composes with a pipe on its right" },
+		-- The redirect wins over a pipe feeding the same command, as in bash.
+		{ line = "echo zzz | wc -l < Cased.luau", want = "2",
+		  why = "< overrides a pipe's stdin" },
+		-- A quoted one is a pattern, exactly as with `>`.
+		{ line = "grep '<' Sample.luau", want = "no matches",
+		  why = "a quoted < is a pattern, not a redirection" },
+
+		-- cut. Taking a COLUMN had no spelling here at all before: awk is refused
+		-- and its stand-in was `sed -n`, which picks rows, not fields.
+		{ line = "cut -d: -f2 Columns.luau", want = "b\n\nh", why = "cut takes a field" },
+		{ line = "cut -d: -f1,3 Columns.luau", want = "a:c\nd:f\ng:i",
+		  why = "a field list keeps the delimiter between them" },
+		{ line = "cut -d: -f3,1 Columns.luau", want = "a:c\nd:f\ng:i",
+		  why = "cut never reorders — file order, as everywhere else" },
+		{ line = "cut -d: -f2- Columns.luau", want = "b:c\n:f\nh:i",
+		  why = "an open range runs to the end of the line" },
+		{ line = "cut -c1 Columns.luau", want = "a\nd\ng", why = "-c takes characters" },
+		-- An empty field between two delimiters is a real field. This is the whole
+		-- reason cut and a whitespace-collapsing split are different tools.
+		{ line = "cut -d: -f2 Columns.luau | wc -l", want = "3",
+		  why = "an empty field is still a field, and still a line" },
+		{ line = "cut -f1 Columns.luau", want = "a:b:c\nd::f\ng:h:i",
+		  why = "the default delimiter is TAB, so an untabbed line passes through" },
+		{ line = "cut -s -f1 Columns.luau", want = "",
+		  why = "-s drops lines with no delimiter instead" },
+		-- With the message routed away there is nothing left to leak downstream,
+		-- which is the only reason a failing stage stops a pipeline at all.
+		{ line = "cat nosuchscript.luau 2>/dev/null | wc -l", want = "0",
+		  why = "a silenced failure does not abandon the rest of the pipeline" },
 
 		-- egrep is grep -E by definition, not an alias that shares a handler.
 		-- Sharing it meant a bracket class searched for its own six characters
@@ -6743,7 +7369,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		  why = "for iterates its word list" },
 		{ line = "for f in Sample.luau; do wc -l $f; done", want = "5",
 		  why = "the loop variable reaches the body" },
-		{ line = "for f in *.luau; do echo $f; done | wc -l", want = "6",
+		{ line = "for f in *.luau; do echo $f; done | wc -l", want = "7",
 		  why = "the word list is globbed and the loop can feed a pipeline" },
 		-- `$ff` is a different variable, not `$f` with an `f` after it, which is
 		-- the one substitution mistake that silently mangles a path.
@@ -6757,10 +7383,10 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		-- reported it — the loop was claimed before statements were split, so the
 		-- only place it could appear was the head of the line.
 		{ line = "echo one; for f in a b; do echo $f; done",
-		  want = "$ echo one\none\n$ for f in a b ; do echo $f ; done\na\nb",
+		  want = "one\na\nb",
 		  why = "a loop can follow a `;`" },
 		{ line = "for f in a b; do echo $f; done | wc -l; echo tail",
-		  want = "$ for f in a b ; do echo $f ; done | wc -l\n2\n$ echo tail\ntail",
+		  want = "2\ntail",
 		  why = "a loop feeds a pipeline with statements after it" },
 		-- `$(...)`. Without it this line did not fail: the word list was the single
 		-- literal token `$(echo`, so the loop ran once over text nobody wrote.
@@ -6852,6 +7478,11 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			{ line = "! grep -q zzz Cased.luau && echo absent", want = "absent" },
 			{ line = "! [ -f Cased.luau ] || echo present", want = "present" },
 			{ line = "! grep -q Humanoid Cased.luau || echo found", want = "found" },
+			-- `2>` sends a failure's message somewhere, and the status has to
+			-- survive it: silencing an error must not make it read as success.
+			-- Without the second half, `2>/dev/null` would be a way to turn every
+			-- failure into a silent pass, which is worse than not supporting it.
+			{ line = "cat nosuchscript.luau 2>/dev/null || echo caught", want = "caught" },
 			-- Globs reach the commands that were expanding them by hand, and the
 			-- ones that take a single path say so rather than silently answering
 			-- for whichever match sorted first.
@@ -7290,6 +7921,39 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		if not ok or (result :: string):match("not a class name") then
 			return false, "find -type " .. alias .. " was rejected: " .. tostring(result)
 		end
+	end
+
+	-- Tags and attributes are the two pieces of instance metadata with no
+	-- property behind them, so nothing else in the shell reads them and nothing
+	-- else would notice if either stopped being read.
+	local tagFixture = Instance.new("Folder")
+	local tagged = Instance.new("ModuleScript")
+	tagged.Name = "Tagged"
+	tagged.Parent = tagFixture
+	local untagged = Instance.new("ModuleScript")
+	untagged.Name = "Plain"
+	untagged.Parent = tagFixture
+	game:GetService("CollectionService"):AddTag(tagged, "SelfTestTag")
+	tagged:SetAttribute("Health", 100)
+	probe.cwd = tagFixture
+	local tagOut = Shell.run(probe, "find . -tag SelfTestTag")
+	local statOut = Shell.run(probe, "stat Tagged.luau")
+	local plainStat = Shell.run(probe, "stat Plain.luau")
+	probe.cwd = savedCwd
+	tagFixture:Destroy()
+	if not tagOut:match("Tagged") or tagOut:match("Plain") then
+		return false, "find -tag did not select by tag: " .. tagOut
+	end
+	if not statOut:match("Tags: SelfTestTag") then
+		return false, "stat did not report tags: " .. statOut
+	end
+	if not statOut:match("Attributes: Health=100") then
+		return false, "stat did not report attributes: " .. statOut
+	end
+	-- The empty case is omitted, not printed empty, which is the whole reason
+	-- these two lines cost nothing on the instances that have neither.
+	if plainStat:match("Tags:") or plainStat:match("Attributes:") then
+		return false, "stat printed empty tag/attribute lines: " .. plainStat
 	end
 
 	-- diff has to ALIGN, not compare by position. The old version walked both

@@ -16,6 +16,7 @@
 --   /Workspace/Parts/Brick  = absolute path
 
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local CollectionService = game:GetService("CollectionService")
 
 -- Studio-only. Fetched once rather than per call because the first thing that
 -- uses it is getSource, which grep calls for every script in scope. Everything
@@ -25,6 +26,16 @@ do
 	local ok, service = pcall(game.GetService, game, "ScriptEditorService")
 	if ok then
 		ScriptEditorService = service
+	end
+end
+
+-- Studio-only, same treatment. Only `ActiveScript` is read from it here; the
+-- shell reaches for GetUserId separately.
+local StudioService: any = nil
+do
+	local ok, service = pcall(game.GetService, game, "StudioService")
+	if ok then
+		StudioService = service
 	end
 end
 
@@ -192,9 +203,34 @@ end
 -- every line number grep reported and padded head/tail with blank lines. One
 -- helper, so the fix can't be half-applied.
 local function splitLines(source: string): { string }
+	-- Empty text is ZERO lines, not one blank one. The scan below cannot say that
+	-- on its own — it finds no newline and emits one empty line — and the
+	-- trailing-newline guard is `#lines > 1`, so it never fired here. `wc -l` on
+	-- an empty script answered 1, and once misses stopped flowing down pipes (see FIDELITY.md
+	-- §3.1) it was `grep nothing . | wc -l` answering 1 as well, which is the
+	-- exact wrong number that fix exists to remove.
+	--
+	-- A file holding only "\n" is still one line, an empty one, and still is:
+	-- that path goes through the guard below untouched.
+	if source == "" then
+		return {}
+	end
+	-- Scanned with a plain `find`, not `(source .. "\n"):gmatch("(.-)\n")`. The
+	-- concatenation copied the WHOLE file a second time on every read, and this
+	-- is the hottest read there is: `grep -r /` runs it once per script in the
+	-- place, on top of the copy `.Source` already handed back. The lazy `.-`
+	-- pattern also scans a character at a time where a plain find does not.
+	-- Same lines out, including the trailing-newline case the guard below fixes.
 	local lines: { string } = {}
-	for line in (source .. "\n"):gmatch("(.-)\n") do
-		lines[#lines + 1] = line
+	local pos = 1
+	while true do
+		local newline = source:find("\n", pos, true)
+		if not newline then
+			lines[#lines + 1] = source:sub(pos)
+			break
+		end
+		lines[#lines + 1] = source:sub(pos, newline - 1)
+		pos = newline + 1
 	end
 	-- A trailing newline terminates the last line rather than starting an empty
 	-- one; that is what `wc -l` counts, and what an editor shows.
@@ -224,7 +260,15 @@ export type GrepOpts = {
 -- matching per line is both faster and the only way a real engine can sit here at
 -- all. Case-insensitivity lives inside the program, so nothing is lowercased on
 -- the way past, captures have to come out of the original text.
-local function matchSpans(subject: string, programs: { any }): { { number } }?
+--
+-- `first` asks only "did anything match", and stops at the first hit. Every
+-- caller but `-o` wants exactly that: grepLines reads `spans ~= nil` for the hit
+-- test and never looks inside the list. Without it, a line holding forty
+-- occurrences ran the engine forty times to answer yes — and grep's whole job is
+-- to run this over every line of every script, so the wasted passes were
+-- proportional to how MUCH a file matched, i.e. worst on exactly the searches
+-- that matter. The returned list is still a list, so callers need no branch.
+local function matchSpans(subject: string, programs: { any }, first: boolean?): { { number } }?
 	local spans: { { number } }? = nil
 	for _, program in ipairs(programs) do
 		local from = 1
@@ -235,6 +279,9 @@ local function matchSpans(subject: string, programs: { any }): { { number } }?
 			end
 			spans = spans or {}
 			spans[#spans + 1] = { start, finish }
+			if first then
+				return spans
+			end
 			-- An empty match (`-E "x*"`) would otherwise never advance `from`.
 			from = math.max(finish :: number, start) + 1
 		end
@@ -271,7 +318,9 @@ function Fs.grepLines(lines: { string }, programs: { any }, opts: GrepOpts?): ({
 	local wanted: { [number]: boolean } = {}
 	local taken, skipped = 0, 0
 	for index, line in ipairs(lines) do
-		local spans = matchSpans(line, programs)
+		-- Only -o reads the span list; everything else needs the yes/no, so stop
+		-- at the first match rather than enumerating every one to discard them.
+		local spans = matchSpans(line, programs, not o.only)
 		local hit = spans ~= nil
 		if o.invert then
 			hit = not hit
@@ -318,14 +367,21 @@ local function instancePath(inst: Instance): string
 	if inst == game then
 		return "/"
 	end
+	-- Appended and reversed, not `table.insert(parts, 1, ...)`: inserting at the
+	-- front shifts every element already there, so building a path of depth d
+	-- costs O(d²). Invisible at depth 10 and not free at depth 100, which is
+	-- where it matters, since `find -path`/`-regex` call this once per node.
 	local parts = {}
 	local current: Instance = inst
 	while current and current ~= game do
-		table.insert(parts, 1, current.Name)
+		parts[#parts + 1] = current.Name
 		current = current.Parent
 	end
 	if not current then
 		return "/" .. inst.Name
+	end
+	for i = 1, #parts // 2 do
+		parts[i], parts[#parts + 1 - i] = parts[#parts + 1 - i], parts[i]
 	end
 	return "/" .. table.concat(parts, "/")
 end
@@ -594,20 +650,54 @@ function Fs.watch()
 	end
 end
 
--- Every script currently open in the editor, as { instance, document } pairs.
--- Command Bar documents are skipped: they have no script behind them and are
--- not a file anyone is editing.
-function Fs.openDocuments(): { { inst: Instance, doc: any } }
-	local out: { { inst: Instance, doc: any } } = {}
+-- The script the user is actually editing, or nil.
+--
+-- `ScriptDocument` cannot answer this — it has no "is this the front tab"
+-- member, which is what led to the claim in Agent.editorContext that there is no
+-- focus API at all. There is: StudioService.ActiveScript, a read-only Instance,
+-- and it is the difference between listing six open files and naming the one.
+--
+-- nil is a real answer, not just a failure: with a 3D viewport in front and no
+-- script tab open, nothing is being edited.
+function Fs.activeScript(): Instance?
+	if not StudioService then
+		return nil
+	end
+	local ok, active = pcall(function()
+		return StudioService.ActiveScript
+	end)
+	if ok and typeof(active) == "Instance" then
+		return active
+	end
+	return nil
+end
+
+-- Every script currently open in the editor, as { instance, document, active }
+-- triples, the ACTIVE one first. Command Bar documents are skipped: they have no
+-- script behind them and are not a file anyone is editing.
+--
+-- Ordered here rather than by the caller because there is only one right order
+-- and every caller wants it: GetScriptDocuments returns them in an order nobody
+-- has documented, so "the first one" meant nothing before.
+function Fs.openDocuments(): { { inst: Instance, doc: any, active: boolean } }
+	local out: { { inst: Instance, doc: any, active: boolean } } = {}
 	if not ScriptEditorService then
 		return out
 	end
+	local active = Fs.activeScript()
 	pcall(function()
 		for _, doc in ipairs(ScriptEditorService:GetScriptDocuments()) do
 			if not doc:IsCommandBar() then
 				local inst = doc:GetScript()
 				if inst then
-					out[#out + 1] = { inst = inst, doc = doc }
+					local entry = { inst = inst, doc = doc, active = inst == active }
+					if entry.active then
+						-- Front of the list, so a caller that can only afford a few
+						-- entries keeps the one that matters.
+						table.insert(out, 1, entry)
+					else
+						out[#out + 1] = entry
+					end
 				end
 			end
 		end
@@ -769,6 +859,33 @@ function Fs.debugId(inst: Instance): string
 	return (ok and type(id) == "string") and id or "?"
 end
 
+-- Tags and attributes: the two pieces of instance metadata with no property to
+-- read them off, and so the two `stat` could not see at all. A tag is the
+-- closest thing here to a file's extended attribute set, an attribute the
+-- closest to a key/value one.
+--
+-- Sorted, because GetTags and GetAttributes both answer in an order nobody
+-- documents, and stat run twice on the same instance should not disagree with
+-- itself about the order it lists them in.
+function Fs.tags(inst: Instance): { string }
+	local tags = CollectionService:GetTags(inst)
+	table.sort(tags)
+	return tags
+end
+
+-- Kept apart from Fs.tags because this is the one on a hot path: `find -tag`
+-- asks it per node, and GetTags would allocate a table for every instance in
+-- the place to answer a question about one string.
+--
+-- ponytail: a walk, where CollectionService:GetTagged is an INDEX and would
+-- make `find / -tag X` O(matches) instead of O(place). Seeding find's results
+-- from the index needs the depth bounds and the tree ordering rebuilt off it,
+-- and it only holds while -tag is the whole expression. Upgrade path if a place
+-- turns up where the walk is felt.
+function Fs.hasTag(inst: Instance, tag: string): boolean
+	return CollectionService:HasTag(inst, tag)
+end
+
 -- Mutation
 -- Every mutation goes through withUndo. Without a ChangeHistoryService recording
 -- the user's Ctrl+Z does nothing and a bad edit is unrecoverable, that is data
@@ -817,20 +934,44 @@ local function globToPattern(glob: string): string
 end
 
 -- Bare words stay substring matches, because `find Handler` should just work.
--- Anything containing a wildcard becomes an anchored glob. Everything is
--- lowercased, so -name and -iname are the same command here.
-function Fs.nameMatcher(pattern: string): (string) -> boolean
-	local needle = pattern:lower()
+-- Anything containing a wildcard becomes an anchored glob.
+--
+-- `exact` turns off the substring fallback, so a wildcard-free pattern has to be
+-- the whole name. That is what `find -name` means everywhere else: GNU matches
+-- the name against a GLOB, and a glob with no wildcard in it matches exactly one
+-- string. Loose matching is right for the bare `find Handler` shorthand, which
+-- is this harness's own invention and is meant to be forgiving, and wrong for
+-- `-name`, where it silently reports MORE than was asked for — `-name Main` also
+-- returning `mainframe` and `Remainder` is a search whose extra hits look
+-- exactly like real ones.
+--
+-- `caseSensitive` is the only thing that has ever separated `-name` from
+-- `-iname`. Without it they were the same function and one of the two was a lie
+-- whichever way you read it.
+export type NameOpts = { exact: boolean?, caseSensitive: boolean? }
+
+function Fs.nameMatcher(pattern: string, opts: NameOpts?): (string) -> boolean
+	local o = opts or {}
+	local fold = not o.caseSensitive
+	local needle = if fold then pattern:lower() else pattern
+	local function prepare(name: string): string
+		return if fold then name:lower() else name
+	end
 	if not pattern:find("[%*%?]") then
+		if o.exact then
+			return function(name)
+				return prepare(name) == needle
+			end
+		end
 		return function(name)
-			return name:lower():find(needle, 1, true) ~= nil
+			return prepare(name):find(needle, 1, true) ~= nil
 		end
 	end
 	-- Globs are their own syntax, not regex, and they compile to a Lua pattern
 	-- purely as an implementation detail, nothing about it reaches the caller.
 	local compiled = globToPattern(needle)
 	return function(name)
-		return name:lower():match(compiled) ~= nil
+		return prepare(name):match(compiled) ~= nil
 	end
 end
 

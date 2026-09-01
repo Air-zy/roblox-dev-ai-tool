@@ -8,6 +8,11 @@
 
 local ui = script.Parent.Parent:WaitForChild("ui")
 
+-- Only to measure the tool schemas for the settings panel's context breakdown:
+-- their punctuation is most of their token cost, so the encoded form is the
+-- honest size and a recursive string-sum is not. Nothing here sends a request.
+local HttpService = game:GetService("HttpService")
+
 local Provider = require(script.Parent:WaitForChild("Provider"))
 local Tools = require(script.Parent:WaitForChild("Tools"))
 local Console = require(ui:WaitForChild("Console"))
@@ -246,7 +251,13 @@ local stopCurrent: (() -> ())? = nil
 -- turn's own split is printed under it by the per-turn line below; this is the
 -- one that says whether the cache is working at all, which is the question a
 -- long run actually has.
-local totals = { input = 0, output = 0, cached = 0 }
+--
+-- `prompt` is not a total: it is the LAST request's whole input — fresh + read +
+-- written — which is how much of the context window this conversation currently
+-- occupies. A running sum answers a different question (what the session spent)
+-- and would climb past the window on turn three while the window sat half empty.
+-- Zero before the first reply, where there is nothing measured to show.
+local totals = { input = 0, output = 0, cached = 0, prompt = 0 }
 -- tool_use / server_tool_use id -> the console block waiting for its result.
 -- Keyed by id rather than "the last one", because a turn can run several calls
 -- and parallel tool use means their blocks are all open at once.
@@ -283,6 +294,10 @@ end
 
 function Agent.reset()
 	conversation = {}
+	-- The window is empty again, so the last measurement no longer describes it.
+	-- input/output/cached are deliberately left alone: those are what this session
+	-- has SPENT, and clearing the history does not un-spend it.
+	totals.prompt = 0
 end
 
 -- Adopts a saved conversation wholesale (Sessions). Takes the table rather than
@@ -293,9 +308,13 @@ function Agent.restore(messages: { any })
 	-- is cached under the current one. Clearing the stamp says so, which makes
 	-- the first turn after a restore the free one to clear on.
 	lastRequestAt = nil
+	-- Nothing has measured THIS history yet. The restored messages have a real
+	-- size, but only the next reply's usage can report it, and carrying the
+	-- previous conversation's number over would describe the wrong one.
+	totals.prompt = 0
 end
 
-function Agent.usage(): { input: number, output: number, cached: number }
+function Agent.usage(): { input: number, output: number, cached: number, prompt: number }
 	return totals
 end
 
@@ -393,6 +412,27 @@ local function cacheIsCold(): boolean
 	return lastRequestAt == nil or os.time() - lastRequestAt >= COLD_AFTER
 end
 
+-- Whether the next request should still find its prefix in the server's cache.
+--
+-- A PREDICTION, not a fact, and the difference is the whole reason this is
+-- documented rather than just exported. It says only that the 1h TTL we ask for
+-- has not run out since the last request — which is the right clock, because a
+-- cache READ refreshes the entry's timer at no cost, so every turn pushes
+-- expiry an hour out. It cannot see a prefix CHANGE: a different model, an
+-- edited system prompt, a cleared tool result all miss on a timer that says
+-- warm. So true means "not expired", never "guaranteed hit".
+--
+-- The fact is only ever available afterwards, as usage.cache_read_input_tokens
+-- on the reply. That is the number the Cache hits row reports; this one is for
+-- the panel to say what the NEXT turn is walking into.
+--
+-- Defined here rather than up with the other accessors on purpose: cacheIsCold
+-- is a local, and a function written above it would capture the global of that
+-- name — nil — instead. Same trap as lastRequestAt's own declaration note.
+function Agent.cacheWarm(): boolean
+	return not cacheIsCold()
+end
+
 -- A tool_use input is a TABLE, so it cannot be measured with `#` like the rest.
 -- Summing its strings rather than JSONEncoding it keeps this allocation-free:
 -- historyChars walks the entire conversation every turn, and encoding every
@@ -424,23 +464,144 @@ end
 -- Counting them reclaims nothing by itself and changes no clearing behaviour —
 -- clearing still touches results only, deliberately, since a write's input is
 -- the record of what changed. It makes the threshold measure what it guards.
-local function historyChars(messages: { any }): number
-	local total = 0
+-- The same walk, split by what the characters ARE. historyChars sums it, so
+-- there is one traversal of the conversation and not two that can disagree.
+--
+-- Order is the display order, and it is fixed rather than sorted by size: a
+-- panel whose rows reshuffle between two openings is one nobody can read a
+-- trend off. `key` is what the walk writes into; `label` is what the panel shows.
+local HISTORY_BUCKETS = {
+	{ key = "user", label = "Your messages" },
+	{ key = "assistant", label = "Assistant" },
+	{ key = "toolCalls", label = "Tool calls" },
+	{ key = "toolResults", label = "Tool results" },
+}
+
+local function historyBuckets(messages: { any }): { [string]: number }
+	local out = { user = 0, assistant = 0, toolCalls = 0, toolResults = 0 }
 	for _, message in ipairs(messages) do
 		local content = message.content
+		local mine = if message.role == "user" then "user" else "assistant"
 		if type(content) == "string" then
-			total += #content
+			out[mine] += #content
 		elseif type(content) == "table" then
 			for _, block in ipairs(content) do
 				if type(block) == "table" then
-					if type(block.text) == "string" then total += #block.text end
-					if type(block.content) == "string" then total += #block.content end
-					if block.input ~= nil then total += inputChars(block.input, 0) end
+					-- A tool_result's payload and a text block's text are both strings
+					-- on the block, so the TYPE is what tells them apart. Read off
+					-- block.type rather than the message role: a tool_result rides in
+					-- a user message, and counting it as something the user typed is
+					-- how the largest bucket in an agent session hides in the smallest.
+					if block.type == "tool_result" then
+						if type(block.content) == "string" then
+							out.toolResults += #block.content
+						end
+					elseif block.type == "tool_use" then
+						if block.input ~= nil then
+							out.toolCalls += inputChars(block.input, 0)
+						end
+					else
+						-- text and thinking. Both belong to whoever's message they are in.
+						if type(block.text) == "string" then out[mine] += #block.text end
+						if type(block.content) == "string" then out[mine] += #block.content end
+						if block.input ~= nil then out[mine] += inputChars(block.input, 0) end
+					end
 				end
 			end
 		end
 	end
+	return out
+end
+
+local function historyChars(messages: { any }): number
+	local buckets = historyBuckets(messages)
+	local total = 0
+	for _, value in pairs(buckets) do
+		total += value
+	end
 	return total
+end
+
+-- Where the context window actually went, as { label, tokens } in a fixed order.
+--
+-- There is NO endpoint that returns this. `usage` on a reply gives the total and
+-- its cache split (and, under `usage.cache_creation`, a per-TTL breakdown of the
+-- writes) — never a breakdown by what the tokens were. Claude Code gets the
+-- split by calling POST /v1/messages/count_tokens once PER CATEGORY, in parallel,
+-- with a Haiku count as the fallback (analyzeContext.ts, countTokensWithFallback)
+-- — an HTTP round trip per row of the display, every time /context is typed.
+--
+-- This does not, because it does not have to. Two facts do the work:
+--
+--   1. the EXACT total is already known and cost nothing — it is what the last
+--      reply billed, fresh + read + written (see totals.prompt);
+--   2. the categories only have to be RIGHT RELATIVE TO EACH OTHER, because
+--      they are then scaled to sum to that exact total.
+--
+-- So the bytes-per-token constants below never need to be accurate. Scaling
+-- cancels any uniform error in them exactly, which is why this can be a local
+-- character count and still put a true number on every row. What the constants
+-- have to get right is the RATIO between prose and dense JSON: a tool schema or
+-- a `write` payload spends a token roughly every 2 bytes, where prose takes
+-- about 4, and one constant for both reads a page of schemas as half its real
+-- share. Claude Code carries the same two numbers for the same reason
+-- (bytesPerTokenForFileType).
+--
+-- nil before the first reply: totals.prompt is the only exact number here, and
+-- without it this would be an estimate wearing a measurement's clothes.
+local BYTES_PER_TOKEN_TEXT = 4
+local BYTES_PER_TOKEN_JSON = 2
+
+export type ContextRow = { label: string, tokens: number }
+
+function Agent.contextBreakdown(): { ContextRow }?
+	if totals.prompt <= 0 then
+		return nil
+	end
+
+	-- The system prompt and the tool schemas are the part a walk of `conversation`
+	-- cannot see, and on a fresh session they ARE the context: several thousand
+	-- tokens before anything is typed. Left out, every other row is overstated by
+	-- exactly their share, and the panel says a one-message session is 40% full of
+	-- "Your messages".
+	local rows: { ContextRow } = {}
+	local weighted: { number } = {}
+	local function add(label: string, chars: number, bytesPerToken: number)
+		if chars <= 0 then return end
+		rows[#rows + 1] = { label = label, tokens = 0 }
+		weighted[#weighted] = chars / bytesPerToken
+	end
+
+	add("System prompt", #(Settings.system() or ""), BYTES_PER_TOKEN_TEXT)
+	-- The schemas as they go on the wire. JSONEncode rather than summing the
+	-- strings: the punctuation is most of a schema and most of its token cost,
+	-- and it is exactly what a recursive string-sum would leave out.
+	local encoded = ""
+	pcall(function()
+		encoded = HttpService:JSONEncode(buildTools())
+	end)
+	add("Tool schemas", #encoded, BYTES_PER_TOKEN_JSON)
+
+	local buckets = historyBuckets(conversation)
+	for _, bucket in ipairs(HISTORY_BUCKETS) do
+		-- Tool calls carry a `write`'s whole payload as JSON; the rest is prose.
+		add(bucket.label, buckets[bucket.key],
+			if bucket.key == "toolCalls" then BYTES_PER_TOKEN_JSON else BYTES_PER_TOKEN_TEXT)
+	end
+
+	local estimate = 0
+	for _, value in ipairs(weighted) do
+		estimate += value
+	end
+	if estimate <= 0 then
+		return nil
+	end
+	-- The one line that makes the rest exact in aggregate.
+	local scale = totals.prompt / estimate
+	for index, row in ipairs(rows) do
+		row.tokens = math.floor(weighted[index] * scale)
+	end
+	return rows
 end
 
 -- Returns the number of characters dropped; 0 means nothing was touched and the
@@ -811,11 +972,19 @@ local function runTurn(turn: number)
 			-- Counted here rather than in the final-turn block below: a tool-use
 			-- turn returns early, and its tokens are just as billed.
 			if result.usage then
-				totals.input += (result.usage.input_tokens or 0)
+				local prompt = (result.usage.input_tokens or 0)
 					+ (result.usage.cache_read_input_tokens or 0)
 					+ (result.usage.cache_creation_input_tokens or 0)
+				totals.input += prompt
 				totals.cached += result.usage.cache_read_input_tokens or 0
 				totals.output += result.usage.output_tokens or 0
+				-- Assigned, not accumulated. This is the only place the real prompt
+				-- size is known: the conversation table's character count is an
+				-- estimate, and the system prompt and tool schemas are not in it at
+				-- all — they are a fixed several thousand tokens the panel would
+				-- otherwise report as zero. Set on EVERY turn including a tool-use
+				-- one, because a tool sweep is exactly when the window fills.
+				totals.prompt = prompt
 			end
 
 			-- One assistant message holding ALL content blocks. Splitting text and
@@ -1081,9 +1250,19 @@ end
 -- conversation cache breakpoint (see withMessageCache in Claude), so re-sending
 -- a changed line here never invalidates the cached prefix.
 --
--- There is no focus API. ScriptDocument cannot say which tab is in front, so
--- every open document is listed with its own cursor rather than one being
--- guessed at and labelled "the" file.
+-- Which tab is in FRONT is a separate question from which are open, and this
+-- used to say there was no way to ask it — "ScriptDocument cannot say which tab
+-- is in front" — and listed all six with equal weight as a result. That was
+-- wrong about the API, not about ScriptDocument: `StudioService.ActiveScript` is
+-- a read-only Instance naming exactly the script being edited. Fs.openDocuments
+-- puts it first and flags it, so "fix this function" resolves to one file
+-- instead of six candidates, and the entry that survives the cap below is always
+-- the one that matters rather than whichever GetScriptDocuments happened to
+-- return first.
+--
+-- Still a LIST, not just the active one: the others are real context (a model
+-- asked to move code between two open files should know both are open), and
+-- nil is a real answer for ActiveScript whenever the viewport is in front.
 local MAX_OPEN_DOCS = 6
 -- The count cap alone does not bound this. instancePath walks to game joining
 -- .Name, and neither nesting depth nor a name's length has a limit, so six
@@ -1111,6 +1290,11 @@ local function editorContext(): string
 		-- straight back to cat/sed/grep. GetFullName's dotted form resolves to
 		-- nothing here, which would make the hint cost a turn instead of saving one.
 		local label = Fs.instancePath(entry.inst)
+		-- The one the user is actually looking at, named as such. Without this the
+		-- list is six paths in an undocumented order and "this file" is a guess.
+		if entry.active then
+			label ..= " [ACTIVE]"
+		end
 		-- GetSelection returns (line, char); the extra parens take the line.
 		local ok, line = pcall(function()
 			return (entry.doc:GetSelection())
@@ -1346,6 +1530,45 @@ function Agent.selfTest(): (boolean, string?)
 	end
 
 	lastRequestAt = savedStamp
+
+	-- The context breakdown's bucketing. The classification that matters is that
+	-- a tool_result rides inside a USER message: reading the message role instead
+	-- of the block type puts the largest bucket in an agent session — everything
+	-- the tools returned — under "Your messages", which is wrong in the one
+	-- direction nobody would question, since a user message plausibly holds text.
+	local mixed: { any } = {
+		{ role = "user", content = "find the bug" },
+		{ role = "assistant", content = {
+			{ type = "text", text = "looking" },
+			{ type = "tool_use", id = "t1", name = "bash", input = { command = "grep -rn x ." } },
+		} },
+		{ role = "user", content = {
+			{ type = "tool_result", tool_use_id = "t1", content = string.rep("h", 500) },
+		} },
+	}
+	local buckets = historyBuckets(mixed)
+	if buckets.toolResults ~= 500 then
+		return false, string.format("historyBuckets put %d chars of tool_result under toolResults, want 500",
+			buckets.toolResults)
+	end
+	if buckets.user ~= #"find the bug" then
+		return false, string.format(
+			"historyBuckets counted %d chars as the user's; a tool_result was misfiled as typed text",
+			buckets.user)
+	end
+	if buckets.assistant ~= #"looking" then
+		return false, "historyBuckets lost the assistant's text, or swept a tool_use into it"
+	end
+	if buckets.toolCalls ~= #"grep -rn x ." then
+		return false, "historyBuckets did not count the tool_use input"
+	end
+	-- The invariant clearOldToolResults rides on: splitting the walk must not
+	-- change what it totals, or the trigger silently measures something else.
+	local summed = buckets.user + buckets.assistant + buckets.toolCalls + buckets.toolResults
+	if historyChars(mixed) ~= summed then
+		return false, "historyChars and historyBuckets disagree about the same history"
+	end
+
 	return true
 end
 

@@ -746,8 +746,17 @@ function Program:find(subject: string, init: number?): (number?, number?, { stri
 		local start, finish = string.find(subject, self.literal, from, true)
 		return start, finish, {}
 	end
-	if self.prefilter and not string.find(subject, self.prefilter, 1, true) then
-		return nil, nil, {}
+	if self.prefilter then
+		-- Case-insensitively, the needle was lowercased at compile time and the
+		-- line is lowercased here. That costs one allocation per line and saves
+		-- entering the backtracker at all on every line that cannot match, which
+		-- is nearly all of them in a real search. Before this, `grep -i` had NO
+		-- fast path — both were disabled wholesale because they compare bytes —
+		-- so it ran the full engine over every line of every script in the place.
+		local haystack = if self.ignoreCase then subject:lower() else subject
+		if not string.find(haystack, self.prefilter, 1, true) then
+			return nil, nil, {}
+		end
 	end
 
 	-- One state for the whole scan, so the step budget covers every start
@@ -785,12 +794,24 @@ function Regex.compile(source: string, opts: { ere: boolean?, ignoreCase: boolea
 		anchored = root.kind == "seq" and root.items[1] ~= nil
 			and root.items[1].kind == "anchor" and root.items[1].at == "start",
 	}, Program)
+	-- The LITERAL path returns the match bounds straight from string.find, so it
+	-- has to compare the real bytes and stays off when folding case. The
+	-- PREFILTER only ever decides whether to skip a line, so it is safe either
+	-- way: lowercase the needle here, lowercase the subject in find(), and a
+	-- false negative is impossible because both sides fold identically.
+	--
+	-- Case-folding the needle with :lower() matches how the parser builds its
+	-- character sets (addRange over both cases), so the two agree on what
+	-- "insensitive" means, which is ASCII. A non-ASCII pattern folds in neither
+	-- place, so the prefilter is no less accurate than the engine behind it.
 	if not program.ignoreCase then
-		-- Both fast paths compare bytes, so neither is safe when folding case.
 		program.literal = literalOf(root)
-		if not program.literal then
-			program.prefilter = prefilterOf(root)
-		end
+	end
+	if not program.literal then
+		local prefilter = prefilterOf(root)
+		program.prefilter = if prefilter and program.ignoreCase
+			then prefilter:lower()
+			else prefilter
 	end
 	return (program :: any) :: Program, nil
 end
@@ -934,20 +955,42 @@ function Regex.selfTest(): (boolean, string?)
 
 	-- The prefilter may only skip lines that genuinely cannot match. An
 	-- over-eager one drops real hits and looks exactly like "no matches".
-	for _, pattern in ipairs({ "foo\\d+bar", "ab+c", "^start[0-9]", "x(y|z)w" }) do
-		local program = Regex.compile(pattern, { ere = true }) :: any
-		if program.prefilter then
-			for _, subject in ipairs({ "foo12bar", "abbbc", "start7", "xyw", "nothing here", "fooXbar" }) do
-				local withFilter = program:find(subject)
-				local saved = program.prefilter
-				program.prefilter = nil
-				local without = program:find(subject)
-				program.prefilter = saved
-				if withFilter ~= without then
-					return false, string.format(
-						"prefilter %q changed the result of %q on %q", saved, pattern, subject)
+	--
+	-- Run under BOTH case settings. The insensitive half is the newer risk: the
+	-- prefilter is lowercased at compile and the subject at match, and if those
+	-- two ever stop folding the same way the filter starts rejecting real hits —
+	-- silently, and only for `grep -i`, which is the search a person reaches for
+	-- when the first one found nothing.
+	for _, fold in ipairs({ false, true }) do
+		for _, pattern in ipairs({ "foo\\d+bar", "ab+c", "^start[0-9]", "x(y|z)w", "Humanoid" }) do
+			local program = Regex.compile(pattern, { ere = true, ignoreCase = fold }) :: any
+			if program.prefilter then
+				for _, subject in ipairs({ "foo12bar", "abbbc", "start7", "xyw", "nothing here",
+					"fooXbar", "FOO12BAR", "the HUMANOID here", "Humanoid" }) do
+					local withFilter = program:find(subject)
+					local saved = program.prefilter
+					program.prefilter = nil
+					local without = program:find(subject)
+					program.prefilter = saved
+					if withFilter ~= without then
+						return false, string.format(
+							"prefilter %q changed the result of %q on %q (ignoreCase=%s)",
+							saved, pattern, subject, tostring(fold))
+					end
 				end
 			end
+		end
+	end
+
+	-- ...and that it is actually THERE under -i. Before, both fast paths were
+	-- switched off wholesale when folding case, so `grep -i` entered the
+	-- backtracker on every line of every script in the place. A silent
+	-- performance cliff: correct answers, arbitrarily slowly.
+	do
+		local program = Regex.compile("Humanoid", { ere = true, ignoreCase = true }) :: any
+		if program.prefilter ~= "humanoid" then
+			return false, "case-insensitive compile lost its prefilter: "
+				.. tostring(program.prefilter)
 		end
 	end
 

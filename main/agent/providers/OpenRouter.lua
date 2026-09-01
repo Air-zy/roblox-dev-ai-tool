@@ -846,6 +846,24 @@ local function selfTest(): (boolean, string?)
 	return true
 end
 
+-- The input window for a model id, for the settings panel's context row. Read
+-- off the fetched roster, which already carries `context_length` under the name
+-- `context` — the same number the picker's hint is built from, so the row and
+-- the hint cannot disagree.
+--
+-- nil, not a guess, when there is no real figure: the hardcoded fallback roster
+-- above has no `context` at all, and a made-up denominator turns a progress bar
+-- into a confident wrong reading. The caller draws nothing instead.
+function OpenRouter.contextWindow(model: string): number?
+	for _, entry in ipairs(OpenRouter.MODELS) do
+		if entry.id == model then
+			local context = (entry :: any).context
+			return if type(context) == "number" and context > 0 then context else nil
+		end
+	end
+	return nil
+end
+
 OpenRouter.Initialize = Initialize
 OpenRouter.streamMessage = streamMessage
 OpenRouter.acceptsModelId = acceptsModelId

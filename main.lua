@@ -408,9 +408,71 @@ local toggleSettings, refreshSettings = Settings.mountPanel(widget, function(): 
 	if usage.input > 0 then
 		table.insert(rows, {
 			label = "Cache hits",
-			value = string.format("%d%% · %s read", math.floor(usage.cached / usage.input * 100),
-				compact(usage.cached)),
+			-- Whether the NEXT turn still has a prefix to read is a different
+			-- question from how well the past ones did, and it is the one that
+			-- decides what the turn costs. Only shown once there is a session to
+			-- be warm about, and only as a prediction — the TTL has not expired;
+			-- a changed prefix would still miss. See Agent.cacheWarm.
+			value = string.format("%d%% · %s read · next %s",
+				math.floor(usage.cached / usage.input * 100), compact(usage.cached),
+				if Agent.cacheWarm() then "warm" else "cold"),
 		})
+	end
+	-- How full the context window is: the LAST request's whole prompt over the
+	-- model's input window. The bar is the point — a percentage in a value column
+	-- is read as another statistic, where a track filling up is read as a budget,
+	-- which is what it is.
+	--
+	-- Measured, not estimated. This is the size the server billed for, so it
+	-- includes the system prompt and the tool schemas, which a walk of the
+	-- conversation table cannot see and which are several thousand tokens before
+	-- the first message is typed. That is why it stays blank until the first
+	-- reply rather than showing a zero that is not one.
+	--
+	-- The denominator can be unknown (an OpenRouter model whose roster came from
+	-- the offline fallback), and then there is no fraction to draw: the row falls
+	-- back to the raw count rather than inventing a window to divide by.
+	local window = Provider.wire.contextWindow and Provider.wire.contextWindow(Settings.model())
+	if usage.prompt > 0 then
+		table.insert(rows, {
+			label = "Context",
+			value = if window
+				then string.format("%s / %s · %d%%", compact(usage.prompt), compact(window),
+					math.floor(usage.prompt / window * 100))
+				else compact(usage.prompt) .. " · window unknown",
+			bar = if window then math.min(1, usage.prompt / window) else nil,
+		})
+		-- What filled it. Indented under the total rather than given bars of their
+		-- own: five more tracks read as five more budgets, where the question these
+		-- answer is which slice of the ONE budget above is which.
+		--
+		-- Percentages are of the prompt, not of the window: "tool results are 61%
+		-- of what I am sending" is the actionable form, and it stays readable at
+		-- 3% of a 1M window where a share-of-window figure would round to zero on
+		-- every row. Rows under 1% are folded away — they are noise, and the panel
+		-- has a fixed height.
+		local breakdown = Agent.contextBreakdown()
+		if breakdown then
+			local other = 0
+			for _, row in ipairs(breakdown) do
+				local share = row.tokens / usage.prompt
+				if share < 0.01 then
+					other += row.tokens
+				else
+					table.insert(rows, {
+						label = "  · " .. row.label,
+						value = string.format("%s · %d%%", compact(row.tokens),
+							math.floor(share * 100)),
+					})
+				end
+			end
+			if other > 0 then
+				table.insert(rows, {
+					label = "  · other",
+					value = string.format("%s · <1%% each", compact(other)),
+				})
+			end
+		end
 	end
 	return rows
 end)

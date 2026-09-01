@@ -71,21 +71,39 @@ local CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for 
 -- more likely to be a smaller one, and asking for more than a model allows is a
 -- 400 rather than a silent clamp.
 --
+-- `context` is the INPUT window, the denominator the settings panel divides a
+-- turn's prompt size by. Nothing in the request uses it: a prompt that overflows
+-- is a 400 from the server either way, and clamping client-side against a
+-- hand-written number would refuse a request the server would have accepted.
+-- It exists only so a reading can be shown as a fraction, which is why an
+-- unknown model gets the SMALLER default here for the opposite reason to
+-- maxOutput's — over-reporting how full the window is costs nothing, while
+-- under-reporting it hides the one thing the row exists to warn about.
+--
 -- ponytail: hand-written, and it goes stale the day a model ships — the numbers
 -- here were copied from Claude Code's own table and were already wrong for two
 -- of these three. Claude Code keeps the same table but treats it as a fallback
--- under GET /v1/models, which reports max_tokens per model and is the upgrade
--- path if this is ever wrong again. Three models and a 400 that says so is not
--- yet worth a fetch and a cache.
-local MODEL_CAPS: { [string]: { thinking: string, effort: boolean, maxOutput: number } } = {
-	["claude-opus-5"]             = { thinking = "adaptive", effort = true,  maxOutput = 128000 },
-	["claude-sonnet-5"]           = { thinking = "adaptive", effort = true,  maxOutput = 128000 },
-	["claude-haiku-4-5"]          = { thinking = "budget",   effort = false, maxOutput = 64000 },
+-- under GET /v1/models, which reports max_tokens AND max_input_tokens per model
+-- and is the upgrade path if this is ever wrong again. Three models and a 400
+-- that says so is not yet worth a fetch and a cache.
+local MODEL_CAPS: { [string]: { thinking: string, effort: boolean, maxOutput: number,
+	context: number } } = {
+	["claude-opus-5"]             = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
+	["claude-sonnet-5"]           = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
+	["claude-haiku-4-5"]          = { thinking = "budget",   effort = false, maxOutput = 64000,  context = 200000 },
 }
-local DEFAULT_CAPS = { thinking = "adaptive", effort = true, maxOutput = 64000 }
+local DEFAULT_CAPS = { thinking = "adaptive", effort = true, maxOutput = 64000, context = 200000 }
 
-local function capsFor(model: string): { thinking: string, effort: boolean, maxOutput: number }
+local function capsFor(model: string): { thinking: string, effort: boolean, maxOutput: number,
+	context: number }
 	return MODEL_CAPS[model] or DEFAULT_CAPS
+end
+
+-- The input window for a model id, for the settings panel's context row. Exported
+-- rather than the whole caps table: everything else in there shapes a request and
+-- belongs to this file alone.
+local function contextWindow(model: string): number
+	return capsFor(model).context
 end
 
 -- A 401 is not retryable on its own — the same token will be rejected again —
@@ -815,6 +833,7 @@ return {
 	selfTest = selfTest,
 	MODELS = MODELS,
 	acceptsModelId = acceptsModelId,
+	contextWindow = contextWindow,
 	DEFAULT_MODEL = DEFAULT_MODEL,
 	_MESSAGES_URL = MESSAGES_URL,
 	_ANTHROPIC_VERSION = ANTHROPIC_VERSION,

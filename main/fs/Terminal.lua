@@ -135,7 +135,10 @@ end
 
 -- cat: if script, return source. Otherwise, dump the properties that differ
 -- from a default instance of the same class.
-function Terminal:cat(path: string?): (string?, string?)
+-- The third return is a NOTE about the text rather than part of it — currently
+-- only the truncation line. The shell routes it to stderr's stand-in; see `note`
+-- in Shell and runPipeline, which is what keeps it out of `| wc -l`.
+function Terminal:cat(path: string?): (string?, string?, string?)
 	local target, err = self:resolve(path)
 	if not target then
 		return nil, err
@@ -151,10 +154,18 @@ function Terminal:cat(path: string?): (string?, string?)
 		-- The range form rather than `head | tail`, which needed a subtraction on
 		-- every call: `head -640 | tail -80` for lines 560-640, and getting it
 		-- wrong returns a plausible block from the wrong part of the file.
-		return string.format("%s\n… TRUNCATED: %d of %d lines shown. Page the rest with " ..
+		--
+		-- Returned as a THIRD value rather than glued to the text. The shell hands
+		-- it to `note()`, which keeps it out of a pipe's data while still printing
+		-- it: `cat big.luau | wc -l` now answers 1000 and says underneath that the
+		-- file has 3182 lines. Appended, it was counted as a line — and stripping
+		-- it instead would have hidden the truncation altogether, which is worse
+		-- than mis-counting it by one.
+		return table.concat(lines, "\n", 1, MAX_CAT_LINES), nil, string.format(
+			"… TRUNCATED: %d of %d lines shown. Page the rest with " ..
 			"`sed -n '%d,%dp' %s`, or grep for what you need.",
-			table.concat(lines, "\n", 1, MAX_CAT_LINES), MAX_CAT_LINES, #lines,
-			MAX_CAT_LINES + 1, math.min(#lines, MAX_CAT_LINES * 2), instancePath(target)), nil
+			MAX_CAT_LINES, #lines,
+			MAX_CAT_LINES + 1, math.min(#lines, MAX_CAT_LINES * 2), instancePath(target))
 	end
 
 	local className = target.ClassName
@@ -222,6 +233,27 @@ function Terminal:stat(path: string?): (string?, string?)
 	if source then
 		table.insert(lines, string.format("Lines: %d", #splitLines(source)))
 		table.insert(lines, "Type: script")
+	end
+	-- Tags and attributes are the two things about an instance that no property
+	-- carries and `cat`'s property diff therefore cannot show. Both are omitted
+	-- entirely when empty, which is the usual case: a line reading `Tags: (none)`
+	-- on every stat is noise on the wire for the rare instance that has some.
+	local tags = Fs.tags(target)
+	if #tags > 0 then
+		table.insert(lines, string.format("Tags: %s", table.concat(tags, ", ")))
+	end
+	local attributes = target:GetAttributes()
+	local names = {}
+	for name in pairs(attributes) do
+		names[#names + 1] = name
+	end
+	if #names > 0 then
+		table.sort(names)
+		local rendered = {}
+		for _, name in ipairs(names) do
+			rendered[#rendered + 1] = string.format("%s=%s", name, formatValue(attributes[name]))
+		end
+		table.insert(lines, string.format("Attributes: %s", table.concat(rendered, ", ")))
 	end
 	-- No `Parent:` line: `Path:` above already ends with it.
 	if not source then
@@ -529,7 +561,21 @@ function Terminal:ensureScript(path: string): (Instance?, string?)
 	local parentPath, leaf = splitPath(path)
 	local parent, parentErr = self:resolve(parentPath)
 	if not parent then
-		return nil, parentErr
+		-- The policy above, carried to the one call that hit it. Bare, this came
+		-- back as `no child named "my" in /Workspace`, which is true and answers a
+		-- different question than the one being asked: the caller wanted a file
+		-- created, and nothing said the missing part was the FOLDER or that one
+		-- command makes it. bash is no more helpful here ("No such file or
+		-- directory"), but bash is not the standard the rest of this file is held
+		-- to. Named rather than done, because auto-creating is how a typo'd path
+		-- becomes a new tree instead of an error.
+		--
+		-- parentPath cannot be nil on this branch: splitPath only returns nil when
+		-- the path holds no "/", and resolve(nil) is the cwd, which never fails.
+		-- tostring anyway, so a future change to either cannot turn this into a
+		-- format error thrown from inside an error path.
+		return nil, string.format("%s — `mkdir -p %s` first, then write %s",
+			tostring(parentErr), tostring(parentPath), path)
 	end
 	local class, name = Fs.classFor(leaf)
 	return withUndo("agent: create " .. name, function()

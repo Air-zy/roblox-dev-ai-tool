@@ -235,6 +235,9 @@ That, and curl, are why there is no unzip here.
 Paths are what you would expect. / is game, . and .. do the usual, service names
 at the root ignore case but everything below it does not. Scripts are listed
 with a .luau suffix, -type f means a script and -type d means anything else.
+Tags and attributes are the two things about an instance that no property holds,
+so they get their own spellings: `find / -tag Enemy` selects by tag, and `stat`
+lists both when there are any.
 Changes go through ChangeHistoryService, so Ctrl+Z works.
 
 Patterns are real regular expressions, from a real engine in `text/Regex.luau` —
