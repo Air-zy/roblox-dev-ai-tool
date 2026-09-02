@@ -111,6 +111,20 @@ local function normaliseNewlines(text: string): string
 end
 Fs.normaliseNewlines = normaliseNewlines
 
+-- The `.Source` SETTER refuses any string of 200,000 characters or more, and
+-- refuses the WHOLE write rather than truncating. UpdateSourceAsync has no such
+-- cap but needs an open document, so past this length the editor is not the
+-- nicer path, it is the only one.
+--
+-- Measured rather than assumed: 210,013 characters through `.Source` is
+-- "Provided string length (210013) is greater than or equal to max length
+-- (200000)", and the same text through an opened document lands intact.
+--
+-- This is not hypothetical. fs/Shell is already past it, which meant the plugin
+-- could no longer edit its own largest module: `edit` and `write` both ended at
+-- that refusal, with the file left untouched.
+local SOURCE_SETTER_LIMIT = 200000
+
 -- Write a script's text, through the editor when the script is open. Returns an
 -- error string, or nil on success.
 --
@@ -139,6 +153,32 @@ function Fs.writeSource(inst: Instance, text: string): string?
 			end)
 		end)
 		return (not ok) and tostring(err) or nil
+	end
+	-- Not open, and too long for the setter: open it for the write and put it
+	-- back. Only in this case — opening a document raises a tab in Studio, and
+	-- doing that on every write would pull the user's focus once per edit.
+	if #content >= SOURCE_SETTER_LIMIT and ScriptEditorService then
+		local opened = pcall(function()
+			ScriptEditorService:OpenScriptDocumentAsync(inst)
+		end)
+		if opened and openDocument(inst) then
+			local ok, err = pcall(function()
+				ScriptEditorService:UpdateSourceAsync(inst, function()
+					return content
+				end)
+			end)
+			-- Closed whether or not the write succeeded: the tab was opened by this
+			-- function, so it belongs to it on both paths.
+			pcall(function()
+				local doc = openDocument(inst)
+				if doc then
+					doc:CloseAsync()
+				end
+			end)
+			return (not ok) and tostring(err) or nil
+		end
+		-- Falls through on failure so the caller gets the engine's own refusal
+		-- below, which names the limit, rather than a second-hand one from here.
 	end
 	local ok, err = pcall(function()
 		(inst :: any).Source = content

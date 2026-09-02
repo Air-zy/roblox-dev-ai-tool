@@ -878,10 +878,25 @@ function Terminal:reload(paths: { string }?): (string?, string?)
 		local source = getSource(target)
 		local _, swapErr = withUndo("agent: reload " .. target.Name, function()
 			local fresh = target:Clone()
-			if source then
-				(fresh :: any).Source = source
-			end
+			-- Clone() has ALREADY copied .Source. This assignment exists only to
+			-- carry the editor's unsaved buffer, which .Source does not reflect,
+			-- so it is skipped when the two already agree.
+			--
+			-- Not merely a saved call: the .Source setter refuses at 200,000
+			-- characters, so re-assigning text it had just copied was enough to
+			-- make `reload` fail outright on any module past that. fs/Shell is,
+			-- which meant reloading the shell after editing it was impossible.
+			-- Parented BEFORE the write so it can go through the script editor,
+			-- which is the only path that accepts a very long source. An unparented
+			-- clone has no document to open.
 			fresh.Parent = parent
+			if source and (fresh :: any).Source ~= source then
+				local sourceErr = Fs.writeSource(fresh, source)
+				if sourceErr then
+					fresh:Destroy()
+					error(sourceErr, 0)
+				end
+			end
 			target:Destroy()
 		end)
 		if swapErr then return nil, swapErr end

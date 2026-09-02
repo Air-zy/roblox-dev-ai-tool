@@ -6312,7 +6312,7 @@ local function parseStatements(argv: { string }): { Statement }
 	while i <= #argv do
 		local arg = argv[i]
 		local stage = current.stages[#current.stages]
-		if arg == "for" and #stage == 0 then
+		if arg == "for" and #stage == 0 and not wasQuoted[i] then
 			-- A loop is ONE stage, taken whole. It used to be claimed before the
 			-- split instead, by a parser that only looked at the head of the line,
 			-- which is why `cd x; for f in ...` came back as "a `for` loop has to
@@ -6324,9 +6324,13 @@ local function parseStatements(argv: { string }): { Statement }
 				stage[#stage + 1] = token
 				;(stage :: any).quoted = (stage :: any).quoted or {}
 				;(stage :: any).quoted[#stage] = wasQuoted[i] or nil
-				if token == "for" then
+				-- Quoted, these are DATA: `echo 'done'` in a body must not close
+				-- the loop the way a bare `done` does. parseLoop applies the same
+				-- rule, and the two have to agree about where the stage ends, or
+				-- the body it re-parses is not the one claimed here.
+				if token == "for" and not wasQuoted[i] then
 					depth += 1
-				elseif token == "done" then
+				elseif token == "done" and not wasQuoted[i] then
 					depth -= 1
 					if depth == 0 then
 						break
@@ -6458,6 +6462,21 @@ local LOOP_SYNTAX = "`for f in *.luau; do head -5 $f; done`"
 -- malformed. Silently falling through on a malformed loop would run `for` as a
 -- command and report an unknown one, which points at the wrong thing.
 local function parseLoop(argv: { string }): (Loop?, string?)
+	-- Which positions came out of quotes, tagged on by parseStatements. EVERY
+	-- structural token below — `;`, `in`, `do`, `done`, `for` — is checked
+	-- against it, because a quoted one is an argument rather than syntax.
+	--
+	-- takeRedirect reads this set and so does parseStatements. parseLoop was the
+	-- one parser that did not, and it is the one that cuts up a loop BODY, so
+	-- the omission surfaced as `for d in x; do find "$d" -exec stat {} \; ; done`
+	-- reporting that -exec had no terminator: the `\;` it was handed had already
+	-- been read as the end of the command. The body is rebuilt below, so the map
+	-- has to be rebuilt with it or the information is gone by the time it counts.
+	local wasQuoted = (argv :: any).quoted or {}
+	local function bareWord(at: number, word: string): boolean
+		return argv[at] == word and not wasQuoted[at]
+	end
+
 	-- Leading `;` tokens are skipped first. A body written on its own line starts
 	-- with the one tokenize made from the newline, and a NESTED loop is exactly
 	-- that shape: without this, the inner loop of
@@ -6467,10 +6486,10 @@ local function parseLoop(argv: { string }): (Loop?, string?)
 	-- is not recognised as a loop at all, and `for` comes back as an unknown
 	-- command with the whole command list printed beside it.
 	local i = 1
-	while argv[i] == ";" do
+	while bareWord(i, ";") do
 		i += 1
 	end
-	if argv[i] ~= "for" then
+	if not bareWord(i, "for") then
 		return nil, nil
 	end
 	local name = argv[i + 1]
@@ -6478,7 +6497,7 @@ local function parseLoop(argv: { string }): (Loop?, string?)
 		return nil, string.format("for: %q is not a variable name — %s",
 			tostring(name), LOOP_SYNTAX)
 	end
-	if argv[i + 2] ~= "in" then
+	if not bareWord(i + 2, "in") then
 		-- bash also has `for f; do`, which iterates the positional parameters.
 		-- There are none here, so it can only ever be a typo for the `in` form.
 		return nil, "for: expected `in` after the variable — " .. LOOP_SYNTAX
@@ -6486,16 +6505,16 @@ local function parseLoop(argv: { string }): (Loop?, string?)
 
 	local words: { string } = {}
 	i += 3
-	while i <= #argv and argv[i] ~= ";" and argv[i] ~= "do" do
+	while i <= #argv and not bareWord(i, ";") and not bareWord(i, "do") do
 		words[#words + 1] = argv[i]
 		i += 1
 	end
 	-- `; do`, or `do` on the next line, which tokenize has already turned into a
 	-- `;`. Several in a row is a blank line between them.
-	while argv[i] == ";" do
+	while bareWord(i, ";") do
 		i += 1
 	end
-	if argv[i] ~= "do" then
+	if not bareWord(i, "do") then
 		return nil, "for: expected `do` after the word list — " .. LOOP_SYNTAX
 	end
 	i += 1
@@ -6504,12 +6523,13 @@ local function parseLoop(argv: { string }): (Loop?, string?)
 	-- outer one's. Nesting costs three lines here and mis-parses silently
 	-- without them: the inner body would become the outer's trailing statements.
 	local body: { string } = {}
+	local bodyQuoted: { [number]: boolean } = {}
 	local depth = 1
 	while i <= #argv do
 		local token = argv[i]
-		if token == "for" then
+		if token == "for" and not wasQuoted[i] then
 			depth += 1
-		elseif token == "done" then
+		elseif token == "done" and not wasQuoted[i] then
 			depth -= 1
 			if depth == 0 then
 				i += 1
@@ -6517,14 +6537,25 @@ local function parseLoop(argv: { string }): (Loop?, string?)
 			end
 		end
 		body[#body + 1] = token
+		-- Re-keyed to the body's OWN positions: the map on `argv` is indexed by
+		-- the stage's, and the body starts partway into it.
+		bodyQuoted[#body] = wasQuoted[i] or nil
 		i += 1
 	end
 	if depth ~= 0 then
 		return nil, "for: missing `done` — " .. LOOP_SYNTAX
 	end
+	;(body :: any).quoted = bodyQuoted
 
 	local rest: { string } = {}
+	local restQuoted: { [number]: boolean } = {}
 	table.move(argv, i, #argv, 1, rest)
+	-- What follows `done`. takeRedirect reads the same map to tell a redirect
+	-- from a quoted `>`.
+	for at = i, #argv do
+		restQuoted[at - i + 1] = wasQuoted[at] or nil
+	end
+	;(rest :: any).quoted = restQuoted
 	return { name = name, words = words, body = body, rest = rest }, nil
 end
 
@@ -6547,6 +6578,11 @@ local function expandVar(tokens: { string }, name: string, value: string): { str
 	for index, token in ipairs(tokens) do
 		out[index] = (token:gsub(braced, replacement):gsub(bare, replacement))
 	end
+	-- Substitution is one token in, one token out, so the quoted map transfers
+	-- position for position. Dropping it here was the other half of the `\;`
+	-- bug: parseLoop could hand over a perfectly good map and this would rebuild
+	-- the body without it, one call before parseStatements went looking.
+	;(out :: any).quoted = (tokens :: any).quoted
 	return out
 end
 
@@ -6677,6 +6713,41 @@ local QUOTED_RISK = "[\"\\]"
 -- the upgrade path past it.
 local MAX_SUBSTITUTION_DEPTH = 4
 
+-- The variables a `for` on THIS line binds.
+--
+-- `$(...)` is spliced on the raw text, before any loop has run, so a
+-- substitution mentioning one of these is reading a name that has no value yet.
+-- bash defers a body's substitutions to each iteration; this shell cannot,
+-- because splicing happens pre-tokenize and the result has to survive being
+-- re-split into words.
+--
+-- What made this worth a refusal is that the old behaviour was not a failure.
+-- The name stayed LITERAL, the inner command ran against the two characters
+-- `$m`, and it answered:
+--     for m in Xyzzy Plugh; do echo "$(grep -rlw $m / | grep -c .)"; done
+-- printed 0 for every module in the list, because grep searched for the string
+-- `$m` and honestly found none. That reads as a finding — "no requirers" — and
+-- it is not one. A wrong answer that looks like data is worse than an error.
+--
+-- Some spellings survived by accident: `$(echo $m)` returns the literal `$m`,
+-- which expandVar then substitutes on the way past, so it appeared to work.
+-- `$(basename $f)` appeared to work too, and quietly stopped the moment a value
+-- had a slash in it. Those are not worth preserving.
+local function loopNames(line: string): { [string]: boolean }
+	-- Quoted text is DATA, the same rule the scanner below runs on: `echo 'for f
+	-- in x'` binds nothing, and reading the raw line instead invented an `f` that
+	-- then refused a legitimate `$(wc -l $f)` later on the same line. Escapes go
+	-- first so a backslashed quote cannot open a span, and each span becomes a
+	-- SPACE rather than vanishing, so its neighbours cannot close up into a `for`
+	-- nobody wrote.
+	local bare = line:gsub("\\.", "  "):gsub("'[^']*'", " "):gsub('"[^"]*"', " ")
+	local names: { [string]: boolean } = {}
+	for name in bare:gmatch("%f[%w_]for%s+([%a_][%w_]*)%s+in%f[^%w_]") do
+		names[name] = true
+	end
+	return names
+end
+
 local function expandSubstitutions(self: any, line: string, depth: number): (string?, string?)
 	if not line:find("$(", 1, true) then
 		return line, nil
@@ -6684,6 +6755,7 @@ local function expandSubstitutions(self: any, line: string, depth: number): (str
 	if depth >= MAX_SUBSTITUTION_DEPTH then
 		return nil, string.format("`$(...)` nested more than %d deep", MAX_SUBSTITUTION_DEPTH)
 	end
+	local bound = loopNames(line)
 
 	local out: { string } = {}
 	local quote: string? = nil
@@ -6697,6 +6769,19 @@ local function expandSubstitutions(self: any, line: string, depth: number): (str
 			local inner, after = takeSubstitution(line, i + 2)
 			if not inner then
 				return nil, "unclosed `$(`"
+			end
+			-- Read before the loop that would define it: see loopNames above.
+			for name in bound do
+				local reads = inner:match("%$" .. name .. "%f[^%w_]") ~= nil
+					or inner:find("${" .. name .. "}", 1, true) ~= nil
+				if reads then
+					return nil, string.format(
+						"`$(%s)` reads $%s, and the `for` on this line has not bound it " ..
+						"yet — `$(...)` is spliced in before the loop runs, so the inner " ..
+						"command would see the literal text `$%s` and answer about that. " ..
+						"Put the substitution's command in the loop body on its own, or " ..
+						"use `run` where a variable is a variable.", inner, name, name)
+				end
 			end
 			local text = runLine(self, inner, depth + 1)
 			-- ERRORED, not merely false. Splicing a refusal in as words is how `for
@@ -7546,6 +7631,17 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		-- literal token `$(echo`, so the loop ran once over text nobody wrote.
 		{ line = "for f in $(echo Sample.luau); do wc -l $f; done", want = "5",
 		  why = "$(...) produces the loop's word list" },
+		-- A backslashed `;` inside a loop BODY. parseLoop is the parser that cuts
+		-- the body out, and it was the one that did not carry the quoted set, so
+		-- the `\;` reached -exec already read as a separator and -exec reported a
+		-- missing terminator.
+		{ line = "for d in .; do find $d -name Sample.luau -exec cat {} \\; ; done",
+		  want = "alpha\nbeta\ngamma\ndelta\nepsilon",
+		  why = "a backslashed ; survives being cut out as a loop body" },
+		-- A QUOTED `for` binds nothing, so the substitution beside it must still
+		-- run. loopNames read the raw line and invented an `f` here.
+		{ line = "echo 'for f in x'; echo $(echo ok)", want = "for f in x\nok",
+		  why = "a quoted for binds no name, so $(...) is not refused" },
 		{ line = "echo \"[$(echo a b)]\"", want = "[a b]",
 		  why = "a quoted $(...) is spliced whole and stays one word" },
 		{ line = "echo '$(echo a)'", want = "$(echo a)",
@@ -7676,6 +7772,11 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			-- iterate over the words of a refusal.
 			{ line = "echo $(cat /nope)", want = "failed" },
 			{ line = "echo $(echo a", want = "unclosed" },
+			-- `$(...)` is spliced before any loop runs, so a substitution reading the
+			-- loop variable would search for the literal text `$f` and answer about
+			-- that — a wrong answer shaped like a finding.
+			{ line = "for f in a b; do echo $(grep -c $f Sample.luau); done",
+			  want = "has not bound it yet" },
 			{ line = "grep zzz Cased.luau", want = "no matches" },
 			-- ...and a `$(...)` that found nothing must NOT be refused. bash
 			-- iterates zero times there; refusing turns every empty search into a
