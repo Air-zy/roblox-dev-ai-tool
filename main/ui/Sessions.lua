@@ -9,9 +9,16 @@
 --
 --   cc_sessions        the index: id, title, place, updated. Small, rewritten
 --                      on every save.
---   cc_session_<id>    one conversation, JSON. Only the ACTIVE session's body is
+--   cc_session_<slot>  one conversation, JSON. Only the ACTIVE session's body is
 --                      rewritten, so a save costs one encode rather than all of
 --                      them.
+--
+-- <slot> is a number, 1..MAX_SESSIONS, and that is load-bearing rather than
+-- tidy: Roblox has no way to LIST a plugin's setting keys, so a body is only
+-- reachable through the id in the index. Under the GUIDs this used, losing the
+-- index orphaned every body permanently — unreadable, undeletable, and sharing
+-- the store with the OAuth tokens and every pref. A bounded key space can be
+-- swept. See freeSlot and reclaimSlots.
 --
 -- Sessions are tagged with PlaceId and the list is filtered to the current place.
 -- Plugin settings are global across places, so without that filter opening the
@@ -32,11 +39,20 @@ local KEY_INDEX = "cc_sessions"
 local KEY_PREFIX = "cc_session_"
 
 local MAX_SESSIONS = 20
--- SetSetting writes to a local JSON file with no documented ceiling, but a
--- session carrying a few `cat`s of large ModuleScripts is megabytes, and that
--- cost is paid on every turn. Past this the old tool results are stubbed before
--- writing: the same trade Agent makes to keep the context window bounded.
-local MAX_BYTES = 400000
+-- SetSetting writes to a local JSON file with no documented ceiling, and the
+-- same store holds the OAuth tokens and every pref — so what a session costs is
+-- not only its own. A session carrying a few `cat`s of large ModuleScripts is
+-- megabytes, and that cost is paid on every turn. Past this the old tool results
+-- are stubbed before writing: the same trade Agent makes to keep the context
+-- window bounded.
+--
+-- Lowered from 400000. That number was a TRIGGER and not a ceiling: one stubbing
+-- pass keeps KEEP_RESULTS results, and at Agent's MODEL_RESULT_CHARS apiece
+-- those alone are half a megabyte, so a session could sit far above the cap
+-- after being "capped". The loop in save now runs the pass down until it fits,
+-- which is what makes this an actual bound: 20 × this, not 20 × whatever the
+-- last few tool results happened to weigh.
+local MAX_BYTES = 150000
 local KEEP_RESULTS = 5
 local CLEARED = "[old tool result cleared — re-run the command if needed]"
 
@@ -71,6 +87,81 @@ local function persistIndex()
 	pluginRef:SetSetting(KEY_INDEX, HttpService:JSONEncode(index))
 end
 
+local function entryFor(id: string): Entry?
+	for _, entry in ipairs(index) do
+		if entry.id == id then return entry end
+	end
+	return nil
+end
+
+-- Session ids are SLOT NUMBERS, "1".."MAX_SESSIONS", not GUIDs.
+--
+-- Roblox gives no way to list a plugin's setting keys: GetSetting takes one key
+-- and there is no enumerator. So a body is only ever reachable through the id
+-- written in the index, which under GUIDs made the index a single point of
+-- failure with no recovery — lose it and every `cc_session_<guid>` in the store
+-- was unreachable AND unremovable, for the life of the install, with up to
+-- twenty more added every time the cap cycled. They sat in the same store as the
+-- auth tokens and the prefs.
+--
+-- A bounded key space is probeable, which is the whole fix: reclaimSlots below
+-- can find a body the index no longer names, because there are only ever
+-- MAX_SESSIONS places for one to be.
+--
+-- Entries written before this carry GUID ids and keep working — the key is
+-- KEY_PREFIX .. id either way. They occupy no slot and age out through the
+-- normal cap. Their bodies are deliberately NOT migrated: moving up to twenty
+-- multi-hundred-KB values on the frame the plugin opens is exactly the stall
+-- this codebase has been removing. The orphans an old install already has stay
+-- orphaned, because nothing can name them.
+local function freeSlot(): string?
+	for slot = 1, MAX_SESSIONS do
+		local id = tostring(slot)
+		if not entryFor(id) then
+			return id
+		end
+	end
+	return nil
+end
+
+-- A slot for a new session, evicting the oldest when every one is taken. That
+-- eviction already happened, on the next save; doing it here moves it to the
+-- click that caused it, where the drawer redraw makes it visible.
+local function nextId(): string
+	local slot = freeSlot()
+	if slot then
+		return slot
+	end
+	table.sort(index, function(a, b) return a.updated > b.updated end)
+	local dropped = table.remove(index) :: Entry
+	pluginRef:SetSetting(KEY_PREFIX .. dropped.id, nil)
+	persistIndex()
+	-- Dropping any entry frees a slot unless the one dropped was a GUID, and a
+	-- GUID entry means fewer than MAX_SESSIONS slots were taken, so freeSlot
+	-- would not have returned nil above. The fallback is belt and braces.
+	return freeSlot() or dropped.id
+end
+
+-- Delete any body the index no longer names. Only reachable at all because the
+-- ids are slots; a GUID orphan cannot be found by anything, ever.
+--
+-- Runs at startup, where the index has just been read: a slot holding a body
+-- with no entry is one whose entry was lost, and a conversation with no entry
+-- has no title, no row and no way to be opened. Reclaiming it is the only thing
+-- left that can be done with it. Slots above MAX_SESSIONS are not swept, so
+-- LOWERING that constant strands whatever sat above the new value.
+local function reclaimSlots(): number
+	local reclaimed = 0
+	for slot = 1, MAX_SESSIONS do
+		local id = tostring(slot)
+		if pluginRef:GetSetting(KEY_PREFIX .. id) ~= nil and not entryFor(id) then
+			pluginRef:SetSetting(KEY_PREFIX .. id, nil)
+			reclaimed += 1
+		end
+	end
+	return reclaimed
+end
+
 -- The active row is drawn differently, so every change of session has to redraw
 -- the list or the highlight stays on the one you just left. Going through a
 -- setter is what keeps that true for all three ways currentId moves, switch,
@@ -86,7 +177,13 @@ function Sessions.Initialize(p: Plugin)
 	pluginRef = p
 	local saved = decode(p:GetSetting(KEY_INDEX))
 	if type(saved) == "table" then index = saved end
-	setCurrent(HttpService:GenerateGUID(false))
+	local reclaimed = reclaimSlots()
+	if reclaimed > 0 then
+		-- Worth saying out loud rather than doing quietly: it means the index was
+		-- lost at some point, which is the failure this whole scheme exists for.
+		warn(string.format("[agent] reclaimed %d orphaned session slot(s)", reclaimed))
+	end
+	setCurrent(nextId())
 end
 
 -- What the reader typed, whichever shape it is stored in. A user message is
@@ -134,7 +231,7 @@ end
 --
 -- Stubbed, not removed, every tool_result pairs with a tool_use that stays, and
 -- a restored session with a broken pairing is rejected on its next request.
-local function stubOldResults(conversation: { any }): { any }
+local function stubOldResults(conversation: { any }, keep: number): { any }
 	local total = 0
 	for _, message in ipairs(conversation) do
 		if type(message.content) == "table" then
@@ -143,7 +240,7 @@ local function stubOldResults(conversation: { any }): { any }
 			end
 		end
 	end
-	local cutoff = total - KEEP_RESULTS
+	local cutoff = total - keep
 	if cutoff <= 0 then return conversation end
 
 	local seen = 0
@@ -173,13 +270,6 @@ local function stubOldResults(conversation: { any }): { any }
 	return out
 end
 
-local function entryFor(id: string): Entry?
-	for _, entry in ipairs(index) do
-		if entry.id == id then return entry end
-	end
-	return nil
-end
-
 -- Called on every busy -> idle transition, so a crash costs at most the turn that
 -- was in flight.
 function Sessions.save()
@@ -192,7 +282,20 @@ function Sessions.save()
 		return
 	end
 	if #json > MAX_BYTES then
-		json = HttpService:JSONEncode(stubOldResults(conversation))
+		-- Down until it fits, rather than one pass and hope. A single pass keeps
+		-- KEEP_RESULTS results whatever they weigh, and at Agent's
+		-- MODEL_RESULT_CHARS apiece that is half a megabyte on its own — so the
+		-- cap used to be a trigger, not a ceiling, and the store had no bound at
+		-- all. Bounded at KEEP_RESULTS + 1 encodes, and only ever on a session
+		-- already over the cap.
+		--
+		-- keep = 0 stubs every result. If even that is over, it is written anyway:
+		-- what is left is the conversation itself, and dropping that to hit a
+		-- number would lose the thing being saved.
+		for keep = KEEP_RESULTS, 0, -1 do
+			json = HttpService:JSONEncode(stubOldResults(conversation, keep))
+			if #json <= MAX_BYTES then break end
+		end
 	end
 	pluginRef:SetSetting(KEY_PREFIX .. currentId, json)
 
@@ -373,7 +476,13 @@ local function replayInto(conversation: { any })
 end
 
 replay = function(conversation: { any })
-	Console.onScreen(function() replayInto(conversation) end)
+	-- Uncapped, because `shown` is already the cap here. The console trims itself
+	-- as a LIVE session grows, and trimming underneath a replay would eat its
+	-- oldest blocks — which are the ones the paging link just pulled up, and for
+	-- a Find jump are the message being jumped to.
+	Console.uncapped(function()
+		Console.onScreen(function() replayInto(conversation) end)
+	end)
 end
 
 -- JSON has no empty-object form that survives the round trip: an argument-less
@@ -475,7 +584,7 @@ function Sessions.new()
 	dropPeek()
 	-- The current session is already on disk: save() runs at the end of every
 	-- turn, so there is nothing to flush before letting go of it.
-	setCurrent(HttpService:GenerateGUID(false))
+	setCurrent(nextId())
 	Console.clear()
 	Agent.reset()
 end
@@ -829,7 +938,7 @@ function Sessions.selfTest(): (boolean, string?)
 		} })
 	end
 
-	local stubbed = stubOldResults(conversation)
+	local stubbed = stubOldResults(conversation, KEEP_RESULTS)
 	local kept, cleared = 0, 0
 	for _, message in ipairs(stubbed) do
 		if type(message.content) == "table" then
@@ -880,6 +989,56 @@ function Sessions.selfTest(): (boolean, string?)
 		{ type = "tool_result", tool_use_id = "t1", content = "ls" },
 	} }) ~= nil then
 		return false, "userText mistook a tool_result batch for something the reader typed"
+	end
+
+	-- Slots, against a fake store: this is the half that used to be impossible.
+	-- Everything here writes through pluginRef, so it is swapped for a table and
+	-- the real plugin settings are never touched.
+	local realPlugin, realIndex = pluginRef, index
+	local store: { [string]: any } = {}
+	pluginRef = {
+		GetSetting = function(_, key) return store[key] end,
+		SetSetting = function(_, key, value) store[key] = value end,
+	} :: any
+	index = {}
+
+	local slotOk, slotErr = pcall(function()
+		if freeSlot() ~= "1" then error("an empty index did not offer slot 1", 0) end
+		-- A pre-slot GUID entry occupies no slot, which is what lets an old
+		-- install keep its sessions without a migration.
+		index = { { id = "abc-guid", title = "old", place = 0, updated = 1 } :: Entry }
+		if freeSlot() ~= "1" then error("a GUID entry consumed a slot", 0) end
+		-- Lowest free, not next: a deleted session's slot is reusable.
+		index = {
+			{ id = "1", title = "a", place = 0, updated = 3 } :: Entry,
+			{ id = "3", title = "c", place = 0, updated = 1 } :: Entry,
+		}
+		if freeSlot() ~= "2" then error("freeSlot did not reuse the gap", 0) end
+		-- Full: the oldest goes, and its body with it.
+		index = {}
+		for slot = 1, MAX_SESSIONS do
+			index[slot] = { id = tostring(slot), title = "s", place = 0, updated = slot } :: Entry
+			store[KEY_PREFIX .. slot] = "body"
+		end
+		if freeSlot() ~= nil then error("freeSlot found a slot in a full index", 0) end
+		local taken = nextId()
+		if taken ~= "1" then error("nextId evicted something other than the oldest: " .. taken, 0) end
+		if store[KEY_PREFIX .. "1"] ~= nil then
+			error("nextId dropped the entry but left its body behind", 0)
+		end
+		if #index ~= MAX_SESSIONS - 1 then error("nextId did not drop exactly one entry", 0) end
+
+		-- The reclaim. A body whose entry is gone is unreachable by every read,
+		-- and before slots it was also impossible to delete.
+		store[KEY_PREFIX .. "1"] = "orphan"
+		if reclaimSlots() ~= 1 then error("reclaimSlots missed an unreferenced body", 0) end
+		if store[KEY_PREFIX .. "1"] ~= nil then error("reclaimSlots left the orphan", 0) end
+		if reclaimSlots() ~= 0 then error("reclaimSlots deleted a body the index names", 0) end
+	end)
+
+	pluginRef, index = realPlugin, realIndex
+	if not slotOk then
+		return false, tostring(slotErr)
 	end
 
 	return true

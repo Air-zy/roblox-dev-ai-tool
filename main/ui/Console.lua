@@ -39,12 +39,112 @@ local sink: Instance = nil :: any
 -- Never reset. It only has to increase; the Working row sits at the int32
 -- ceiling so it stays last however long this runs.
 local nextOrder = 0
+-- The "Working..." row, see Console.setWorking.
+local workingRow: TextLabel = nil :: any
+
+-- How many blocks stay DRAWN.
+--
+-- The conversation is not trimmed by any of this — Agent and Sessions still hold
+-- every message, and Claude still sees all of it. This caps what the console
+-- holds, which is a different thing and the one that costs.
+--
+-- Every block is an AutomaticSize TextBox with TextWrapped, inside a
+-- UIListLayout, inside a ScrollingFrame with AutomaticCanvasSize: the canvas
+-- height is a sum over every child and each child's height is a text
+-- measurement, so a width change re-measures all of them and a canvas
+-- invalidation re-sums all of them. Uncapped, the cost of every layout pass grew
+-- with how long you had been talking — which is why opening a panel got slower
+-- the further into a session you were, and why restarting fixed it: a REPLAY
+-- only ever draws REPLAY_MESSAGES worth of blocks and the live path had no
+-- equivalent.
+--
+-- A guess, and the knob to turn. It wants to be well above what one replay
+-- draws, so reopening a session and carrying on does not immediately start
+-- dropping what was just restored, and low enough that the ceiling is flat.
+-- Measure a freeze in the MicroProfiler before moving it.
+local MAX_BLOCKS = 150
+-- The most Instances one append is allowed to destroy. See the use below.
+local TRIM_BATCH = 8
+-- False while a replay is deliberately drawing more than the cap. See
+-- Console.uncapped.
+local capping = true
+
+-- Destroy the oldest drawn block once there are more than MAX_BLOCKS. A few per
+-- new block, so this is amortised rather than a stall the first time the cap is
+-- crossed.
+--
+-- Nothing is lost that cannot come back: Console.jumpToMessage already answers
+-- false for a message that is not drawn, and Find's caller already redraws a
+-- wider window when it does. That path does not care whether the block went
+-- missing because a replay never drew it or because this destroyed it.
+--
+-- Read off the parent rather than a registry, for the reason the anchors are:
+-- the blocks already ARE the record of what is on screen, and a side list would
+-- have to be kept in step with every clear, every peek and every re-replay.
+--
+-- Called BEFORE the block it is making room for exists, so the real ceiling is
+-- MAX_BLOCKS + 1. The slack is one block, which is as tight as it gets without
+-- trimming after the fact and paying a second pass.
+local function trimBlocks()
+	if not capping then
+		return
+	end
+	local blocks: { GuiObject } = {}
+	for _, child in ipairs(sink:GetChildren()) do
+		-- UIListLayout and UIPadding are not GuiObjects, so they are already out;
+		-- the Working row is one and has to be named.
+		if child:IsA("GuiObject") and child ~= workingRow then
+			blocks[#blocks + 1] = child
+		end
+	end
+	if #blocks <= MAX_BLOCKS then
+		return
+	end
+	-- By LayoutOrder, not by position: GetChildren is insertion order, and a peek
+	-- re-parents blocks, so insertion order is not age once one has happened.
+	table.sort(blocks, function(a, b)
+		return a.LayoutOrder < b.LayoutOrder
+	end)
+	-- At most a handful per append, so the amortisation above holds even coming
+	-- back from an uncapped replay: paging a long session in and then typing
+	-- would otherwise destroy hundreds of Instances on one frame, which is the
+	-- stall this whole thing exists to remove. It converges over the next few
+	-- appends instead.
+	local over = math.min(#blocks - MAX_BLOCKS, TRIM_BATCH)
+	for index = 1, over do
+		blocks[index]:Destroy()
+	end
+end
+
+-- Draw without the cap, for a redraw whose SIZE is already someone's decision.
+--
+-- Sessions pages history in by widening `shown` and replaying, and Find reaches
+-- a message by widening it far enough to include that message. Both then draw
+-- more blocks than the cap on purpose, and trimming underneath them would eat
+-- the oldest — which is exactly the part being paged in, and for Find is exactly
+-- the message being jumped to. The replay has its own cap in `shown`; this one
+-- is only ever about unbounded LIVE growth.
+--
+-- The freeze a big page-back costs is then one the reader asked for, which is
+-- the same trade Sessions already documents for redrawing rather than
+-- prepending.
+function Console.uncapped(draw: () -> ())
+	local previous = capping
+	capping = false
+	local ok, err = pcall(draw)
+	capping = previous
+	if not ok then error(err, 0) end
+end
+
+-- The cap rides here because every new top-level block passes through this and
+-- nothing else does — appendLine, appendLink, the reply bubble, a standalone
+-- thinking block and a tool call, all of them and only them. An appender that
+-- forgot to call a trim() of its own is exactly how this comes back.
 local function takeOrder(): number
+	trimBlocks()
 	nextOrder += 1
 	return nextOrder
 end
--- The "Working..." row, see Console.setWorking.
-local workingRow: TextLabel = nil :: any
 
 -- Sticky bottom. ScrollingFrame has no bottom-pin and no scroll method, the
 -- whole API is CanvasPosition and two read-only measurements, so following the
@@ -1337,6 +1437,51 @@ function Console.selfTest(): (boolean, string?)
 		end
 		if not Console.jumpToMessage(7) then
 			return false, "jumpToMessage could not reach an anchored message"
+		end
+
+		-- The live cap. Nothing else bounds how many blocks the console holds, and
+		-- an unbounded console makes every layout pass more expensive the longer
+		-- the session has run — which is invisible until it is four seconds.
+		Console.clear()
+		local newest: TextBox = nil :: any
+		for index = 1, MAX_BLOCKS + 5 do
+			newest = Console.appendLine("selftest " .. index, "info")
+		end
+		local drawn = 0
+		for _, child in ipairs(output:GetChildren()) do
+			if child:IsA("GuiObject") and child ~= workingRow then
+				drawn += 1
+			end
+		end
+		-- +1: the trim runs before the block it makes room for is created.
+		if drawn > MAX_BLOCKS + 1 then
+			return false, string.format("the console kept %d blocks, past the cap of %d",
+				drawn, MAX_BLOCKS)
+		end
+		if newest.Parent ~= output then
+			return false, "the cap dropped the newest block instead of the oldest"
+		end
+		if workingRow.Parent ~= output then
+			return false, "the cap destroyed the Working row"
+		end
+		-- A replay draws past the cap on purpose, and trimming underneath it would
+		-- destroy the oldest blocks — which are the ones a paging click just
+		-- pulled up, and for a Find jump are the message being jumped to.
+		local held = drawn
+		Console.uncapped(function()
+			for index = 1, 5 do
+				Console.appendLine("selftest uncapped " .. index, "info")
+			end
+		end)
+		local after = 0
+		for _, child in ipairs(output:GetChildren()) do
+			if child:IsA("GuiObject") and child ~= workingRow then
+				after += 1
+			end
+		end
+		if after ~= held + 5 then
+			return false, string.format("uncapped drew %d blocks past a %d cap, not 5",
+				after - held, MAX_BLOCKS)
 		end
 		return true
 	end

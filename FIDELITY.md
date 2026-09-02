@@ -259,6 +259,34 @@ argv is cut into stages), and `takeRedirect` skips a quoted arrow. A loop body
 rebuilt by `expandVar` arrives without the set, which degrades to the old
 behaviour rather than to a new failure.
 
+### 3.11 ~~A quoted or backslashed separator still split the line~~ — FIXED
+
+§3.10 taught `takeRedirect` that a quoted `>` is data. `parseStatements` was
+never told the same thing about `;` `&&` `||` `|`, and it is reading the same
+set off the same argv:
+
+```
+echo ';'                              →  two statements, the second empty
+find . -name X -exec cat {} \; | sed  →  find, then a SECOND statement "| sed"
+```
+
+Two halves, and both had to move. `parseStatements` compared the token text
+alone, so a token whose text was `;` was a separator no matter where it came
+from. And `tokenize`'s unquoted-backslash branch put the escaped character
+straight into the word **without setting `sawQuote`**, so `\;` produced a token
+byte-identical to the operator and carrying no mark to tell them apart.
+
+The reported case came in as `cd D && find . -name X -exec cat {} \; | sed -n
+'1,120p'`, and what ran was `cd`, then `find` without its `-exec`, then `sed`
+with no input — three outputs, none of them the one asked for.
+
+The same escape reached §3.10's destructive case by the other door:
+`echo \> f.luau` marked nothing, so the arrow was taken as a redirection, the
+argument was dropped and **f.luau was truncated**. Fixing the flag closes both.
+
+One bash behaviour falls out for free: an escaped digit is a word, not a stream
+number, so `echo \2>f` writes `2` to `f` rather than being read as fd 2.
+
 ## 4. Honest divergences (announced, refuse rather than fake)
 
 These are correct calls, listed so they are not mistaken for the section above.
@@ -274,6 +302,14 @@ These are correct calls, listed so they are not mistaken for the section above.
   tar xargs while until do done` each fail with a specific reason and a working
   substitute, instead of "command not found". `awk`'s now names `cut` for a
   column, which is the half of it that had no spelling at all before.
+- **`find -exec` runs**, in both the `\;` and `+` forms, with `{}` substituted.
+  It used to be refused for "there is no process to run", which was the wrong
+  reason: there is no process to run in this shell at all — `cat`, `grep` and
+  `sed` are Lua functions in `HANDLERS`, and one of those is the only thing
+  anyone puts after `-exec`. It is a dispatch per result. `-execdir` and `-ok`
+  stay refused and now point at it. One divergence: a failing invocation stops
+  the rest, the way a pipeline does, because `failed` means the output IS the
+  message and letting it run on would mix an error into the results as data.
 - **`for` is the only loop**, deliberately: nothing here can change a condition
   between iterations, so `while` runs zero times or forever, and forever is a
   frozen Studio.
@@ -372,8 +408,14 @@ Per script, in `Terminal:grep` → `Fs.getSource` → `Fs.grepLines` →
    insert-at-front shifted every element already collected, so a depth-100 path
    did 5000 moves to build 100 components — and `find -path`/`-regex` pay it per
    node, not per hit.
-5. `getSource` is called **twice** per instance in the `-L` path (once in the
-   walk, once in the re-walk).
+5. ~~`getSource` is called **twice** per instance in the `-L` path (once in the
+   walk, once in the re-walk).~~ **FIXED**, and it was worse than "twice": the
+   re-walk's only question was *"is this a file"*, and it asked it with
+   `getSource(inst)`, which answers by handing back a **copy of the whole
+   script**. So `grep -L X /` read every source in the place a second time to
+   produce a boolean that `getSource`'s own first line already had. `isScript` is
+   that line, and agrees exactly. The same loop also built `instancePath` twice
+   per instance, once to look up and once to emit; it is built once now.
 
 Rough shape: 10k scripts × ~200 lines is 2M line-matches. With a prefilter hit
 that is 2M `string.find` calls — Luau will do that, but not instantly, and the

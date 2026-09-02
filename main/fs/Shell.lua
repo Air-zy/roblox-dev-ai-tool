@@ -115,6 +115,13 @@ local function tokenize(line: string): ({ string }?, string?, { [number]: boolea
 		if c == "\\" and quote == nil then
 			i += 1
 			buf[#buf + 1] = line:sub(i, i)
+			-- A backslash literalises exactly the way a quote does, and the flag is
+			-- what says so downstream. Without this, `\;` `\|` `\>` produced tokens
+			-- byte-identical to the OPERATORS and nothing could tell them apart:
+			-- `find . -exec cat {} \;` had its statement cut at the `\;`, and
+			-- `echo \> f.luau` was §3.10 all over again — the arrow taken as a
+			-- redirection, the argument dropped and f.luau truncated.
+			sawQuote = true
 		elseif c == "\\" and quote == '"' then
 			local following = line:sub(i + 1, i + 1)
 			if DOUBLE_QUOTE_ESCAPES[following] then
@@ -1147,6 +1154,12 @@ end
 -- list is the thing that grows, and this way the "unknown command" hint and the
 -- alias entries below are derived from it instead of maintained alongside it.
 local HANDLERS: { [string]: (any, { string }, string?) -> string } = {}
+
+-- Forward-declared for `find -exec`, which runs a command per result and so has
+-- to reach the dispatcher that is defined below every handler. The same shape
+-- runLoopStage already has, and for the same reason: a handler that runs
+-- commands sits above the thing that runs commands.
+local runCommand: (any, { string }, string?) -> (string, boolean)
 
 -- -L and -P differ only where symlinks do. Nothing resolves through an
 -- ObjectValue here, so both spellings have the same answer and accepting them is
@@ -2187,10 +2200,10 @@ local FIND_VALUE_TESTS: { [string]: boolean } = {
 -- whole subtree to someone who asked for three levels, with nothing in the
 -- output to say so, and the same is true of every filter below.
 local FIND_UNSUPPORTED: { [string]: string } = {
-	["-exec"] = "runs a command per result, and there is no process to run — " ..
-		"use the `run` tool, or pipe find's output into grep",
-	["-execdir"] = "runs a command per result; use the `run` tool",
-	["-ok"] = "prompts before running a command, and there is nothing to prompt",
+	["-execdir"] = "runs the command from each result's own directory, and every " ..
+		"command here takes a whole path — `-exec` is the same thing",
+	["-ok"] = "prompts before running a command, and there is nothing to prompt — " ..
+		"`-exec` is the same thing without the prompt",
 	["-user"] = "matches the owning user, and an Instance has no owner — nothing " ..
 		"in the DataModel records who made it",
 	["-group"] = "matches the owning group, and an Instance has no owner or group",
@@ -2216,6 +2229,7 @@ HANDLERS.find = function(self, argv)
 	local minDepth: number? = nil
 	local maxDepth: number? = nil
 	local deleting = false
+	local exec: { command: { string }, batch: boolean }? = nil
 	local negateNext = false
 	local now = os.time()
 
@@ -2414,6 +2428,38 @@ HANDLERS.find = function(self, argv)
 			groups[#groups + 1] = {}
 		elseif arg == "-a" or arg == "-and" then
 			-- Implicit already; accepted so writing it out is not an error.
+		elseif arg == "-exec" then
+			-- Everything up to the terminator is the command. `\;` runs it once per
+			-- result, `+` once with every result appended, exactly as find(1) has
+			-- it — and the terminator arrives here as a plain word because a
+			-- backslashed `;` is marked literal by the tokenizer.
+			--
+			-- This used to be refused, and the refusal's reason was wrong: it said
+			-- there is no process to run. There is no process to run in this shell
+			-- AT ALL — `cat`, `grep` and `sed` are Lua functions in HANDLERS, and
+			-- the only thing anyone ever puts after -exec here is one of them. So
+			-- there is nothing to fork and nothing missing: it is a dispatch per
+			-- result, which is what runCommand already is.
+			local command: { string } = {}
+			i += 1
+			local terminator: string? = nil
+			while i <= #argv do
+				if argv[i] == ";" or argv[i] == "+" then
+					terminator = argv[i]
+					break
+				end
+				command[#command + 1] = argv[i]
+				i += 1
+			end
+			if not terminator then
+				return fail("find", "-exec needs a terminating `\\;` (once per result) " ..
+					"or `+` (once with all of them). The `;` has to be escaped or " ..
+					"quoted, or it ends the command line instead.")
+			end
+			if #command == 0 then
+				return fail("find", "-exec needs a command, as `-exec cat {} \\;`")
+			end
+			exec = { command = command, batch = terminator == "+" }
 		elseif arg == "-print" then
 			-- The default action, and printing is all this find does.
 		elseif arg == "-delete" then
@@ -2423,7 +2469,8 @@ HANDLERS.find = function(self, argv)
 		elseif arg:sub(1, 1) == "-" and #arg > 1 and not arg:match("^%-%d") then
 			return fail("find", string.format("%s is not supported — find takes -name, " ..
 				"-iname, -path, -regex, -type, -size, -empty, -perm, -inum, -tag, " ..
-				"-newer, -mmin, -mtime, -maxdepth, -mindepth, -not, -o and -delete", arg))
+				"-newer, -mmin, -mtime, -maxdepth, -mindepth, -not, -o, -exec and " ..
+				"-delete", arg))
 		else
 			bare[#bare + 1] = arg
 		end
@@ -2574,6 +2621,71 @@ HANDLERS.find = function(self, argv)
 			end
 		end
 		return table.concat(removed, "\n")
+	end
+
+	if exec then
+		local paths: { string } = {}
+		for _, inst in ipairs(found) do
+			paths[#paths + 1] = instancePath(inst)
+		end
+		-- `{}` is replaced wherever it appears, which is what find(1) does; with no
+		-- `{}` at all the command still runs per result, also as find(1) has it.
+		-- Under `+` the paths go where the `{}` was, spliced as separate words, and
+		-- onto the end when there is none.
+		local function expand(into: { string }, replacements: { string }): { string }
+			local out: { string } = {}
+			local placed = false
+			for _, word in ipairs(into) do
+				if word == "{}" then
+					placed = true
+					for _, value in ipairs(replacements) do
+						out[#out + 1] = value
+					end
+				else
+					out[#out + 1] = word
+				end
+			end
+			if not placed and (exec :: any).batch then
+				for _, value in ipairs(replacements) do
+					out[#out + 1] = value
+				end
+			end
+			return out
+		end
+
+		-- Saved because runCommand RESETS these on entry and reads them again after
+		-- this handler returns: without the restore, find's own status would be
+		-- whatever the last thing it ran happened to leave behind.
+		local outerTrailer = trailer
+		local pieces: { string } = {}
+		local runs: { { string } } = {}
+		if exec.batch then
+			runs[1] = expand(exec.command, paths)
+		else
+			for _, path in ipairs(paths) do
+				runs[#runs + 1] = expand(exec.command, { path })
+			end
+		end
+		for _, one in ipairs(runs) do
+			local output, ok = runCommand(self, one, nil)
+			if not ok and failed then
+				-- Stopped at the first real failure, the way a pipeline is, and for
+				-- the same reason: `failed` means the output IS the message, so
+				-- letting it run on would mix an error into the results as data with
+				-- nothing to tell them apart.
+				trailer = outerTrailer
+				return fail("find", output)
+			end
+			if output ~= "" then
+				pieces[#pieces + 1] = output
+			end
+		end
+		failed, unmatched, missText, trailer = false, false, false, outerTrailer
+		if skipped > 0 then
+			note(string.format("… %d more matches not run (narrow the path or the pattern)",
+				skipped))
+		end
+		return table.concat(pieces, "\n")
 	end
 
 	local lines: { string } = {}
@@ -3112,8 +3224,19 @@ HANDLERS.grep = function(self, argv, stdin)
 		table.insert(searched, 1, target)
 		local out: { string } = {}
 		for _, inst in ipairs(searched) do
-			if getSource(inst) and not withMatch[instancePath(inst)] then
-				out[#out + 1] = instancePath(inst)
+			-- isScript, NOT getSource. The only question here is "is this a file",
+			-- and getSource answers it by handing back a COPY of the whole script:
+			-- this re-walk was reading every source in the place a second time for
+			-- a boolean that getSource's own first line already had. The two agree
+			-- exactly — getSource returns nil for everything isScript rejects — so
+			-- this is the same answer without the second read of the whole place.
+			if isScript(inst) then
+				-- Built once. It was called twice per instance, once to look up and
+				-- once to emit, which is two whole paths walked to game per script.
+				local instPath = instancePath(inst)
+				if not withMatch[instPath] then
+					out[#out + 1] = instPath
+				end
 			end
 		end
 		return table.concat(out, "\n")
@@ -5980,7 +6103,7 @@ local STDIN_COMMANDS: { [string]: boolean } = {
 -- defined below both of them.
 local runLoopStage: (any, { string }) -> (string, boolean)
 
-local function runCommand(self: any, argv: { string }, stdin: string?): (string, boolean)
+function runCommand(self: any, argv: { string }, stdin: string?): (string, boolean)
 	failed, unmatched, missText, trailer = false, false, false, nil
 	-- Before takeRedirect, which would otherwise steal a `>` out of the loop's
 	-- BODY: `for f in a; do echo $f > out.luau; done` is a redirect per
@@ -6211,10 +6334,16 @@ local function parseStatements(argv: { string }): { Statement }
 				end
 				i += 1
 			end
-		elseif SEPARATORS[arg] then
+		-- Quoted or backslashed, a separator is DATA. This read the token text
+		-- alone, so `echo ';'` and `echo '|'` were cut into pieces at the very
+		-- character they were quoted to protect, and `find ... -exec cat {} \;`
+		-- lost everything after the `\;` to a second statement that began with a
+		-- pipe. takeRedirect learned this in §3.10; parseStatements did not, and
+		-- it is the same set riding on the same argv.
+		elseif SEPARATORS[arg] and not wasQuoted[i] then
 			flush()
 			current = { joiner = arg, stages = { {} } }
-		elseif arg == "|" then
+		elseif arg == "|" and not wasQuoted[i] then
 			current.stages[#current.stages + 1] = {}
 		else
 			stage[#stage + 1] = arg
@@ -7325,6 +7454,31 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		{ line = "grep '<' Sample.luau", want = "no matches",
 		  why = "a quoted < is a pattern, not a redirection" },
 
+		-- A BACKSLASHED separator is data too, and it was not: the escape put the
+		-- character straight into the word without marking it literal, so the
+		-- token that came out was byte-identical to the operator and
+		-- parseStatements cut the line at it. `find . -exec cat {} \;` lost
+		-- everything after the `\;` to a second statement beginning with a pipe.
+		{ line = "echo a \\; b", want = "a ; b",
+		  why = "a backslashed ; is a word, not a statement break" },
+		{ line = "echo a \\| b", want = "a | b",
+		  why = "a backslashed | is a word, not a pipe" },
+		-- The quoted forms of the same thing, which parseStatements also cut:
+		-- takeRedirect learned about the quoted set in §3.10 and this did not.
+		{ line = "echo ';'", want = ";", why = "a quoted ; is an argument" },
+		{ line = "echo '|'", want = "|", why = "a quoted | is an argument" },
+
+		-- -exec, once the `\;` survives to reach it. The refusal it replaces said
+		-- there was no process to run; there is no process to run in this shell at
+		-- all, and every command anyone puts after -exec is one of its own.
+		{ line = "find . -name Sample.luau -exec cat {} \\;",
+		  want = "alpha\nbeta\ngamma\ndelta\nepsilon",
+		  why = "-exec runs a builtin once per result, with {} as the path" },
+		{ line = "find . -name Nums.luau -exec sort -n {} +", want = "2\n10\n30",
+		  why = "the + form runs once with the paths spliced in" },
+		{ line = "find . -name Sample.luau -exec wc -l {} \\; | wc -l", want = "1",
+		  why = "-exec output is ordinary stdout and pipes like any other" },
+
 		-- cut. Taking a COLUMN had no spelling here at all before: awk is refused
 		-- and its stand-in was `sed -n`, which picks rows, not fields.
 		{ line = "cut -d: -f2 Columns.luau", want = "b\n\nh", why = "cut takes a field" },
@@ -7433,7 +7587,10 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			-- already: it used to claim yielding stalls SSE parsing, which is not
 			-- true: what rules -f out is that it never RETURNS.
 			{ line = "tail -f Sample.luau", want = "never returns" },
-			{ line = "find / -exec ls", want = "`run` tool" },
+			-- -exec RUNS now; what is still an error is leaving off the terminator,
+			-- and the message has to name it, since an unterminated -exec would
+			-- otherwise swallow the rest of the line as its command.
+			{ line = "find / -exec ls", want = "terminating" },
 			{ line = "find / -user me", want = "no owner" },
 			-- A truncated sequence is the WRONG sequence, and a loop built from one
 			-- silently does the wrong number of things, so the cap refuses.
