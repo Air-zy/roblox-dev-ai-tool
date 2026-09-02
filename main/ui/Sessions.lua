@@ -44,11 +44,7 @@ local make = Theme.make
 
 local Sessions = {}
 
--- Legacy keys. Read once at Initialize to clear what the old scheme left in the
--- shared settings file, then never written again.
-local KEY_INDEX = "cc_sessions"
-local KEY_PREFIX = "cc_session_"
--- The one key still in use, see the mirror in save().
+-- The crash mirror, see save().
 local KEY_ACTIVE = "cc_active"
 
 -- Sessions are Instances under ServerStorage, not plugin settings.
@@ -405,32 +401,6 @@ end
 function Sessions.Initialize(p: Plugin)
 	pluginRef = p
 	rebuildIndex()
-	-- One-time clean-up of the old scheme. Nothing is migrated: the bodies were
-	-- whole conversations in the shared settings file, which is the problem being
-	-- removed, and reading twenty of them back out on the frame the plugin opens
-	-- would be the stall this change exists to delete.
-	--
-	-- Gated on the index key so it costs nothing on every later launch, and each
-	-- delete is skipped unless that key is really there — a SetSetting is a
-	-- whole-store write, and there is no reason to pay for one to remove nothing.
-	if p:GetSetting(KEY_INDEX) ~= nil then
-		local stale = decode(p:GetSetting(KEY_INDEX))
-		if type(stale) == "table" then
-			for _, entry in ipairs(stale) do
-				if type(entry) == "table" and type(entry.id) == "string"
-					and p:GetSetting(KEY_PREFIX .. entry.id) ~= nil then
-					p:SetSetting(KEY_PREFIX .. entry.id, nil)
-				end
-			end
-		end
-		-- The slot key space, for bodies whose entry was already lost.
-		for slot = 1, 20 do
-			if p:GetSetting(KEY_PREFIX .. tostring(slot)) ~= nil then
-				p:SetSetting(KEY_PREFIX .. tostring(slot), nil)
-			end
-		end
-		p:SetSetting(KEY_INDEX, nil)
-	end
 	setCurrent(nextId())
 end
 
