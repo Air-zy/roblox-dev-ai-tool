@@ -4,21 +4,30 @@
 -- so persisting `Agent.conversation()` and replaying it through the Console's
 -- normal appenders is the whole feature. Nothing new renders here.
 --
--- Storage is plugin:SetSetting, same as Settings, so it survives a Studio crash
---, which is the point. Two kinds of key:
+-- Storage is Instances under ServerStorage, one folder per session:
 --
---   cc_sessions        the index: id, title, place, updated. Small, rewritten
---                      on every save.
---   cc_session_<slot>  one conversation, JSON. Only the ACTIVE session's body is
---                      rewritten, so a save costs one encode rather than all of
---                      them.
+--   ServerStorage/AgentSessions/<guid>/   attributes: title, updated, provider,
+--                                         chunks
+--     1, 2, 3 ...                         StringValue, <= CHUNK_BYTES each
 --
--- <slot> is a number, 1..MAX_SESSIONS, and that is load-bearing rather than
--- tidy: Roblox has no way to LIST a plugin's setting keys, so a body is only
--- reachable through the id in the index. Under the GUIDs this used, losing the
--- index orphaned every body permanently — unreadable, undeletable, and sharing
--- the store with the OAuth tokens and every pref. A bounded key space can be
--- swept. See freeSlot and reclaimSlots.
+-- It used to be plugin:SetSetting, and that looked like a key-value store while
+-- being one JSON file per plugin — shared by every locally-installed plugin,
+-- with no partial write. Setting one key re-serialised all of it. Measured on a
+-- real install: 15.4 MB across eighteen conversations, rewritten after every
+-- tool batch. That is what made loading the plugin, opening the settings panel
+-- and switching sessions stall, and the size caps could not fix it: the only
+-- thing they knew how to shrink was tool_result content, 2% of a session.
+--
+-- A folder costs only its own session to write, and only the session you open to
+-- read — which is what makes the list cheap: it is built from attributes and
+-- never touches a body. The slot ids this used are gone with it, along with
+-- freeSlot, nextId's eviction and reclaimSlots: those existed only because
+-- setting keys cannot be enumerated, and folder children can.
+--
+-- The price is that ServerStorage is part of the PLACE. Sessions persist on
+-- Ctrl+S rather than immediately, they ship when the place is published, they
+-- replicate in Team Create, and writing one marks the place dirty. cc_active
+-- covers the first of those; see the mirror in save().
 --
 -- Sessions are tagged with PlaceId and the list is filtered to the current place.
 -- Plugin settings are global across places, so without that filter opening the
@@ -35,26 +44,50 @@ local make = Theme.make
 
 local Sessions = {}
 
+-- Legacy keys. Read once at Initialize to clear what the old scheme left in the
+-- shared settings file, then never written again.
 local KEY_INDEX = "cc_sessions"
 local KEY_PREFIX = "cc_session_"
+-- The one key still in use, see the mirror in save().
+local KEY_ACTIVE = "cc_active"
 
-local MAX_SESSIONS = 20
--- SetSetting writes to a local JSON file with no documented ceiling, and the
--- same store holds the OAuth tokens and every pref — so what a session costs is
--- not only its own. A session carrying a few `cat`s of large ModuleScripts is
--- megabytes, and that cost is paid on every turn. Past this the old tool results
--- are stubbed before writing: the same trade Agent makes to keep the context
--- window bounded.
+-- Sessions are Instances under ServerStorage, not plugin settings.
 --
--- Lowered from 400000. That number was a TRIGGER and not a ceiling: one stubbing
--- pass keeps KEEP_RESULTS results, and at Agent's MODEL_RESULT_CHARS apiece
--- those alone are half a megabyte, so a session could sit far above the cap
--- after being "capped". The loop in save now runs the pass down until it fits,
--- which is what makes this an actual bound: 20 × this, not 20 × whatever the
--- last few tool results happened to weigh.
-local MAX_BYTES = 150000
-local KEEP_RESULTS = 5
-local CLEARED = "[old tool result cleared — re-run the command if needed]"
+-- SetSetting looks like a key-value store and is not: Roblox backs ALL of a
+-- plugin's settings with ONE JSON file, shared by every locally-installed
+-- plugin, and there is no partial write — setting any key re-serialises the
+-- whole thing. Measured on a real install: 15.4 MB across eighteen
+-- conversations, in a file that also held another plugin's settings. save() runs
+-- after every tool batch, so a twenty-tool sweep was twenty full rewrites. That
+-- is what made opening the settings panel, switching sessions and loading the
+-- plugin stall, and no cap could fix it: MAX_BYTES only knew how to shrink
+-- tool_result content, which is 2% of a session — the rest is thinking blocks
+-- and `write` payloads, and neither is reachable from here.
+--
+-- A folder per session costs only that session to write, and only the one you
+-- open to read.
+--
+-- The price is that ServerStorage is part of the PLACE. Sessions persist on
+-- Ctrl+S rather than immediately, they are included when the place is published,
+-- they replicate in Team Create, and writing one marks the place dirty. Git.lua
+-- keeps the GitHub token out of the DataModel for exactly that reason; the
+-- difference is that a conversation is the reader's own content rather than a
+-- credential. KEY_ACTIVE covers the first of those.
+local FOLDER_NAME = "AgentSessions"
+
+-- GetService, never FindFirstChild: the two return different objects the moment
+-- something else in `game` shares the name. Shell.lua:1556 documents the same
+-- trap for the same service.
+local ServerStorage = game:GetService("ServerStorage")
+
+-- StringValue.Value refuses at 200,000 characters — the same ceiling .Source has,
+-- and the same error — so a conversation is split across several.
+local CHUNK_BYTES = 190000
+
+-- ponytail: no size limit and no eviction, deliberately. A lazy read costs only
+-- the session opened, so size no longer shows up per operation. Ceiling: the
+-- place file grows for as long as sessions are kept, and saving it slows with
+-- them. Upgrade path is eviction by the `updated` attribute until a total fits.
 
 -- `provider` is stamped on the index rather than into the saved blob, so
 -- there is no stored format to migrate: an entry written before this simply
@@ -83,10 +116,6 @@ local function decode(json: any): any?
 	return ok and value or nil
 end
 
-local function persistIndex()
-	pluginRef:SetSetting(KEY_INDEX, HttpService:JSONEncode(index))
-end
-
 local function entryFor(id: string): Entry?
 	for _, entry in ipairs(index) do
 		if entry.id == id then return entry end
@@ -94,72 +123,254 @@ local function entryFor(id: string): Entry?
 	return nil
 end
 
--- Session ids are SLOT NUMBERS, "1".."MAX_SESSIONS", not GUIDs.
---
--- Roblox gives no way to list a plugin's setting keys: GetSetting takes one key
--- and there is no enumerator. So a body is only ever reachable through the id
--- written in the index, which under GUIDs made the index a single point of
--- failure with no recovery — lose it and every `cc_session_<guid>` in the store
--- was unreachable AND unremovable, for the life of the install, with up to
--- twenty more added every time the cap cycled. They sat in the same store as the
--- auth tokens and the prefs.
---
--- A bounded key space is probeable, which is the whole fix: reclaimSlots below
--- can find a body the index no longer names, because there are only ever
--- MAX_SESSIONS places for one to be.
---
--- Entries written before this carry GUID ids and keep working — the key is
--- KEY_PREFIX .. id either way. They occupy no slot and age out through the
--- normal cap. Their bodies are deliberately NOT migrated: moving up to twenty
--- multi-hundred-KB values on the frame the plugin opens is exactly the stall
--- this codebase has been removing. The orphans an old install already has stay
--- orphaned, because nothing can name them.
-local function freeSlot(): string?
-	for slot = 1, MAX_SESSIONS do
-		local id = tostring(slot)
-		if not entryFor(id) then
-			return id
-		end
+-- The sessions folder, made on first WRITE only. A place that never talks to the
+-- agent gets no folder, and a read has no business creating one.
+local function sessionsFolder(create: boolean?): Instance?
+	local folder = ServerStorage:FindFirstChild(FOLDER_NAME)
+	if not folder and create then
+		local made = Instance.new("Folder")
+		made.Name = FOLDER_NAME
+		made.Parent = ServerStorage
+		folder = made
 	end
-	return nil
+	return folder
 end
 
--- A slot for a new session, evicting the oldest when every one is taken. That
--- eviction already happened, on the next save; doing it here moves it to the
--- click that caused it, where the drawer redraw makes it visible.
-local function nextId(): string
-	local slot = freeSlot()
-	if slot then
-		return slot
+-- Split for StringValue, on a CHARACTER boundary rather than a byte one.
+--
+-- JSONEncode emits raw multi-byte UTF-8 — every em dash in this codebase is
+-- three bytes — and on real sessions one boundary in seventy-three landed
+-- inside a codepoint. A plain :sub() there leaves two chunks that are each
+-- invalid UTF-8, which is the kind of corruption that appears once in fifty
+-- saves and cannot be traced back to the save that caused it.
+--
+-- utf8.offset(s, 0, k) is the start of the character CONTAINING byte k, so
+-- asking about the byte just past the cut moves the cut back onto a boundary.
+-- The `start > i` guard is for a single character longer than the chunk, which
+-- cannot happen with 190000 but costs one comparison to rule out.
+local function splitChunks(text: string): { string }
+	local out: { string } = {}
+	local i = 1
+	while i <= #text do
+		local stop = math.min(i + CHUNK_BYTES - 1, #text)
+		if stop < #text then
+			local start = utf8.offset(text, 0, stop + 1)
+			if start and start > i then stop = start - 1 end
+		end
+		out[#out + 1] = text:sub(i, stop)
+		i = stop + 1
 	end
+	return out
+end
+
+-- Chunks are REUSED rather than destroyed and remade: a save that rewrites the
+-- same values touches no instance tree, where a destroy/create pair churns the
+-- Explorer and the undo stream on every turn.
+-- Bytes, not text: splitChunks backs each cut onto a UTF-8 character boundary,
+-- which is meaningless on compressed data.
+local function splitBinary(text: string): { string }
+	local out: { string } = {}
+	local i = 1
+	while i <= #text do
+		local stop = math.min(i + CHUNK_BYTES - 1, #text)
+		out[#out + 1] = text:sub(i, stop)
+		i = stop + 1
+	end
+	return out
+end
+
+local function writeBody(session: Instance, text: string, binary: boolean?)
+	local parts = if binary then splitBinary(text) else splitChunks(text)
+	for n, part in ipairs(parts) do
+		local name = tostring(n)
+		local existing = session:FindFirstChild(name)
+		if existing and not existing:IsA("StringValue") then
+			existing:Destroy()
+			existing = nil
+		end
+		local value = existing :: any
+		if value then
+			-- UNCHANGED chunks are left alone. A conversation grows by appending, so
+			-- of eleven chunks in a 2 MB session exactly one differs from the last
+			-- save — and this runs after every tool batch. Assigning all eleven
+			-- rewrote 2 MB to change 190 kB of it, and every write marks the place
+			-- dirty. Same defect as Settings.setSystem and Provider.use, one layer
+			-- down: the cheapest write is the one not made.
+			if value.Value ~= part then
+				value.Value = part
+			end
+		else
+			value = Instance.new("StringValue")
+			value.Name = name
+			value.Value = part
+			value.Parent = session
+		end
+	end
+	-- The count, written BEFORE the leftovers go. readBody reads exactly this
+	-- many and ignores everything else, so a write that dies partway through, or
+	-- a stray StringValue dropped into the folder by hand, cannot be
+	-- concatenated onto the end of a conversation.
+	--
+	-- SetSetting swapped one string and was atomic for free. N instance writes
+	-- are not, and this is the cheapest thing that stops a torn one decoding as
+	-- garbage: it degrades to "could not be loaded", which is the truth.
+	session:SetAttribute("chunks", #parts)
+	-- A conversation that SHRANK leaves chunks numbered past the new end.
+	-- StringValues with numeric names ONLY: this folder is visible in the
+	-- Explorer, and anything else in it belongs to whoever put it there.
+	for _, child in ipairs(session:GetChildren()) do
+		local n = tonumber(child.Name)
+		if n and n > #parts and child:IsA("StringValue") then child:Destroy() end
+	end
+end
+
+-- Indexed by the chunk's number, never appended: GetChildren is insertion order,
+-- which stops being chunk order the first time a session is rewritten.
+--
+-- A missing chunk (deleted by hand in the Explorer) leaves a hole, and
+-- table.concat stops at it rather than splicing the tail on — so the result
+-- fails to decode and the session reports as unloadable, which is the truth.
+local function readBody(session: Instance): string
+	local count = tonumber(session:GetAttribute("chunks"))
+	local parts: { string } = {}
+	for _, child in ipairs(session:GetChildren()) do
+		local n = tonumber(child.Name)
+		if n and child:IsA("StringValue") and (count == nil or n <= count) then
+			parts[n] = child.Value
+		end
+	end
+	-- A hole means a torn write or a chunk deleted by hand. Returning the prefix
+	-- would hand JSONDecode a truncated document; returning nothing lets the
+	-- caller say the session cannot be loaded, which is what has happened.
+	if count then
+		for n = 1, count do
+			if parts[n] == nil then return "" end
+		end
+	end
+	return table.concat(parts)
+end
+
+-- Compression, for sessions that are no longer the open one.
+--
+-- COLD ONLY, and that is forced rather than tidy. Compressed bytes have no
+-- stable prefix: one new message changes every one of them, so compressing the
+-- live session would undo the skip in writeBody and rewrite the whole thing on
+-- every tool batch. Plain text while a session is open, compressed once it is
+-- left. The session you use every day therefore never compresses, which is the
+-- right outcome — it is the other nineteen that cost space.
+--
+-- EncodingService shipped 2026-09-01 and is not in the API dump yet, so it is
+-- fetched through a pcall and everything here degrades to plain text without it.
+local EncodingService: any = nil
+do
+	local ok, service = pcall(game.GetService, game, "EncodingService")
+	if ok then EncodingService = service end
+end
+
+-- Level 3. Measured on a real 1.9 MB session: level 1 is 2.03x in 5.6 ms, level
+-- 3 is 2.20x in 7.8 ms, level 19 is 2.29x in 574 ms, and level 22 comes out
+-- WORSE than level 15. Past 3 the ratio is flat and the clock is not, and 8 ms
+-- on a session switch is not felt.
+local COMPRESS_LEVEL = 3
+
+-- Compressed bytes are not valid UTF-8, and whether a StringValue carries them
+-- through a place save intact is UNVERIFIED: binary .rbxl should, .rbxlx cannot
+-- represent them at all and people save as XML for git. Base64 is 4/3 the size
+-- and raises no such question, so it is the default.
+--
+-- Flip to true once the byte probe in the plan prints SURVIVED: 1.65x becomes
+-- 2.20x. Sessions already written stay readable either way — the form is
+-- recorded per folder in the `compressed` attribute, not inferred from this.
+local RAW_BYTES = false
+
+local function packBody(text: string): (string?, string?)
+	if not EncodingService then return nil, nil end
+	local ok, packed = pcall(function()
+		local out = EncodingService:CompressBuffer(
+			buffer.fromstring(text), Enum.CompressionAlgorithm.Zstd, COMPRESS_LEVEL)
+		if not RAW_BYTES then
+			out = EncodingService:Base64Encode(out)
+		end
+		return buffer.tostring(out)
+	end)
+	if not ok then return nil, nil end
+	return packed, (if RAW_BYTES then "zstd" else "zstd-b64")
+end
+
+-- `form` comes off the folder rather than from RAW_BYTES, so flipping that
+-- constant cannot orphan sessions written under the other one.
+local function unpackBody(body: string, form: string): string?
+	if not EncodingService then return nil end
+	local ok, text = pcall(function()
+		local packed = buffer.fromstring(body)
+		if form == "zstd-b64" then
+			packed = EncodingService:Base64Decode(packed)
+		end
+		return buffer.tostring(
+			EncodingService:DecompressBuffer(packed, Enum.CompressionAlgorithm.Zstd))
+	end)
+	return ok and text or nil
+end
+
+-- Compress a session in place. Skipped when it is already cold, when the service
+-- is missing, and when compressing would not actually save anything.
+local function compressSession(session: Instance)
+	if not EncodingService then return end
+	if session:GetAttribute("compressed") ~= nil then return end
+	local text = readBody(session)
+	if text == "" then return end
+	local packed, form = packBody(text)
+	if not packed or not form or #packed >= #text then return end
+	writeBody(session, packed, true)
+	session:SetAttribute("compressed", form)
+end
+
+-- The body as JSON text, whichever form it is stored in.
+local function loadBody(session: Instance): string
+	local body = readBody(session)
+	local form = session:GetAttribute("compressed")
+	if type(form) == "string" and form ~= "" then
+		return unpackBody(body, form) or ""
+	end
+	return body
+end
+
+-- The index IS the folder. Listing sessions reads attributes and never a body,
+-- which is the whole point of the move.
+--
+-- `place` is stamped as the CURRENT place rather than stored: the folder lives
+-- in this place's file, so everything in it belongs to this place by
+-- construction. draw() and restoreLast() both filter on it and neither needs
+-- changing.
+local function rebuildIndex()
+	index = {}
+	local folder = sessionsFolder()
+	if folder then
+		for _, child in ipairs(folder:GetChildren()) do
+			if child:IsA("Folder") then
+				index[#index + 1] = {
+					id = child.Name,
+					-- Never nil: draw() calls entry.title:lower().
+					title = tostring(child:GetAttribute("title") or ""),
+					place = game.PlaceId,
+					updated = tonumber(child:GetAttribute("updated")) or 0,
+					provider = child:GetAttribute("provider") :: string?,
+				}
+			end
+		end
+	end
+	-- Newest first. restoreLast takes the FIRST match and the drawer reads top
+	-- down; save() used to hold this order by sorting after every write.
 	table.sort(index, function(a, b) return a.updated > b.updated end)
-	local dropped = table.remove(index) :: Entry
-	pluginRef:SetSetting(KEY_PREFIX .. dropped.id, nil)
-	persistIndex()
-	-- Dropping any entry frees a slot unless the one dropped was a GUID, and a
-	-- GUID entry means fewer than MAX_SESSIONS slots were taken, so freeSlot
-	-- would not have returned nil above. The fallback is belt and braces.
-	return freeSlot() or dropped.id
 end
 
--- Delete any body the index no longer names. Only reachable at all because the
--- ids are slots; a GUID orphan cannot be found by anything, ever.
---
--- Runs at startup, where the index has just been read: a slot holding a body
--- with no entry is one whose entry was lost, and a conversation with no entry
--- has no title, no row and no way to be opened. Reclaiming it is the only thing
--- left that can be done with it. Slots above MAX_SESSIONS are not swept, so
--- LOWERING that constant strands whatever sat above the new value.
-local function reclaimSlots(): number
-	local reclaimed = 0
-	for slot = 1, MAX_SESSIONS do
-		local id = tostring(slot)
-		if pluginRef:GetSetting(KEY_PREFIX .. id) ~= nil and not entryFor(id) then
-			pluginRef:SetSetting(KEY_PREFIX .. id, nil)
-			reclaimed += 1
-		end
-	end
-	return reclaimed
+-- A GUID again, and the reason the slot scheme existed is gone with it: setting
+-- keys could not be enumerated, so a bounded key space was the only way to find
+-- a body the index no longer named. Folder children enumerate, so freeSlot,
+-- nextId's eviction and reclaimSlots all went with it — an orphan is now just
+-- a folder you can see and delete in the Explorer.
+local function nextId(): string
+	return HttpService:GenerateGUID(false)
 end
 
 -- The active row is drawn differently, so every change of session has to redraw
@@ -169,19 +380,47 @@ end
 -- here because Initialize is the first caller and a `local function` is not in
 -- scope above its own definition.
 local function setCurrent(id: string)
+	-- The session being LEFT goes cold, and this is the only funnel every change
+	-- of session runs through, so it is the only place that has to know.
+	if currentId ~= "" and currentId ~= id then
+		local folder = sessionsFolder()
+		local leaving = folder and folder:FindFirstChild(currentId)
+		if leaving and leaving:IsA("Folder") then
+			compressSession(leaving)
+		end
+	end
 	currentId = id
 	if refreshList then refreshList() end
 end
 
 function Sessions.Initialize(p: Plugin)
 	pluginRef = p
-	local saved = decode(p:GetSetting(KEY_INDEX))
-	if type(saved) == "table" then index = saved end
-	local reclaimed = reclaimSlots()
-	if reclaimed > 0 then
-		-- Worth saying out loud rather than doing quietly: it means the index was
-		-- lost at some point, which is the failure this whole scheme exists for.
-		warn(string.format("[agent] reclaimed %d orphaned session slot(s)", reclaimed))
+	rebuildIndex()
+	-- One-time clean-up of the old scheme. Nothing is migrated: the bodies were
+	-- whole conversations in the shared settings file, which is the problem being
+	-- removed, and reading twenty of them back out on the frame the plugin opens
+	-- would be the stall this change exists to delete.
+	--
+	-- Gated on the index key so it costs nothing on every later launch, and each
+	-- delete is skipped unless that key is really there — a SetSetting is a
+	-- whole-store write, and there is no reason to pay for one to remove nothing.
+	if p:GetSetting(KEY_INDEX) ~= nil then
+		local stale = decode(p:GetSetting(KEY_INDEX))
+		if type(stale) == "table" then
+			for _, entry in ipairs(stale) do
+				if type(entry) == "table" and type(entry.id) == "string"
+					and p:GetSetting(KEY_PREFIX .. entry.id) ~= nil then
+					p:SetSetting(KEY_PREFIX .. entry.id, nil)
+				end
+			end
+		end
+		-- The slot key space, for bodies whose entry was already lost.
+		for slot = 1, 20 do
+			if p:GetSetting(KEY_PREFIX .. tostring(slot)) ~= nil then
+				p:SetSetting(KEY_PREFIX .. tostring(slot), nil)
+			end
+		end
+		p:SetSetting(KEY_INDEX, nil)
 	end
 	setCurrent(nextId())
 end
@@ -231,6 +470,14 @@ end
 --
 -- Stubbed, not removed, every tool_result pairs with a tool_use that stays, and
 -- a restored session with a broken pairing is rejected on its next request.
+-- The MIRROR's ceiling, not the archive's. ServerStorage is uncapped by design;
+-- this bounds only the crash copy that goes into the shared settings file, which
+-- is the file whose size caused all of this. Stubbing old tool results is the
+-- trade this module already made, for exactly this reason.
+local MIRROR_BYTES = 150000
+local KEEP_RESULTS = 5
+local CLEARED = "[old tool result cleared — re-run the command if needed]"
+
 local function stubOldResults(conversation: { any }, keep: number): { any }
 	local total = 0
 	for _, message in ipairs(conversation) do
@@ -281,76 +528,71 @@ function Sessions.save()
 		warn("[agent] session not saved: " .. tostring(json))
 		return
 	end
-	-- The most stubbing could possibly reclaim, worked out before paying to find
-	-- out. The loop below re-clones and re-encodes the WHOLE conversation once
-	-- per pass, so six futile passes cost six copies of it and six multi-megabyte
-	-- strings — per save, and a save runs after every tool batch.
-	--
-	-- It is futile whenever results are not where the size is. A session that is
-	-- mostly thinking blocks and `write` payloads has nothing here to stub, and
-	-- both of those are out of reach on purpose: the thinking a turn is owed
-	-- back, and the record of what a write changed. Measured on a real 2 MB
-	-- session — 563 results holding 35 kB between them against 1.7 MB of thinking
-	-- and tool_use — stubbing every one reclaimed about 5 kB, six times over, and
-	-- the full encode was written anyway.
-	--
-	-- A JSON-escaped string is never longer than 6 bytes per source byte (\u00XX
-	-- is the longest escape there is), so 6x the raw content is a ceiling on what
-	-- the encoding can shrink by. Over it, no `keep` can reach the cap and the
-	-- loop is skipped; under it, nothing changes and it runs as before.
-	-- Deliberately loose — it only has to be a bound, and a loose one still
-	-- catches the case that costs.
-	local reclaimable = 0
-	if #json > MAX_BYTES then
-		for _, message in ipairs(conversation) do
-			if type(message.content) == "table" then
-				for _, block in ipairs(message.content) do
-					if block.type == "tool_result" and type(block.content) == "string"
-						and #block.content > #CLEARED then
-						reclaimable += #block.content
-					end
-				end
-			end
-		end
+
+	local folder = sessionsFolder(true) :: Instance
+	local existing = folder:FindFirstChild(currentId)
+	if existing and not existing:IsA("Folder") then
+		existing:Destroy()
+		existing = nil
 	end
-	if #json > MAX_BYTES and #json - 6 * reclaimable <= MAX_BYTES then
-		-- Down until it fits, rather than one pass and hope. A single pass keeps
-		-- KEEP_RESULTS results whatever they weigh, and at Agent's
-		-- MODEL_RESULT_CHARS apiece that is half a megabyte on its own — so the
-		-- cap used to be a trigger, not a ceiling, and the store had no bound at
-		-- all. Bounded at KEEP_RESULTS + 1 encodes, and only ever on a session
-		-- already over the cap.
-		--
-		-- keep = 0 stubs every result. If even that is over, it is written anyway:
-		-- what is left is the conversation itself, and dropping that to hit a
-		-- number would lose the thing being saved.
+	local session = existing
+	if not session then
+		local made = Instance.new("Folder")
+		made.Name = currentId
+		made.Parent = folder
+		session = made
+	end
+	writeBody(session :: Instance, json)
+	-- Reopened and written to again, so it is warm: the chunks above are plain
+	-- text now and the attribute has to stop claiming otherwise. Plain text is
+	-- always LONGER than the compressed form it replaces, so writeBody's own
+	-- sweep has already removed every leftover binary chunk.
+	;(session :: Instance):SetAttribute("compressed", nil)
+	-- Retitled and re-stamped on EVERY save rather than once at creation: /clear
+	-- empties a session in place, so the title and the provider both have to
+	-- follow what is in it now.
+	local target = session :: Instance
+	target:SetAttribute("title", titleOf(conversation) or (os.date("%b %d, %H:%M") :: string))
+	-- ONE timestamp for the folder and the mirror below. Two os.time() calls can
+	-- straddle a second, and restoreLast compares them: a mirror a second newer
+	-- than the folder written beside it would win the tiebreak and restore the
+	-- stubbed copy over the complete one.
+	local now = os.time()
+	target:SetAttribute("updated", now)
+	target:SetAttribute("provider", Provider.id)
+	rebuildIndex()
+
+	-- The crash copy. ServerStorage only reaches disk when the PLACE is saved, so
+	-- a place closed or crashed without a Ctrl+S loses everything since the last
+	-- one — including, on the first turn of a session, a message the reader would
+	-- have to retype. This runs on every save for that reason: Agent fires the
+	-- checkpoint as the message goes IN, which is the write that protects it.
+	--
+	-- Stubbed, unlike the archive, and that is what makes running it every time
+	-- affordable: a SetSetting re-serialises the whole settings file, so what
+	-- goes there has to stay small. Bounded at MIRROR_BYTES the file stays in the
+	-- low hundreds of KB, where the same write against the old 15 MB store was
+	-- the stall this module was rewritten to remove.
+	local body = json
+	if #body > MIRROR_BYTES then
 		for keep = KEEP_RESULTS, 0, -1 do
-			json = HttpService:JSONEncode(stubOldResults(conversation, keep))
-			if #json <= MAX_BYTES then break end
+			body = HttpService:JSONEncode(stubOldResults(conversation, keep))
+			if #body <= MIRROR_BYTES then break end
 		end
 	end
-	pluginRef:SetSetting(KEY_PREFIX .. currentId, json)
+	pcall(function()
+		pluginRef:SetSetting(KEY_ACTIVE, HttpService:JSONEncode({
+			id = currentId,
+			-- Stamped because a setting key is global to the plugin where a folder
+			-- is not: without these, recovery would restore this conversation into
+			-- whatever place and provider happened to open next.
+			place = game.PlaceId,
+			provider = Provider.id,
+			updated = now,
+			body = body,
+		}))
+	end)
 
-	local entry = entryFor(currentId)
-	if not entry then
-		entry = { id = currentId, title = "", place = game.PlaceId, updated = 0 }
-		table.insert(index, entry :: Entry)
-	end
-	-- Stamped on every save, not only at creation: /clear empties a session in
-	-- place, so the provider has to follow whatever produced the messages NOW.
-	entry.provider = Provider.id
-	-- Retitled every save rather than once at creation: /clear empties the
-	-- conversation without changing session, so the title has to follow whatever
-	-- the first message is NOW.
-	entry.title = titleOf(conversation) or (os.date("%b %d, %H:%M") :: string)
-	entry.updated = os.time()
-
-	table.sort(index, function(a, b) return a.updated > b.updated end)
-	while #index > MAX_SESSIONS do
-		local dropped = table.remove(index) :: Entry
-		pluginRef:SetSetting(KEY_PREFIX .. dropped.id, nil)
-	end
-	persistIndex()
 	-- The drawer stays open while you work, so the row for the session you are
 	-- IN has to pick up its new title and time as they change.
 	if refreshList then refreshList() end
@@ -547,7 +789,10 @@ function Sessions.load(id: string)
 		return
 	end
 
-	local conversation = decode(pluginRef:GetSetting(KEY_PREFIX .. id))
+	local folder = sessionsFolder()
+	local session = folder and folder:FindFirstChild(id)
+	local conversation = if session and session:IsA("Folder")
+		then decode(loadBody(session)) else nil
 	if type(conversation) ~= "table" then
 		Console.appendLine("That session could not be loaded.", "error")
 		return
@@ -626,14 +871,17 @@ function Sessions.delete(id: string)
 	-- Deleting the one you are peeking at would leave a conversation on screen
 	-- that no longer exists anywhere.
 	if id == previewId then Sessions.endPeek() end
-	pluginRef:SetSetting(KEY_PREFIX .. id, nil)
-	for i, entry in ipairs(index) do
-		if entry.id == id then
-			table.remove(index, i)
-			break
-		end
+	local folder = sessionsFolder()
+	local session = folder and folder:FindFirstChild(id)
+	if session then session:Destroy() end
+	-- The mirror too, or /clear does not clear. Commands.lua says it outright:
+	-- "leaving the saved copy behind would have the next open restore what was
+	-- just cleared" — and the crash copy is a saved copy.
+	local saved = decode(pluginRef:GetSetting(KEY_ACTIVE))
+	if type(saved) == "table" and saved.id == id then
+		pcall(function() pluginRef:SetSetting(KEY_ACTIVE, nil) end)
 	end
-	persistIndex()
+	rebuildIndex()
 	-- Deleting the session you are IN leaves you on a blank one rather than
 	-- looking at a conversation that no longer exists anywhere.
 	if id == currentId then
@@ -655,13 +903,55 @@ end
 -- provider switch should land somewhere usable, not print an error about a
 -- session nobody asked for.
 function Sessions.restoreLast()
+	-- The folders are the record, and Initialize is not the last word on them:
+	-- a place reload, or a folder deleted by hand in the Explorer, both land
+	-- between then and here.
+	rebuildIndex()
+	local newest: Entry? = nil
 	for _, entry in ipairs(index) do
 		if entry.place == game.PlaceId
 			and ((entry.provider or "anthropic") == Provider.id) then
-			Sessions.load(entry.id)
+			newest = entry
+			break
+		end
+	end
+
+	-- The crash copy, weighed by TIME rather than by existence.
+	--
+	-- Preferring the folder outright loses the exact case the mirror exists for:
+	-- a place last saved days ago still HAS folders, so an hour of unsaved work
+	-- sitting in the mirror would never be read — and the next save would
+	-- overwrite it. Whichever is newer wins.
+	--
+	-- place and provider are checked because a setting key is global to the
+	-- plugin where a folder is not: without them this restores one place's
+	-- conversation into another, which is the thing the place filter exists to
+	-- stop. ponytail: an unpublished local place reports PlaceId 0, so two of
+	-- them are indistinguishable here. Upgrade path is a marker instance in the
+	-- place, the day that turns up as a real confusion rather than a hypothetical.
+	local saved = decode(pluginRef:GetSetting(KEY_ACTIVE))
+	if type(saved) == "table" and type(saved.body) == "string"
+		and type(saved.id) == "string"
+		and saved.place == game.PlaceId
+		and (saved.provider or "anthropic") == Provider.id
+		and (newest == nil or (tonumber(saved.updated) or 0) > newest.updated) then
+		local conversation = decode(saved.body)
+		if type(conversation) == "table" then
+			repairInputs(conversation)
+			dropPeek()
+			setCurrent(saved.id)
+			Console.clear()
+			Agent.restore(conversation)
+			shown = REPLAY_MESSAGES
+			replay(conversation)
+			Console.appendLine(string.format(
+				"Recovered %d messages — the place was closed without saving.",
+				#conversation), "system")
 			return
 		end
 	end
+
+	if newest then Sessions.load(newest.id) end
 end
 
 -- Sidebar
@@ -823,6 +1113,12 @@ function Sessions.mountSidebar(parent: Instance, openSettings: () -> ()): (boole
 	make("UIPadding", { Parent = list, PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) })
 
 	local function draw()
+		-- Re-read the folders first. Under SetSetting `index` WAS the record and
+		-- only this module could change it; now the folders are, and they sit in
+		-- the Explorer where anything can rename, retitle or delete one. Drawing
+		-- from a stale copy is how a row comes to point at a session that is not
+		-- there, or how a cleared title reaches entry.title:lower() as nil.
+		rebuildIndex()
 		for _, child in ipairs(list:GetChildren()) do
 			if child:IsA("GuiObject") then child:Destroy() end
 		end
@@ -1024,53 +1320,130 @@ function Sessions.selfTest(): (boolean, string?)
 	end
 
 	-- Slots, against a fake store: this is the half that used to be impossible.
-	-- Everything here writes through pluginRef, so it is swapped for a table and
-	-- the real plugin settings are never touched.
-	local realPlugin, realIndex = pluginRef, index
-	local store: { [string]: any } = {}
-	pluginRef = {
-		GetSetting = function(_, key) return store[key] end,
-		SetSetting = function(_, key, value) store[key] = value end,
-	} :: any
-	index = {}
-
-	local slotOk, slotErr = pcall(function()
-		if freeSlot() ~= "1" then error("an empty index did not offer slot 1", 0) end
-		-- A pre-slot GUID entry occupies no slot, which is what lets an old
-		-- install keep its sessions without a migration.
-		index = { { id = "abc-guid", title = "old", place = 0, updated = 1 } :: Entry }
-		if freeSlot() ~= "1" then error("a GUID entry consumed a slot", 0) end
-		-- Lowest free, not next: a deleted session's slot is reusable.
-		index = {
-			{ id = "1", title = "a", place = 0, updated = 3 } :: Entry,
-			{ id = "3", title = "c", place = 0, updated = 1 } :: Entry,
-		}
-		if freeSlot() ~= "2" then error("freeSlot did not reuse the gap", 0) end
-		-- Full: the oldest goes, and its body with it.
-		index = {}
-		for slot = 1, MAX_SESSIONS do
-			index[slot] = { id = tostring(slot), title = "s", place = 0, updated = slot } :: Entry
-			store[KEY_PREFIX .. slot] = "body"
+	-- Chunking, against a folder that is NOT in the place. Instance.new with no
+	-- Parent is the same trick as the pluginRef swap this replaces, one layer
+	-- down: /selftest is one command away and must not write into ServerStorage.
+	--
+	-- This is the only genuinely new primitive in the module, and the only one
+	-- that can corrupt silently, so it is what the test is spent on.
+	local root = Instance.new("Folder")
+	local chunkOk, chunkErr = pcall(function()
+		local function session(): Instance
+			local f = Instance.new("Folder")
+			f.Parent = root
+			return f
 		end
-		if freeSlot() ~= nil then error("freeSlot found a slot in a full index", 0) end
-		local taken = nextId()
-		if taken ~= "1" then error("nextId evicted something other than the oldest: " .. taken, 0) end
-		if store[KEY_PREFIX .. "1"] ~= nil then
-			error("nextId dropped the entry but left its body behind", 0)
+		local function roundTrip(name: string, body: string)
+			local f = session()
+			writeBody(f, body)
+			local back = readBody(f)
+			if back ~= body then
+				error(string.format("%s: %d bytes in, %d back", name, #body, #back), 0)
+			end
 		end
-		if #index ~= MAX_SESSIONS - 1 then error("nextId did not drop exactly one entry", 0) end
 
-		-- The reclaim. A body whose entry is gone is unreachable by every read,
-		-- and before slots it was also impossible to delete.
-		store[KEY_PREFIX .. "1"] = "orphan"
-		if reclaimSlots() ~= 1 then error("reclaimSlots missed an unreferenced body", 0) end
-		if store[KEY_PREFIX .. "1"] ~= nil then error("reclaimSlots left the orphan", 0) end
-		if reclaimSlots() ~= 0 then error("reclaimSlots deleted a body the index names", 0) end
+		roundTrip("empty", "")
+		roundTrip("one short chunk", "[]")
+		roundTrip("exactly one chunk", string.rep("a", CHUNK_BYTES))
+		roundTrip("one past a chunk", string.rep("a", CHUNK_BYTES + 1))
+		roundTrip("several chunks", string.rep("ab", CHUNK_BYTES * 2))
+
+		-- A cut landing INSIDE a codepoint. JSONEncode emits raw multi-byte UTF-8,
+		-- and on real sessions one boundary in seventy-three landed here; a plain
+		-- :sub() leaves two chunks that are each invalid UTF-8.
+		local wide = string.rep("\u{2014}", CHUNK_BYTES)
+		roundTrip("split mid-codepoint", wide)
+		local widened = session()
+		writeBody(widened, wide)
+		for _, child in ipairs(widened:GetChildren()) do
+			if child:IsA("StringValue") and not utf8.len(child.Value) then
+				error("a chunk is not valid UTF-8 on its own", 0)
+			end
+		end
+
+		-- SHRINKING. Chunks numbered past the new end have to go, or the next read
+		-- concatenates them onto the end of the conversation.
+		local shrink = session()
+		writeBody(shrink, string.rep("x", CHUNK_BYTES * 4))
+		writeBody(shrink, "small")
+		if readBody(shrink) ~= "small" then error("a shrunk session read back long", 0) end
+		local kept = 0
+		for _, child in ipairs(shrink:GetChildren()) do
+			if child:IsA("StringValue") then kept += 1 end
+		end
+		if kept ~= 1 then error("shrinking left " .. kept .. " chunks, want 1", 0) end
+
+		-- A stray value dropped into the folder by hand is IGNORED rather than
+		-- spliced on, which is what the chunks attribute buys.
+		local stray = Instance.new("StringValue")
+		stray.Name = "9"
+		stray.Value = "garbage"
+		stray.Parent = shrink
+		if readBody(shrink) ~= "small" then error("a stray chunk was concatenated in", 0) end
+		local notes = Instance.new("StringValue")
+		notes.Name = "notes"
+		notes.Value = "hello"
+		notes.Parent = shrink
+		if readBody(shrink) ~= "small" then error("a non-numeric child was read as a chunk", 0) end
+
+		-- A HOLE is a torn write. Reading the prefix would hand JSONDecode a
+		-- truncated document; nothing at all is the honest answer.
+		local torn = session()
+		writeBody(torn, string.rep("y", CHUNK_BYTES * 3))
+		local middle = torn:FindFirstChild("2")
+		if middle then middle:Destroy() end
+		if readBody(torn) ~= "" then error("a torn session read back as a prefix", 0) end
+
+		-- Writing the SAME text twice must touch nothing. This is the whole point
+		-- of the skip in writeBody, and a Changed counter is the only way to see
+		-- it from outside: the bytes are identical either way.
+		local quiet = session()
+		local same = string.rep("q", CHUNK_BYTES * 2)
+		writeBody(quiet, same)
+		local writes = 0
+		for _, child in ipairs(quiet:GetChildren()) do
+			if child:IsA("StringValue") then
+				child.Changed:Connect(function() writes += 1 end)
+			end
+		end
+		writeBody(quiet, same)
+		if writes ~= 0 then error("rewrote " .. writes .. " unchanged chunk(s)", 0) end
+		-- ...and a real change still lands, or the skip is just a broken write.
+		writeBody(quiet, string.rep("q", CHUNK_BYTES * 2 - 1) .. "z")
+		if writes == 0 then error("a changed chunk was not written", 0) end
+
+		-- Compression. With no EncodingService the whole path has to degrade to
+		-- plain text rather than fail, so both branches are assertions.
+		local cold = session()
+		local body = string.rep('{"a":1}', 5000)
+		writeBody(cold, body)
+		compressSession(cold)
+		if EncodingService then
+			if cold:GetAttribute("compressed") == nil then
+				error("compressSession left the folder uncompressed", 0)
+			end
+		elseif cold:GetAttribute("compressed") ~= nil then
+			error("marked compressed with no EncodingService", 0)
+		end
+		if loadBody(cold) ~= body then error("a cold session did not round-trip", 0) end
+
+		-- Big enough to span several chunks in the compressed form too.
+		local spanning = session()
+		local big = string.rep('{"k":"vvvvvvvvvv"}', 60000)
+		writeBody(spanning, big)
+		compressSession(spanning)
+		if loadBody(spanning) ~= big then
+			error("a multi-chunk cold session did not round-trip", 0)
+		end
+
+		-- A folder with no `compressed` attribute keeps reading as plain text.
+		local plain = session()
+		writeBody(plain, "[1,2,3]")
+		if loadBody(plain) ~= "[1,2,3]" then error("a plain session did not read back", 0) end
 	end)
-
-	pluginRef, index = realPlugin, realIndex
-	if not slotOk then
-		return false, tostring(slotErr)
+	root:Destroy()
+	if not chunkOk then
+		return false, tostring(chunkErr)
 	end
 
 	return true

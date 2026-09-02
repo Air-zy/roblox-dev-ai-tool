@@ -7631,13 +7631,14 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		-- literal token `$(echo`, so the loop ran once over text nobody wrote.
 		{ line = "for f in $(echo Sample.luau); do wc -l $f; done", want = "5",
 		  why = "$(...) produces the loop's word list" },
-		-- A backslashed `;` inside a loop BODY. parseLoop is the parser that cuts
-		-- the body out, and it was the one that did not carry the quoted set, so
-		-- the `\;` reached -exec already read as a separator and -exec reported a
-		-- missing terminator.
-		{ line = "for d in .; do find $d -name Sample.luau -exec cat {} \\; ; done",
-		  want = "alpha\nbeta\ngamma\ndelta\nepsilon",
-		  why = "a backslashed ; survives being cut out as a loop body" },
+		-- ...and inside a loop BODY, which is a different parser: parseLoop cuts
+		-- the body out and re-chunks it, and it was the one that did not carry
+		-- the quoted set, so a `\;` came back out indistinguishable from the
+		-- separator it was escaped to avoid being. Deliberately `echo` and not
+		-- `find -exec`: this is about the token surviving the loop, and testing
+		-- it through -exec would drag in path resolution the fixture cannot do.
+		{ line = "for d in a b; do echo $d \\; x; done", want = "a ; x\nb ; x",
+		  why = "a backslashed ; is a word inside a loop body too" },
 		-- A QUOTED `for` binds nothing, so the substitution beside it must still
 		-- run. loopNames read the raw line and invented an `f` here.
 		{ line = "echo 'for f in x'; echo $(echo ok)", want = "for f in x\nok",
