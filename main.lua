@@ -123,8 +123,32 @@ local function syncRunState()
 end
 syncRunState()
 
+-- Everything this plugin connected to something that OUTLIVES it, dropped here.
+--
+-- Studio unloads and reloads a plugin every time its file is rewritten, and this
+-- plugin is rebuilt into the Plugins folder constantly, so this runs often. The
+-- flag alone used to be the whole handler, which stopped the poll below and
+-- nothing else: the Heartbeat in Console and the two signals in Fs stayed live
+-- on RunService, `game` and ScriptEditorService, one more set per rebuild, each
+-- still holding its dead console tree. Idle CPU and memory climbed all session
+-- and only restarting Studio cleared them — the exact failure Plugin.Unloading
+-- is documented to prevent ("if a plugin does not clean up properly, the old
+-- copies will remain").
+--
+-- Anything connected to a signal on `game`, a service, or RunService belongs
+-- here. Connections to our own GUI do not: those die with the widget.
 local unloading = false
-plugin.Unloading:Connect(function() unloading = true end)
+-- Forward-declared: the handler below runs long after this line, but it has to
+-- CLOSE over the local, and a `local` written further down would leave this
+-- reading the global of that name — nil — instead. Same trap as lastRequestAt
+-- in Agent.
+local escapeConnection: RBXScriptConnection? = nil
+plugin.Unloading:Connect(function()
+	unloading = true
+	Console.unload()
+	Fs.unload()
+	if escapeConnection then escapeConnection:Disconnect() end
+end)
 task.spawn(function()
 	while not unloading do
 		task.wait(1)
@@ -1135,7 +1159,10 @@ end)
 -- docs say it fires only while the client window has focus, which is precisely
 -- the 3D view and never this widget. Nothing else is hung off it: a key pressed
 -- while working in the viewport is meant for Studio, not for us.
-UserInputService.InputBegan:Connect(function(input: InputObject)
+-- HELD: UserInputService outlives the plugin, so this is the same leak as the
+-- Heartbeat and the two Fs signals — one more live handler per reload, each
+-- keeping Agent alive behind it.
+escapeConnection = UserInputService.InputBegan:Connect(function(input: InputObject)
 	if input.KeyCode == Enum.KeyCode.Escape and Agent.isBusy() then
 		Agent.stop()
 	end

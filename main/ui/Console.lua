@@ -41,6 +41,8 @@ local sink: Instance = nil :: any
 local nextOrder = 0
 -- The "Working..." row, see Console.setWorking.
 local workingRow: TextLabel = nil :: any
+-- The one per-frame connection, kept so Console.unload can drop it.
+local heartbeat: RBXScriptConnection? = nil
 
 -- How many blocks stay DRAWN.
 --
@@ -239,7 +241,12 @@ function Console.mount(parent: Instance, layoutOrder: number): ScrollingFrame
 	-- settled numbers. maxY is the bottom of the scroll range, the only fact the
 	-- engine gives us to work with.
 	local lastPos = 0
-	RunService.Heartbeat:Connect(function()
+	-- HELD so it can be dropped again. Heartbeat lives on RunService, which
+	-- outlives the plugin, so this goes on running once per frame after an
+	-- unload — against an orphaned `output` it also keeps alive. Studio reloads a
+	-- plugin whenever its file is rewritten, so without Console.unload the
+	-- handlers accumulate one per rebuild and only a Studio restart clears them.
+	heartbeat = RunService.Heartbeat:Connect(function()
 		local maxY = math.max(output.AbsoluteCanvasSize.Y - output.AbsoluteWindowSize.Y, 0)
 		local pos = output.CanvasPosition.Y
 		-- Where the view would sit if nobody but the engine had touched it: it only
@@ -261,6 +268,14 @@ function Console.mount(parent: Instance, layoutOrder: number): ScrollingFrame
 	end)
 	sink = output
 	return output
+end
+
+-- Drop the per-frame connection. Called from plugin.Unloading.
+function Console.unload()
+	if heartbeat then
+		heartbeat:Disconnect()
+		heartbeat = nil
+	end
 end
 
 -- `force` re-arms following even if the reader had scrolled up, for things they

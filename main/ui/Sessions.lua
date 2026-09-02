@@ -281,7 +281,39 @@ function Sessions.save()
 		warn("[agent] session not saved: " .. tostring(json))
 		return
 	end
+	-- The most stubbing could possibly reclaim, worked out before paying to find
+	-- out. The loop below re-clones and re-encodes the WHOLE conversation once
+	-- per pass, so six futile passes cost six copies of it and six multi-megabyte
+	-- strings — per save, and a save runs after every tool batch.
+	--
+	-- It is futile whenever results are not where the size is. A session that is
+	-- mostly thinking blocks and `write` payloads has nothing here to stub, and
+	-- both of those are out of reach on purpose: the thinking a turn is owed
+	-- back, and the record of what a write changed. Measured on a real 2 MB
+	-- session — 563 results holding 35 kB between them against 1.7 MB of thinking
+	-- and tool_use — stubbing every one reclaimed about 5 kB, six times over, and
+	-- the full encode was written anyway.
+	--
+	-- A JSON-escaped string is never longer than 6 bytes per source byte (\u00XX
+	-- is the longest escape there is), so 6x the raw content is a ceiling on what
+	-- the encoding can shrink by. Over it, no `keep` can reach the cap and the
+	-- loop is skipped; under it, nothing changes and it runs as before.
+	-- Deliberately loose — it only has to be a bound, and a loose one still
+	-- catches the case that costs.
+	local reclaimable = 0
 	if #json > MAX_BYTES then
+		for _, message in ipairs(conversation) do
+			if type(message.content) == "table" then
+				for _, block in ipairs(message.content) do
+					if block.type == "tool_result" and type(block.content) == "string"
+						and #block.content > #CLEARED then
+						reclaimable += #block.content
+					end
+				end
+			end
+		end
+	end
+	if #json > MAX_BYTES and #json - 6 * reclaimable <= MAX_BYTES then
 		-- Down until it fits, rather than one pass and hope. A single pass keeps
 		-- KEEP_RESULTS results whatever they weigh, and at Agent's
 		-- MODEL_RESULT_CHARS apiece that is half a megabyte on its own — so the

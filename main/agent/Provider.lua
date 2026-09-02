@@ -75,7 +75,11 @@ function Provider.use(id: string): boolean
 	-- the second argument.
 	Provider.wire.Initialize(Provider.auth, pluginRef)
 
-	if pluginRef then
+	-- Only on a real switch. `use` is also how Initialize applies the SAVED id,
+	-- which wrote back the value it had just read — and a plugin's settings are
+	-- one JSON object, so that is the whole store re-serialised on every load to
+	-- store nothing. Same trap as Settings.setSystem and for the same reason.
+	if pluginRef and pluginRef:GetSetting(KEY_PROVIDER) ~= id then
 		pluginRef:SetSetting(KEY_PROVIDER, id)
 	end
 	return true

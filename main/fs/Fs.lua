@@ -669,25 +669,46 @@ end
 
 -- Wire the session-wide sources. Called once from main; a second call is a
 -- no-op rather than a second set of connections.
+--
+-- HELD, not fired and forgotten. Both signals live on objects that outlive the
+-- plugin — `game` and ScriptEditorService — so a connection to either survives
+-- the plugin being unloaded and goes on running against a dead closure. Studio
+-- unloads and reloads a plugin every time its file is rewritten, which for this
+-- one is every rebuild, so the copies accumulate for as long as Studio is open
+-- and only a restart clears them. See Fs.unload.
 local watching = false
+local watchConnections: { RBXScriptConnection } = {}
 function Fs.watch()
 	if watching then return end
 	watching = true
-	game.DescendantAdded:Connect(function(inst)
+	watchConnections[#watchConnections + 1] = game.DescendantAdded:Connect(function(inst)
 		mtimes[inst] = os.time()
 	end)
 	-- Guarded because a missing event must not take the plugin down over a signal
 	-- that only fills in one column of `ls`.
 	if ScriptEditorService then
 		pcall(function()
-			ScriptEditorService.TextDocumentDidChange:Connect(function(document: any)
-				local target = document and document:GetScript()
-				if target then
-					mtimes[target] = os.time()
-				end
-			end)
+			watchConnections[#watchConnections + 1] =
+				ScriptEditorService.TextDocumentDidChange:Connect(function(document: any)
+					local target = document and document:GetScript()
+					if target then
+						mtimes[target] = os.time()
+					end
+				end)
 		end)
 	end
+end
+
+-- Drop the session-wide connections. Called from plugin.Unloading.
+--
+-- `watching` is cleared too, so a plugin that is unloaded and loaded again in
+-- the same Studio session re-wires rather than coming back deaf.
+function Fs.unload()
+	for _, connection in ipairs(watchConnections) do
+		connection:Disconnect()
+	end
+	table.clear(watchConnections)
+	watching = false
 end
 
 -- The script the user is actually editing, or nil.

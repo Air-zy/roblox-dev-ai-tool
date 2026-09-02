@@ -146,6 +146,13 @@ function Settings.setWebSearch(maxUses: number)
 end
 
 function Settings.setSystem(text: string)
+	-- Unchanged text writes nothing. The panel calls this on EVERY close,
+	-- whether or not the box was touched, and a plugin's settings are one JSON
+	-- object: there is no partial write, so setting any key re-serialises every
+	-- key. With sessions in the same store that is megabytes through the main
+	-- thread, which is long enough for Studio to offer to stop the plugin —
+	-- closing the settings panel was doing exactly that.
+	if text == state.system then return end
 	state.system = text
 	pluginRef:SetSetting(KEY_SYSTEM, text)
 end
