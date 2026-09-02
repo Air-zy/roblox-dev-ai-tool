@@ -179,8 +179,14 @@ local function splitBinary(text: string): { string }
 	return out
 end
 
-local function writeBody(session: Instance, text: string, binary: boolean?)
+-- Returns how many chunks were actually WRITTEN, which is the only way the
+-- skip below can be asserted: an unchanged write and a skipped one leave
+-- byte-identical instances behind, and Changed cannot be used to tell them
+-- apart because Roblox defers signal handlers to the next resumption point,
+-- long after a synchronous self-test has read its counter.
+local function writeBody(session: Instance, text: string, binary: boolean?): number
 	local parts = if binary then splitBinary(text) else splitChunks(text)
+	local written = 0
 	for n, part in ipairs(parts) do
 		local name = tostring(n)
 		local existing = session:FindFirstChild(name)
@@ -198,12 +204,14 @@ local function writeBody(session: Instance, text: string, binary: boolean?)
 			-- down: the cheapest write is the one not made.
 			if value.Value ~= part then
 				value.Value = part
+				written += 1
 			end
 		else
 			value = Instance.new("StringValue")
 			value.Name = name
 			value.Value = part
 			value.Parent = session
+			written += 1
 		end
 	end
 	-- The count, written BEFORE the leftovers go. readBody reads exactly this
@@ -222,6 +230,7 @@ local function writeBody(session: Instance, text: string, binary: boolean?)
 		local n = tonumber(child.Name)
 		if n and n > #parts and child:IsA("StringValue") then child:Destroy() end
 	end
+	return written
 end
 
 -- Indexed by the chunk's number, never appended: GetChildren is insertion order,
@@ -1394,23 +1403,23 @@ function Sessions.selfTest(): (boolean, string?)
 		if middle then middle:Destroy() end
 		if readBody(torn) ~= "" then error("a torn session read back as a prefix", 0) end
 
-		-- Writing the SAME text twice must touch nothing. This is the whole point
-		-- of the skip in writeBody, and a Changed counter is the only way to see
-		-- it from outside: the bytes are identical either way.
+		-- Writing the SAME text twice must touch nothing, and this is the whole
+		-- point of the skip in writeBody. Asserted off its return value rather
+		-- than a Changed counter: signal handlers are DEFERRED, so a counter
+		-- still reads zero here whether or not the write happened, and the test
+		-- would pass for the wrong reason.
 		local quiet = session()
 		local same = string.rep("q", CHUNK_BYTES * 2)
-		writeBody(quiet, same)
-		local writes = 0
-		for _, child in ipairs(quiet:GetChildren()) do
-			if child:IsA("StringValue") then
-				child.Changed:Connect(function() writes += 1 end)
-			end
+		local first = writeBody(quiet, same)
+		if first ~= 2 then error("first write reported " .. first .. " chunks, want 2", 0) end
+		local again = writeBody(quiet, same)
+		if again ~= 0 then error("rewrote " .. again .. " unchanged chunk(s)", 0) end
+		-- ...and a real change still lands, in the ONE chunk that carries it,
+		-- or the skip is just a broken write.
+		local touched = writeBody(quiet, string.rep("q", CHUNK_BYTES * 2 - 1) .. "z")
+		if touched ~= 1 then
+			error("a one-chunk change wrote " .. touched .. " chunk(s), want 1", 0)
 		end
-		writeBody(quiet, same)
-		if writes ~= 0 then error("rewrote " .. writes .. " unchanged chunk(s)", 0) end
-		-- ...and a real change still lands, or the skip is just a broken write.
-		writeBody(quiet, string.rep("q", CHUNK_BYTES * 2 - 1) .. "z")
-		if writes == 0 then error("a changed chunk was not written", 0) end
 
 		-- Compression. With no EncodingService the whole path has to degrade to
 		-- plain text rather than fail, so both branches are assertions.
