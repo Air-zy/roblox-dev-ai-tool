@@ -103,10 +103,26 @@ end
 -- Runs a tool. Never throws: a tool that errors returns the error as its result,
 -- because every tool_use needs a matching tool_result and an unanswered one is a
 -- protocol error that poisons the rest of the conversation.
+-- Whether a tool is switched on, injected rather than required, for the reason
+-- Terminal.setRunGuard is: this module is the registry and has no business
+-- knowing about the settings panel. Absent means everything is on.
+local enabledGuard: ((string) -> boolean)? = nil
+
+function Tools.setEnabledGuard(guard: (string) -> boolean)
+	enabledGuard = guard
+end
+
 function Tools.dispatch(term: any, name: string, input: { [string]: any }): string
 	local tool = byName[name]
 	if not tool then
 		return "error: unknown tool '" .. tostring(name) .. "'"
+	end
+	-- A backstop, not the mechanism — Agent.buildTools already withholds the
+	-- definition. This catches a call replayed out of history from before the
+	-- tool was switched off, where running it would be the one thing the setting
+	-- exists to prevent.
+	if enabledGuard and not enabledGuard(name) then
+		return string.format("error: %s is switched off in settings", name)
 	end
 	local ok, result = pcall(tool.run, term, input)
 	if not ok then

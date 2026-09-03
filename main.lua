@@ -42,6 +42,7 @@ local Find     = require(ui:WaitForChild("Find"))
 local Settings = require(ui:WaitForChild("Settings"))
 local Sessions = require(ui:WaitForChild("Sessions"))
 local Agent    = require(agent:WaitForChild("Agent"))
+local Tools    = require(agent:WaitForChild("Tools"))
 local Commands = require(script:WaitForChild("Commands"))
 
 local make = Theme.make
@@ -58,6 +59,9 @@ local term = Terminal.new(game)
 -- Terminal asks this before executing anything, rather than importing Settings
 -- itself; keeps the dependency pointing one way.
 Terminal.setRunGuard(Settings.allowRun)
+-- Same shape, same reason: the registry asks whether a tool is on rather than
+-- importing the settings panel to find out.
+Tools.setEnabledGuard(Settings.toolEnabled)
 
 -- Widget + toolbar
 -- Float, not Bottom: there is no dock state for the centre viewport. Studio
@@ -373,6 +377,17 @@ local function compact(n: number): string
 	return tostring(n)
 end
 
+-- "1h 46m 18s", dropping leading units that are zero. Claude Code's own session
+-- block reads the same way; a bare second count is unreadable past a few minutes
+-- and a padded 00h 00m is three units of noise to find the one that moved.
+local function elapsed(seconds: number): string
+	local whole = math.max(0, math.floor(seconds))
+	local h, m, s = whole // 3600, whole % 3600 // 60, whole % 60
+	if h > 0 then return string.format("%dh %dm %ds", h, m, s) end
+	if m > 0 then return string.format("%dm %ds", m, s) end
+	return string.format("%ds", s)
+end
+
 -- Plan usage ------------------------------------------------------------------
 -- Held between openings so the bars are already on screen while a refresh is in
 -- flight, and so a rate-limited fetch (the usage endpoint has its own limit)
@@ -418,9 +433,31 @@ local function usageRows(rows: { Settings.StatusRow })
 			label = row.label,
 			value = row.value .. age,
 			bar = row.bar,
+			barValue = row.barValue,
 		})
 	end
 end
+
+-- The plan, on Anthropic only. Not a capability every provider has: OpenRouter
+-- sells credits and has no plan to name, so the row is absent there rather than
+-- present and empty.
+--
+-- Read here, fetched elsewhere. The first version called the provider straight
+-- from the status provider, which meant a blocking HTTP request inside a redraw
+-- — and, because a failed lookup cached nothing, one request per redraw for the
+-- rest of the session.
+local planName: string? = nil
+local planTried = false
+
+local function planRow(rows: { Settings.StatusRow })
+	if planName then
+		table.insert(rows, { label = "Plan", value = planName :: string })
+	end
+end
+
+-- Fetched below, beside refreshUsage: both need refreshSettings, which does not
+-- exist until mountPanel has returned.
+local refreshPlan: () -> ()
 
 -- One branch per tab. Asked only for the page on screen, so the work each page
 -- does to build itself is work the other two never pay for — which is the whole
@@ -429,10 +466,10 @@ local toggleSettings, refreshSettings = Settings.mountPanel(widget,
 	function(page: Settings.Page): { Settings.StatusRow }
 	local rows: { Settings.StatusRow } = {}
 
-	-- Sticky, above the tabs. It gates the other two: a signed-out Usage page
-	-- has nothing to report and no way to say why, so the reason lives here
-	-- where every page can see it.
-	if page == "header" then
+	-- Model, effort, web search and run-code are NOT repeated here: each has a
+	-- dropdown a few rows down showing the same value, and the console header
+	-- already carries model . effort.
+	if page == "settings" then
 		if Provider.auth.isLoggedIn() then
 			local expiry = Provider.auth.tokenExpiry()
 			local detail = "yes"
@@ -443,42 +480,91 @@ local toggleSettings, refreshSettings = Settings.mountPanel(widget,
 		else
 			table.insert(rows, { label = "Signed in", value = "no — /login" })
 		end
-		return rows
-	end
-
-	-- Model, effort, web search and run-code are NOT repeated here: each has a
-	-- dropdown a few rows down showing the same value, and the console header
-	-- already carries model . effort.
-	if page == "settings" then
 		table.insert(rows, { label = "Working dir", value = term:pwd() })
+
+		-- One row per tool, click to flip. This replaced two dropdown sections
+		-- with a wrapped paragraph under each, which spent most of the page on two
+		-- values and had no way at all to reach the other five tools.
+		--
+		-- The warnings the paragraphs carried are not gone, they are the row's
+		-- value: the one that matters is `run`'s, and it is now beside the switch
+		-- that arms it rather than three lines below.
+		table.insert(rows, { label = "TOOLS", value = "", heading = true })
+		for _, name in ipairs(Tools.names()) do
+			-- `run` keeps its own setting rather than joining toolsOff. It is not
+			-- just a tool definition: Terminal.setRunGuard gates execution itself,
+			-- which also covers `/sh` and anything else reaching Exec, and that is
+			-- the guard worth keeping for the one tool that can freeze Studio.
+			local isRun = name == "run"
+			local on = if isRun then Settings.allowRun() else Settings.toolEnabled(name)
+			table.insert(rows, {
+				label = name,
+				value = "",
+				toggle = on,
+				onClick = function()
+					if isRun then
+						Settings.setAllowRun(not on)
+					else
+						Settings.setToolEnabled(name, not on)
+					end
+				end,
+			})
+		end
+		-- Web search is not in Tools.names(): it is Anthropic's server-side tool,
+		-- and it is a ceiling rather than a switch, so it keeps the dropdown of its
+		-- own further down the page.
 		return rows
 	end
 
 	if page == "usage" then
-		-- Asked for here rather than when the panel opens: opening Settings to
-		-- change the system prompt should cost no network at all. Its own 60s
-		-- freshness guard still applies, so flipping between tabs does not refetch,
-		-- and the rows below draw whatever was last known while it is in flight.
-		refreshUsage()
+		planRow(rows)
 		usageRows(rows)
+
+		-- Refresh sits with the bars it refreshes rather than in the panel chrome,
+		-- where it would have to say what it acts on. Clears the freshness stamp
+		-- first: refreshUsage's own 60s guard exists to stop a panel open costing a
+		-- request, and an explicit click is the one case that should always spend
+		-- one — a reader pressing Refresh has already decided the numbers are old.
+		table.insert(rows, {
+			label = "",
+			value = if usageInFlight then "refreshing…" else "↻ Refresh",
+			onClick = function()
+				if usageInFlight then return end
+				usageFetchedAt = 0
+				refreshUsage()
+			end,
+		})
+
+		-- Session totals, in the shape Claude Code's own end-of-session block
+		-- reports (cost-tracker.ts formatTotalCost). Cost itself is deliberately
+		-- absent: it needs a per-model price table, and a hardcoded one goes stale
+		-- without saying so — a confidently wrong number is worse here than none.
+		-- Same for the per-model split and API duration, which need usage keyed by
+		-- model and a clock threaded through Stream.
 		local spent = Agent.usage()
+		table.insert(rows, { label = "Session", value = elapsed(Agent.sessionElapsed()) })
 		table.insert(rows, {
 			label = "Tokens",
 			value = string.format("%s in · %s out", compact(spent.input), compact(spent.output)),
 		})
-		-- Cache hit rate over the session. Its own row rather than a third figure
-		-- on the one above, which truncates at the end and would drop it. Absent
-		-- before the first turn, where 0 of 0 is not 0%.
+		-- Cache read and cache WRITE are separate figures because they are priced
+		-- an order of magnitude apart, and the hit rate is the thing that decides
+		-- what the next turn costs. Absent before the first turn, where 0 of 0 is
+		-- not 0%.
 		if spent.input > 0 then
 			table.insert(rows, {
-				label = "Cache hits",
+				label = "Cache",
+				value = string.format("%d%% hits · %s read · %s written",
+					math.floor(spent.cached / spent.input * 100),
+					compact(spent.cached), compact(spent.cacheWrite)),
+			})
+			table.insert(rows, {
+				label = "Requests",
 				-- Whether the NEXT turn still has a prefix to read is a different
 				-- question from how well the past ones did, and it is the one that
-				-- decides what the turn costs. Only shown once there is a session to
-				-- be warm about, and only as a prediction — the TTL has not expired;
-				-- a changed prefix would still miss. See Agent.cacheWarm.
-				value = string.format("%d%% · %s read · next %s",
-					math.floor(spent.cached / spent.input * 100), compact(spent.cached),
+				-- decides what the turn costs. Only a prediction — the TTL has not
+				-- expired; a changed prefix would still miss. See Agent.cacheWarm.
+				value = string.format("%d · next %s", spent.requests,
 					if Agent.cacheWarm() then "warm" else "cold"),
 			})
 		end
@@ -503,14 +589,29 @@ local toggleSettings, refreshSettings = Settings.mountPanel(widget,
 	-- the offline fallback), and then there is no fraction to draw: the row falls
 	-- back to the raw count rather than inventing a window to divide by.
 	local window = Provider.wire.contextWindow and Provider.wire.contextWindow(Settings.model())
-	if usage.prompt > 0 then
-		-- What filled it. Not five more tracks — five more bars read as five more
-		-- budgets, where the question these answer is which slice of the ONE
-		-- budget above is which. So the answer is the SAME bar, divided.
-		--
-		-- Computed before the Context row is built, because it feeds that row's
-		-- segments.
-		local breakdown = Agent.contextBreakdown()
+
+	-- What filled it. Not five more tracks — five more bars read as five more
+	-- budgets, where the question these answer is which slice of the ONE budget
+	-- above is which. So the answer is the SAME bar, divided.
+	--
+	-- Computed before the Context row is built, because it feeds that row's
+	-- segments and, before the first reply, its total as well.
+	local breakdown, measured = Agent.contextBreakdown()
+
+	-- A reply's usage is the exact prompt size and is preferred whenever there is
+	-- one. Without it the rows carry the raw estimate and their sum IS the total —
+	-- which is the whole reason this no longer waits for a reply: a session
+	-- restored from disk is exactly when "how full am I before I send" is the
+	-- question, and it used to be the one moment the page refused to answer.
+	local total = usage.prompt
+	if not measured and breakdown then
+		total = 0
+		for _, row in ipairs(breakdown) do
+			total += row.tokens
+		end
+	end
+
+	if total > 0 then
 
 		-- Segment fractions are of the WINDOW, matching the plain bar they
 		-- replace, so the stack ends exactly where the single fill would have and
@@ -530,13 +631,18 @@ local toggleSettings, refreshSettings = Settings.mountPanel(widget,
 			segments = built
 		end
 
+		-- A leading "~" is the whole of the honesty here, and it is enough: the
+		-- figure is a character estimate until a reply reports what was billed,
+		-- and the shape of the row is otherwise identical so the two do not read
+		-- as different statistics.
+		local mark = if measured then "" else "~"
 		table.insert(rows, {
 			label = "Context",
 			value = if window
-				then string.format("%s / %s · %d%%", compact(usage.prompt), compact(window),
-					math.floor(usage.prompt / window * 100))
-				else compact(usage.prompt) .. " · window unknown",
-			bar = if window then math.min(1, usage.prompt / window) else nil,
+				then string.format("%s%s / %s · %d%%", mark, compact(total), compact(window),
+					math.floor(total / window * 100))
+				else mark .. compact(total) .. " · window unknown",
+			bar = if window then math.min(1, total / window) else nil,
 			segments = segments,
 		})
 
@@ -548,7 +654,7 @@ local toggleSettings, refreshSettings = Settings.mountPanel(widget,
 		if breakdown then
 			local other = 0
 			for _, row in ipairs(breakdown) do
-				local share = row.tokens / usage.prompt
+				local share = row.tokens / total
 				if share < 0.01 then
 					other += row.tokens
 				else
@@ -568,13 +674,45 @@ local toggleSettings, refreshSettings = Settings.mountPanel(widget,
 				})
 			end
 		end
+	else
+		-- Reachable only with no system prompt, no tools and no history, which is
+		-- not a state the plugin starts in. Says so rather than drawing nothing,
+		-- because a page with one row and no explanation reads as broken.
+		table.insert(rows, { label = "Context", value = "nothing to send yet" })
 	end
 	return rows
-end)
+end,
+	-- Fires when a page BECOMES visible, never on a plain redraw, which is what
+	-- keeps the two fetches out of the render loop. Opening Settings to edit the
+	-- system prompt still costs no network at all.
+	function(page: Settings.Page)
+		if page == "usage" then
+			refreshUsage()
+			refreshPlan()
+		end
+	end)
 
--- The bars come from a network call, so they can't be produced inside the
--- synchronous status provider above. Fetched when the Usage page is drawn,
--- redrawn when it lands.
+-- Once per session, off the render path, and `planTried` covers the failure as
+-- well as the success: a profile endpoint that 404s on some account shape must
+-- cost one request, not one per panel open.
+refreshPlan = function()
+	local fetch = (Provider.auth :: any).fetchPlan
+	if planTried or not fetch or not Provider.auth.isLoggedIn() then return end
+	planTried = true
+	task.spawn(function()
+		local ok, name = pcall(fetch)
+		if ok and type(name) == "string" and name ~= "" then
+			planName = name
+			refreshSettings()
+		end
+	end)
+end
+
+-- The bars come from a network call, so they cannot be produced inside the
+-- status provider above — that runs on every redraw, INCLUDING the redraw this
+-- triggers when it lands, so a fetch in there answers itself forever. Both of
+-- these are driven by onPageShown instead, which fires only when a page becomes
+-- visible.
 local USAGE_MAX_AGE = 60
 refreshUsage = function()
 	if usageInFlight or not Provider.auth.isLoggedIn() then return end

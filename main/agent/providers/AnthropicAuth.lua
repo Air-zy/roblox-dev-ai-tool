@@ -415,13 +415,28 @@ local function fraction(utilization: any): number?
 	return math.clamp(if utilization > 1 then utilization / 100 else utilization, 0, 1)
 end
 
--- The two rolling windows Claude Code's /usage draws, as rows. Anything the
--- response does not carry is simply not a row.
-local function usageRows(payload: any): { { label: string, value: string, bar: number? } }
-	local rows: { { label: string, value: string, bar: number? } } = {}
+-- Every rolling window the endpoint can carry, as rows. Anything the response
+-- does not carry is simply not a row, so an account with no per-model limits
+-- draws the two it does have and nothing else.
+--
+-- The list is the one in Claude Code's own Utilization type (services/api/usage.ts):
+-- five_hour, seven_day, seven_day_oauth_apps, seven_day_opus, seven_day_sonnet,
+-- plus extra_usage. We used to read the first two and look for a
+-- `seven_day_overage_included` that is not in the current shape at all — so a Max
+-- account's per-model weekly limits, the ones that actually bite, were invisible.
+--
+-- `value` is what sits at the top right and `barValue` beside the track, because
+-- the two answer different questions: when it comes back, and how much is gone.
+export type UsageRow = { label: string, value: string, bar: number?, barValue: string? }
+
+local function usageRows(payload: any): { UsageRow }
+	local rows: { UsageRow } = {}
 	for _, window in ipairs({
 		{ key = "five_hour", label = "Session (5h)" },
 		{ key = "seven_day", label = "Weekly" },
+		{ key = "seven_day_opus", label = "Weekly · Opus" },
+		{ key = "seven_day_sonnet", label = "Weekly · Sonnet" },
+		{ key = "seven_day_oauth_apps", label = "Weekly · apps" },
 	}) do
 		local data = payload[window.key]
 		if type(data) == "table" then
@@ -429,16 +444,81 @@ local function usageRows(payload: any): { { label: string, value: string, bar: n
 			if used then
 				rows[#rows + 1] = {
 					label = window.label,
-					value = string.format("%d%% · %s", math.floor(used * 100 + 0.5), untilReset(data.resets_at)),
+					value = untilReset(data.resets_at),
 					bar = used,
+					barValue = string.format("%d%% used", math.floor(used * 100 + 0.5)),
 				}
 			end
 		end
 	end
+
+	-- Extra usage is credits, not a rolling window: it has no reset, and its
+	-- ceiling is a dollar figure rather than a share of a plan. Only drawn when
+	-- the account has it turned on, since "0% of nothing" is not a limit.
+	local extra = payload.extra_usage
+	if type(extra) == "table" and extra.is_enabled == true then
+		local used = fraction(extra.utilization)
+		rows[#rows + 1] = {
+			label = "Extra usage",
+			value = if type(extra.monthly_limit) == "number"
+				then string.format("$%d/mo cap", extra.monthly_limit) else "enabled",
+			bar = used,
+			barValue = if used then string.format("%d%% used", math.floor(used * 100 + 0.5)) else nil,
+		}
+	end
 	return rows
 end
 
-local function fetchUsage(): ({ { label: string, value: string, bar: number? } }?, string?)
+-- The plan, from the profile endpoint. Cached for the session because it is the
+-- one number here that does not move: a subscription does not change between two
+-- openings of a settings panel, and the usage call beside this one already pays
+-- for a round trip every minute.
+--
+-- Derived from organization.organization_type exactly as Claude Code does
+-- (services/oauth/client.ts:369) — claude_max/claude_pro/claude_enterprise/
+-- claude_team, and null for anything else, which includes plain API accounts.
+-- Unknown is left blank rather than guessed: naming the wrong plan is worse than
+-- naming none, and this is a row the reader would take at face value.
+local PROFILE_URL = "https://api.anthropic.com/api/claude_cli_profile"
+local PLAN_NAMES: { [string]: string } = {
+	claude_max = "Max",
+	claude_pro = "Pro",
+	claude_enterprise = "Enterprise",
+	claude_team = "Team",
+}
+local cachedPlan: string? = nil
+
+local function fetchPlan(): string?
+	if cachedPlan then return cachedPlan end
+	local token = getAccessToken()
+	if not token then return nil end
+	local ok, response = pcall(function()
+		return HttpService:RequestAsync({
+			Url = PROFILE_URL,
+			Method = "GET",
+			Headers = {
+				["Authorization"] = "Bearer " .. token,
+				["accept"] = "application/json",
+				["x-app"] = "cli",
+			},
+		})
+	end)
+	-- Silent on failure, unlike fetchUsage. This is one decorative row; a profile
+	-- endpoint that 404s on some account shape must not put an error where the
+	-- plan goes, and must not cost a retry on every panel open either.
+	if not ok or (response :: any).StatusCode ~= 200 then return nil end
+	local parsed
+	local parseOk = pcall(function()
+		parsed = HttpService:JSONDecode((response :: any).Body)
+	end)
+	if not parseOk or type(parsed) ~= "table" then return nil end
+	local org = (parsed :: any).organization
+	local name = type(org) == "table" and PLAN_NAMES[tostring(org.organization_type)] or nil
+	cachedPlan = name
+	return name
+end
+
+local function fetchUsage(): ({ UsageRow }?, string?)
 	local token, tokenErr = getAccessToken()
 	if not token then
 		return nil, tokenErr or "Not logged in."
@@ -480,6 +560,8 @@ end
 local function logout()
 	clearTokens()
 	clearPkceState()
+	-- Or the next account to sign in inherits this one's plan for the session.
+	cachedPlan = nil
 end
 
 local function tokenExpiry(): number?
@@ -495,6 +577,7 @@ return {
 	isLoggedIn = isLoggedIn,
 	getAccessToken = getAccessToken,
 	fetchUsage = fetchUsage,
+	fetchPlan = fetchPlan,
 	logout = logout,
 	refresh = refresh,
 	tokenExpiry = tokenExpiry,

@@ -220,8 +220,24 @@ end
 -- reorder invalidates the system and conversation breakpoints too. The registry
 -- sorts; web search is appended last so toggling it only ever invalidates from
 -- the end of the tool block onward.
+-- Switched-off tools are removed HERE rather than refused at dispatch, and the
+-- trade is deliberate. Removing changes the tool block, so flipping a toggle
+-- costs one cache re-write from the tool block onward — paid once, while the
+-- reader is already in the settings panel. Leaving them in and refusing the call
+-- instead costs a wasted tool call every turn the model reaches for something it
+-- is never allowed to have, forever. Tools.dispatch refuses too, but as a
+-- backstop for a call replayed out of old history, not as the mechanism.
+--
+-- Relative order is preserved, so the surviving prefix is still stable turn to
+-- turn; only the one change invalidates.
 local function buildTools(): { any }
-	return Tools.definitions()
+	local out: { any } = {}
+	for _, def in ipairs(Tools.definitions()) do
+		if Settings.toolEnabled(def.name) then
+			out[#out + 1] = def
+		end
+	end
+	return out
 end
 
 local term: any = nil
@@ -257,7 +273,13 @@ local stopCurrent: (() -> ())? = nil
 -- occupies. A running sum answers a different question (what the session spent)
 -- and would climb past the window on turn three while the window sat half empty.
 -- Zero before the first reply, where there is nothing measured to show.
-local totals = { input = 0, output = 0, cached = 0, prompt = 0 }
+local totals = { input = 0, output = 0, cached = 0, cacheWrite = 0, prompt = 0, requests = 0 }
+
+-- Wall clock over the same span `totals` covers, which is the plugin's lifetime
+-- and not the conversation's: Agent.reset clears the window measurement and
+-- deliberately leaves what was SPENT alone, so a duration that restarted on
+-- /clear would disagree with every other number beside it.
+local sessionStartedAt = os.clock()
 -- tool_use / server_tool_use id -> the console block waiting for its result.
 -- Keyed by id rather than "the last one", because a turn can run several calls
 -- and parallel tool use means their blocks are all open at once.
@@ -314,8 +336,18 @@ function Agent.restore(messages: { any })
 	totals.prompt = 0
 end
 
-function Agent.usage(): { input: number, output: number, cached: number, prompt: number }
+function Agent.usage(): {
+	input: number, output: number, cached: number, cacheWrite: number,
+	prompt: number, requests: number,
+}
 	return totals
+end
+
+-- Seconds since the plugin loaded. Wall, not API time: timing the requests
+-- themselves would mean threading a clock through Stream, and the number a
+-- reader wants from a session summary is how long they have been at it.
+function Agent.sessionElapsed(): number
+	return os.clock() - sessionStartedAt
 end
 
 function Agent.isBusy(): boolean
@@ -547,17 +579,21 @@ end
 -- share. Claude Code carries the same two numbers for the same reason
 -- (bytesPerTokenForFileType).
 --
--- nil before the first reply: totals.prompt is the only exact number here, and
--- without it this would be an estimate wearing a measurement's clothes.
+-- Before the first reply there is no measurement to scale to, and the second
+-- return says so. This used to answer nil there, on the grounds that an unscaled
+-- estimate is an estimate wearing a measurement's clothes — but the clothes were
+-- the problem, not the estimate. A restored session is exactly when "how full am
+-- I before I send" is worth asking, and the constants are a rule of thumb good to
+-- roughly a fifth, which answers it. The caller marks it approximate.
 local BYTES_PER_TOKEN_TEXT = 4
 local BYTES_PER_TOKEN_JSON = 2
 
 export type ContextRow = { label: string, tokens: number }
 
-function Agent.contextBreakdown(): { ContextRow }?
-	if totals.prompt <= 0 then
-		return nil
-	end
+-- Returns the rows and whether they are MEASURED. Measured means scaled to what
+-- the last reply actually billed, so the rows sum to a true total; unmeasured
+-- means the raw character estimate, which is only ever the pre-first-reply case.
+function Agent.contextBreakdown(): ({ ContextRow }?, boolean)
 
 	-- The system prompt and the tool schemas are the part a walk of `conversation`
 	-- cannot see, and on a fresh session they ARE the context: several thousand
@@ -569,7 +605,14 @@ function Agent.contextBreakdown(): { ContextRow }?
 	local function add(label: string, chars: number, bytesPerToken: number)
 		if chars <= 0 then return end
 		rows[#rows + 1] = { label = label, tokens = 0 }
-		weighted[#weighted] = chars / bytesPerToken
+		-- +1, and the bug this fixes is why the breakdown never once appeared:
+		-- `weighted[#weighted]` writes index 0 on an empty table, and index 0 does
+		-- not count toward `#`, so every later call overwrote the same slot and the
+		-- table stayed empty as far as ipairs was concerned. estimate summed to 0,
+		-- the guard below read that as "nothing to show", and contextBreakdown
+		-- returned nil on every call it has ever received. Indexes here line up
+		-- with `rows`, so this must append exactly as rows[#rows + 1] does.
+		weighted[#weighted + 1] = chars / bytesPerToken
 	end
 
 	add("System prompt", #(Settings.system() or ""), BYTES_PER_TOKEN_TEXT)
@@ -594,14 +637,17 @@ function Agent.contextBreakdown(): { ContextRow }?
 		estimate += value
 	end
 	if estimate <= 0 then
-		return nil
+		return nil, false
 	end
-	-- The one line that makes the rest exact in aggregate.
-	local scale = totals.prompt / estimate
+	-- The one line that makes the rest exact in aggregate — when there is
+	-- something to be exact against. A scale of 1 leaves the raw estimate, which
+	-- is the honest answer before the first reply rather than no answer.
+	local measured = totals.prompt > 0
+	local scale = if measured then totals.prompt / estimate else 1
 	for index, row in ipairs(rows) do
 		row.tokens = math.floor(weighted[index] * scale)
 	end
-	return rows
+	return rows, measured
 end
 
 -- Returns the number of characters dropped; 0 means nothing was touched and the
@@ -1060,7 +1106,12 @@ local function runTurn(turn: number)
 					+ (result.usage.cache_creation_input_tokens or 0)
 				totals.input += prompt
 				totals.cached += result.usage.cache_read_input_tokens or 0
+				-- Kept apart from `cached` rather than summed with it: a read is
+				-- charged at a tenth and a write at one and a quarter, so one number
+				-- for both is the one thing a cache figure must not be.
+				totals.cacheWrite += result.usage.cache_creation_input_tokens or 0
 				totals.output += result.usage.output_tokens or 0
+				totals.requests += 1
 				-- Same counter, different window: totals is the session, this is
 				-- since the reader's last message, which is what a budget is for.
 				budgetSpent += result.usage.output_tokens or 0
