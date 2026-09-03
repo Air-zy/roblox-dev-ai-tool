@@ -382,6 +382,27 @@ local usageError: string? = nil
 local usageFetchedAt = 0
 local usageInFlight = false
 
+-- Forward-declared because the status provider below is written before it and
+-- calls it when the Usage page is drawn. Declared with `local` up here and
+-- ASSIGNED later, not declared later: a name used before its `local` exists is
+-- a nil global, not that local, which is the trap Agent.lua's cancelRequested
+-- and Sessions' `replay` are both arranged around.
+local refreshUsage: () -> ()
+
+-- One colour per breakdown category, keyed by the label Agent.contextBreakdown
+-- returns. Semantic where the palette already means something — tool calls take
+-- the same periwinkle the console draws them in, and the reader's own messages
+-- take the accent — so the bar agrees with the transcript above it. A label with
+-- no entry falls back to the muted grey rather than going invisible.
+local CONTEXT_COLORS: { [string]: Color3 } = {
+	["System prompt"] = Theme.TEXT_LO,
+	["Tool schemas"] = Theme.THINK_CLR,
+	["Your messages"] = Theme.ACCENT,
+	["Assistant"] = Theme.BAR_CLR,
+	["Tool calls"] = Theme.TOOL_CLR,
+	["Tool results"] = Theme.CODE_CLR,
+}
+
 -- Already formatted by whichever provider fetched them: one reports rolling
 -- utilisation windows and the other reports credits, and this panel is not the
 -- place to know the difference.
@@ -401,47 +422,72 @@ local function usageRows(rows: { Settings.StatusRow })
 	end
 end
 
-local toggleSettings, refreshSettings = Settings.mountPanel(widget, function(): { Settings.StatusRow }
+-- One branch per tab. Asked only for the page on screen, so the work each page
+-- does to build itself is work the other two never pay for — which is the whole
+-- reason the Context breakdown can afford to be as detailed as it is.
+local toggleSettings, refreshSettings = Settings.mountPanel(widget,
+	function(page: Settings.Page): { Settings.StatusRow }
 	local rows: { Settings.StatusRow } = {}
 
-	if Provider.auth.isLoggedIn() then
-		local expiry = Provider.auth.tokenExpiry()
-		local detail = "yes"
-		if expiry then
-			detail = string.format("yes · ~%d min", math.max(0, math.floor((expiry - os.time()) / 60)))
+	-- Sticky, above the tabs. It gates the other two: a signed-out Usage page
+	-- has nothing to report and no way to say why, so the reason lives here
+	-- where every page can see it.
+	if page == "header" then
+		if Provider.auth.isLoggedIn() then
+			local expiry = Provider.auth.tokenExpiry()
+			local detail = "yes"
+			if expiry then
+				detail = string.format("yes · ~%d min", math.max(0, math.floor((expiry - os.time()) / 60)))
+			end
+			table.insert(rows, { label = "Signed in", value = detail })
+		else
+			table.insert(rows, { label = "Signed in", value = "no — /login" })
 		end
-		table.insert(rows, { label = "Signed in", value = detail })
-	else
-		table.insert(rows, { label = "Signed in", value = "no — /login" })
+		return rows
 	end
 
-	usageRows(rows)
 	-- Model, effort, web search and run-code are NOT repeated here: each has a
 	-- dropdown a few rows down showing the same value, and the console header
 	-- already carries model . effort.
-	table.insert(rows, { label = "Working dir", value = term:pwd() })
+	if page == "settings" then
+		table.insert(rows, { label = "Working dir", value = term:pwd() })
+		return rows
+	end
+
+	if page == "usage" then
+		-- Asked for here rather than when the panel opens: opening Settings to
+		-- change the system prompt should cost no network at all. Its own 60s
+		-- freshness guard still applies, so flipping between tabs does not refetch,
+		-- and the rows below draw whatever was last known while it is in flight.
+		refreshUsage()
+		usageRows(rows)
+		local spent = Agent.usage()
+		table.insert(rows, {
+			label = "Tokens",
+			value = string.format("%s in · %s out", compact(spent.input), compact(spent.output)),
+		})
+		-- Cache hit rate over the session. Its own row rather than a third figure
+		-- on the one above, which truncates at the end and would drop it. Absent
+		-- before the first turn, where 0 of 0 is not 0%.
+		if spent.input > 0 then
+			table.insert(rows, {
+				label = "Cache hits",
+				-- Whether the NEXT turn still has a prefix to read is a different
+				-- question from how well the past ones did, and it is the one that
+				-- decides what the turn costs. Only shown once there is a session to
+				-- be warm about, and only as a prediction — the TTL has not expired;
+				-- a changed prefix would still miss. See Agent.cacheWarm.
+				value = string.format("%d%% · %s read · next %s",
+					math.floor(spent.cached / spent.input * 100), compact(spent.cached),
+					if Agent.cacheWarm() then "warm" else "cold"),
+			})
+		end
+		return rows
+	end
+
+	-- page == "context"
 	table.insert(rows, { label = "Messages", value = tostring(#Agent.conversation()) })
 	local usage = Agent.usage()
-	table.insert(rows, {
-		label = "Tokens",
-		value = string.format("%s in · %s out", compact(usage.input), compact(usage.output)),
-	})
-	-- Cache hit rate over the session. Its own row rather than a third figure on
-	-- the one above, which truncates at the end and would drop it. Absent before
-	-- the first turn, where 0 of 0 is not 0%.
-	if usage.input > 0 then
-		table.insert(rows, {
-			label = "Cache hits",
-			-- Whether the NEXT turn still has a prefix to read is a different
-			-- question from how well the past ones did, and it is the one that
-			-- decides what the turn costs. Only shown once there is a session to
-			-- be warm about, and only as a prediction — the TTL has not expired;
-			-- a changed prefix would still miss. See Agent.cacheWarm.
-			value = string.format("%d%% · %s read · next %s",
-				math.floor(usage.cached / usage.input * 100), compact(usage.cached),
-				if Agent.cacheWarm() then "warm" else "cold"),
-		})
-	end
 	-- How full the context window is: the LAST request's whole prompt over the
 	-- model's input window. The bar is the point — a percentage in a value column
 	-- is read as another statistic, where a track filling up is read as a budget,
@@ -458,6 +504,32 @@ local toggleSettings, refreshSettings = Settings.mountPanel(widget, function(): 
 	-- back to the raw count rather than inventing a window to divide by.
 	local window = Provider.wire.contextWindow and Provider.wire.contextWindow(Settings.model())
 	if usage.prompt > 0 then
+		-- What filled it. Not five more tracks — five more bars read as five more
+		-- budgets, where the question these answer is which slice of the ONE
+		-- budget above is which. So the answer is the SAME bar, divided.
+		--
+		-- Computed before the Context row is built, because it feeds that row's
+		-- segments.
+		local breakdown = Agent.contextBreakdown()
+
+		-- Segment fractions are of the WINDOW, matching the plain bar they
+		-- replace, so the stack ends exactly where the single fill would have and
+		-- the empty remainder is real free space. The row VALUES stay shares of
+		-- the prompt — "tool results are 61% of what I am sending" is the
+		-- actionable form, and it survives at 3% of a 1M window where a
+		-- share-of-window figure rounds to zero on every row.
+		local segments: { { fraction: number, color: Color3 } }? = nil
+		if breakdown and window then
+			local built: { { fraction: number, color: Color3 } } = {}
+			for _, row in ipairs(breakdown) do
+				built[#built + 1] = {
+					fraction = row.tokens / window,
+					color = CONTEXT_COLORS[row.label] or Theme.TEXT_LO,
+				}
+			end
+			segments = built
+		end
+
 		table.insert(rows, {
 			label = "Context",
 			value = if window
@@ -465,17 +537,14 @@ local toggleSettings, refreshSettings = Settings.mountPanel(widget, function(): 
 					math.floor(usage.prompt / window * 100))
 				else compact(usage.prompt) .. " · window unknown",
 			bar = if window then math.min(1, usage.prompt / window) else nil,
+			segments = segments,
 		})
-		-- What filled it. Indented under the total rather than given bars of their
-		-- own: five more tracks read as five more budgets, where the question these
-		-- answer is which slice of the ONE budget above is which.
-		--
-		-- Percentages are of the prompt, not of the window: "tool results are 61%
-		-- of what I am sending" is the actionable form, and it stays readable at
-		-- 3% of a 1M window where a share-of-window figure would round to zero on
-		-- every row. Rows under 1% are folded away — they are noise, and the panel
-		-- has a fixed height.
-		local breakdown = Agent.contextBreakdown()
+
+		-- The legend. The swatch is also the indent: the dot sits where Context's
+		-- text starts and pushes the label 12px right, so these read as nested
+		-- without a prefix of spaces doing the work. Rows under 1% are folded
+		-- away — they are noise, and the panel has a fixed height. Their segments
+		-- stay in the bar above, where at that size they are a sliver.
 		if breakdown then
 			local other = 0
 			for _, row in ipairs(breakdown) do
@@ -484,7 +553,8 @@ local toggleSettings, refreshSettings = Settings.mountPanel(widget, function(): 
 					other += row.tokens
 				else
 					table.insert(rows, {
-						label = "  · " .. row.label,
+						label = row.label,
+						swatch = CONTEXT_COLORS[row.label] or Theme.TEXT_LO,
 						value = string.format("%s · %d%%", compact(row.tokens),
 							math.floor(share * 100)),
 					})
@@ -492,7 +562,8 @@ local toggleSettings, refreshSettings = Settings.mountPanel(widget, function(): 
 			end
 			if other > 0 then
 				table.insert(rows, {
-					label = "  · other",
+					label = "other",
+					swatch = Theme.TEXT_LO,
 					value = string.format("%s · <1%% each", compact(other)),
 				})
 			end
@@ -502,9 +573,10 @@ local toggleSettings, refreshSettings = Settings.mountPanel(widget, function(): 
 end)
 
 -- The bars come from a network call, so they can't be produced inside the
--- synchronous status provider above. Fetch on open, redraw when it lands.
+-- synchronous status provider above. Fetched when the Usage page is drawn,
+-- redrawn when it lands.
 local USAGE_MAX_AGE = 60
-local function refreshUsage()
+refreshUsage = function()
 	if usageInFlight or not Provider.auth.isLoggedIn() then return end
 	if usageWindows and os.clock() - usageFetchedAt < USAGE_MAX_AGE then return end
 	usageInFlight = true
@@ -544,7 +616,6 @@ end
 -- shift and needs the same offset applied by hand.
 local sidebarOffset = 0
 local toggleSessions = Sessions.mountSidebar(widget, function()
-	refreshUsage()
 	toggleSettings(nil)
 end)
 sessionsButton.MouseButton1Click:Connect(function()

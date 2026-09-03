@@ -38,13 +38,16 @@ Ours, per `agent/Agent.lua`:
 
 ```
 turn → capTurn/forModel     (:144,:183  cap this turn's results)
-     → clearOldToolResults  (:609  clear old tool results, cold-cache only)
+     → clearOldToolResults  (clear old tool results, cold-cache only)
      → request
-     → stop                 (the model stopped, so the turn is over)
+     → budgetContinuation   (continue the turn, or stop)  [ported]
 ```
 
-Two of their four context stages exist here, and the loop has no budget
-mechanism at all. That is the headline, expanded in §4.1 and §4.2.
+The budget stage matches: armed per message by `+500k` or `use 2m tokens` in the
+prompt (`parseTokenBudget`), inert otherwise, both thresholds upstream's.
+
+Two of their four context stages exist here, and the missing one — summarising
+compaction — is the headline, expanded in §4.1.
 
 ---
 
@@ -81,6 +84,13 @@ Not gaps. Recording them so they are not "fixed" into existence later.
   left the note ("cached heights from a different width are wrong → black
   screen on scroll-up after widen"). Tracked as a `ponytail:` on
   `Sessions.lua`'s `windowEnd`.
+- **`count_tokens` for the context breakdown.** They call
+  `POST /v1/messages/count_tokens` once per category, in parallel, with a Haiku
+  fallback (`analyzeContext.ts`) — a round trip per row of `/context`.
+  `Agent.contextBreakdown` scales a local character count to the exact total the
+  last reply billed, so a uniform error in the bytes-per-token constants cancels
+  and the rows are right relative to each other for zero requests. Do not
+  "upgrade" this into six HTTP calls per settings open.
 - **Separate read vs shell result budgets.** They split shell output from file
   reads because a read is a primary operation and shell output is incidental.
   We take one number for both, because `cat` is not a separate tool here — it
@@ -113,23 +123,7 @@ from the other end.
 
 **Cost:** the session ends. Nothing degrades first — it works, then it stops.
 
-### 4.2 No token budget, so no continuation and no diminishing-returns stop
-
-`src/query/tokenBudget.ts` is 93 lines and we have none of it. When a turn ends
-under `COMPLETION_THRESHOLD = 0.9` of its budget, Claude Code does not stop — it
-issues `getBudgetContinuationMessage` and lets the model keep going. It stops on
-`isDiminishing`: three or more continuations where both the last delta and the
-current one are under `DIMINISHING_THRESHOLD = 500` tokens.
-
-Our loop ends when the model stops. A turn that halts early halts, full stop.
-
-**Cost:** real, and it is the quality-shaped one on this list. A model that stops
-at 40% of budget on a task it could have finished is the exact failure this
-mechanism exists to catch. Closing it needs a per-turn token count we already get
-from `usage`, plus a nudge message and a continuation cap. Smallest real port on
-this page.
-
-### 4.3 Compaction has no tool allowlist
+### 4.2 Compaction has no tool allowlist
 
 `microCompact.ts:41` clears results only for tools on `COMPACTABLE_TOOLS`
 (read, shell, grep, glob, web search, web fetch, edit, write) — an **allowlist**,
@@ -143,7 +137,7 @@ tells the model to re-run, and for `run` that advice can be wrong.
 **Cost:** low frequency, silent when it happens. Fix is a set literal and one
 condition.
 
-### 4.4 No max-output-tokens recovery loop
+### 4.3 No max-output-tokens recovery loop
 
 `query.ts:164` carries `MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3`. We detect the
 truncated-JSON case and report it to the model (§2), but there is no bounded
@@ -168,15 +162,60 @@ Kept so they are not re-investigated.
 
 ---
 
-## 6. To close the last gaps
+## 6. Endpoints
+
+What Claude Code calls that we do not. [verified] against the leak on
+2026-09-03. Nothing here is wired up; each is its own decision.
+
+**Not a gap — a stale host.** We post to `console.anthropic.com/v1/oauth/token`
+and authorize at `claude.ai/oauth/authorize`. Current Claude Code uses
+`platform.claude.com/v1/oauth/token` and `claude.com/cai/oauth/authorize`
+(`constants/oauth.ts:89,91`), with a matching
+`platform.claude.com/oauth/code/callback` redirect. Console **307s today**, so
+login works; we are depending on a redirect that is nobody's contract. This is
+the one item here worth acting on, and it is an auth change, not a feature.
+
+Applicable to a plugin — has an OAuth token, no filesystem, no MCP, no subagents:
+
+| Endpoint | Would buy |
+|---|---|
+| `POST /v1/messages/count_tokens` | An exact pre-send token count; we have none. Does **not** contradict §3, which is about the context *breakdown* — that total is already exact and free. |
+| `GET /api/claude_cli_profile` (fallback `/api/oauth/profile`) | Account + org identity, and the `x-organization-uuid` several other endpoints want. |
+| `GET /api/oauth/claude_cli/roles` | Org membership and role. |
+| `GET /api/claude_cli/bootstrap` | One startup call: entitlements and notices. |
+| `POST /api/oauth/claude_cli/create_api_key` | Mints a durable API key from an OAuth session — would remove refresh-token rotation from Studio entirely. Note [[anthropic-device-flow-unauthorized]]. |
+| `GET`/`PUT /api/oauth/account/settings` | Settings that survive a plugin reinstall. |
+| `POST /api/claude_cli_feedback` | Feedback with no browser trip. |
+
+**Not gaps, recorded so they are not rediscovered:** Claude Code calls neither
+`GET /v1/models` (its roster is config-driven — so the note at `Anthropic.lua:86`
+proposing it is a divergence *from* upstream, not toward it) nor the Batches API.
+
+**Inapplicable:** bridge/environment, CCR worker, session teleport, MCP, files,
+ultrareview quota, Bedrock/Vertex/Azure clients, update channels. And all
+telemetry — `event_logging/batch`, `claude_code/metrics`, Datadog, OTLP,
+GrowthBook — which would be a new privacy commitment, not a feature.
+
+---
+
+## 7. To close the last gaps
 
 In the order I would take them:
 
-1. **§4.2, token budget.** Self-contained, no schema or history changes, and the
-   only item here that makes the agent finish more work rather than merely
-   survive longer.
-2. **§4.3, allowlist.** A set and a condition.
+1. **Recalibrate `clearOldToolResults` off the model's context window.**
+   `TRIGGER_CHARS = 200000` and `URGENT_CHARS = 600000` are fixed, while
+   `MODEL_CAPS` knows `claude-opus-5` and `claude-sonnet-5` carry
+   `context = 1000000` and only `haiku-4-5` carries `200000`. So on the two
+   models actually in use, tool results are permanently destroyed — no
+   spill-to-disk, gone — at **15% of the window**, where the same number is a
+   correct 75% on Haiku. One constant, right for the model it was tuned against
+   and wrong for the rest. `contextWindow(model)` is already exported by both
+   providers (`Anthropic.lua:836`, `OpenRouter.lua:857`) and used only by the
+   settings panel, so the plumbing is there. Not in §4 because it is not a
+   divergence from Claude Code — theirs is calibrated the same way — but it is
+   the highest-value item on the page.
+2. **§4.2, allowlist.** A set and a condition.
 3. **§4.1, summarising compaction.** The big one, and the only one that needs a
    design: what to summarise, with which model, and how to mark the boundary so
    a restored session does not re-summarise its own summary.
-4. **§4.4, recovery loop.** Only if it turns up in practice.
+4. **§4.3, recovery loop.** Only if it turns up in practice.

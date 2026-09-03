@@ -307,13 +307,31 @@ end
 -- Panel
 -- `bar` is a 0..1 fraction; rows that carry one get a progress track drawn under
 -- the label/value line.
-export type StatusRow = { label: string, value: string, bar: number? }
+--
+-- `segments` turns the row's bar into a stacked one: the same track, the same
+-- total width, divided by where the space went. Each fraction is of the WHOLE
+-- track, not of the filled part, so the segments end exactly where the plain
+-- fill would have and what is left is genuinely free. `swatch` is the legend
+-- half — a row that names one of those segments carries its colour.
+export type StatusRow = {
+	label: string,
+	value: string,
+	bar: number?,
+	segments: { { fraction: number, color: Color3 } }?,
+	swatch: Color3?,
+}
+
+-- Which set of rows the provider is being asked for. "header" is the sticky row
+-- above the tabs; the other three are the tabs themselves. The provider is asked
+-- ONLY for the page on screen, so a page's rows cost nothing while it is hidden
+-- — which is what lets the Context page do real work to build its own.
+export type Page = "header" | "settings" | "usage" | "context"
 
 -- `statusProvider` is supplied by the entry point so Settings doesn't have to
 -- know about OAuth, the Terminal or the Agent.
 function Settings.mountPanel(
 	parent: Instance,
-	statusProvider: () -> { StatusRow }
+	statusProvider: (Page) -> { StatusRow }
 ): ((boolean?) -> (), () -> ())
 	-- Full-bleed scrim: dims the console and catches clicks outside the card.
 	local scrim = make("TextButton", {
@@ -353,10 +371,11 @@ function Settings.mountPanel(
 		MaxSize = Vector2.new(520, 640),
 	})
 
+	local HEADER_H = 40
 	local header = make("Frame", {
 		Parent = card,
 		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 40),
+		Size = UDim2.new(1, 0, 0, HEADER_H),
 	})
 	make("TextLabel", {
 		Parent = header,
@@ -387,17 +406,59 @@ function Settings.mountPanel(
 		Position = UDim2.new(0, 0, 1, -1),
 	})
 
+	-- The card has no UIListLayout — header, sticky row, tabs and scroll are all
+	-- positioned by hand against each other. Derived from one sum rather than
+	-- written out three times: the previous version had the header's 40 typed
+	-- into the scroll's Size AND Position, which is two places to miss.
+	local STICKY_H, TABS_H = 26, 30
+	local CHROME_H = HEADER_H + STICKY_H + TABS_H
+
+	-- Above the tabs, not on a page. Being signed in is what decides whether the
+	-- other two pages have anything at all to show, so a signed-out Usage tab
+	-- that just looks empty is the thing this exists to prevent.
+	local stickyBox = make("Frame", {
+		Parent = card,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, STICKY_H),
+		Position = UDim2.new(0, 0, 0, HEADER_H),
+	})
+	make("UIListLayout", { Parent = stickyBox, SortOrder = Enum.SortOrder.LayoutOrder })
+	make("UIPadding", {
+		Parent = stickyBox,
+		PaddingLeft = UDim.new(0, 18),
+		PaddingRight = UDim.new(0, 18),
+	})
+
+	local tabStrip = make("Frame", {
+		Parent = card,
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, TABS_H),
+		Position = UDim2.new(0, 0, 0, HEADER_H + STICKY_H),
+	})
+	make("Frame", {
+		Parent = tabStrip,
+		BackgroundColor3 = Theme.BORDER,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 0, 1),
+		Position = UDim2.new(0, 0, 1, -1),
+	})
+
 	local scroll = make("ScrollingFrame", {
 		Parent = card,
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
-		Size = UDim2.new(1, 0, 1, -40),
-		Position = UDim2.new(0, 0, 0, 40),
+		Size = UDim2.new(1, 0, 1, -CHROME_H),
+		Position = UDim2.new(0, 0, 0, CHROME_H),
 		CanvasSize = UDim2.new(1, 0, 0, 0),
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
 		ScrollBarThickness = 5,
 		ScrollBarImageColor3 = Theme.TEXT_LO,
 	})
+	-- Kept even though the scroll now holds three children of which one is ever
+	-- visible: a UIListLayout skips Visible = false children when it measures, and
+	-- that is what makes AutomaticCanvasSize follow the ACTIVE page instead of the
+	-- tallest one. Without it the three pages also stack at the origin rather than
+	-- being laid out at all.
 	make("UIListLayout", { Parent = scroll, Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder })
 	make("UIPadding", {
 		Parent = scroll,
@@ -407,15 +468,44 @@ function Settings.mountPanel(
 		PaddingBottom = UDim.new(0, 18),
 	})
 
-	-- Status ------------------------------------------------------------------
-	sectionLabel(scroll, "STATUS", 1)
+	-- Pages
+	-- One container per tab, all three parented to the scroll and only one
+	-- Visible. The UIListLayout that used to live on the scroll moves ONTO each
+	-- page: content is a level deeper now, and without its own layout a page's
+	-- children stack at the origin with no 8px gap. AutomaticSize.Y for the same
+	-- reason — statusBox, both dropdown holders, the dropdown lists and the two
+	-- helper labels are all auto-sized, and a fixed-height parent collapses every
+	-- one of them to nothing.
+	--
+	-- A hidden page is skipped by the scroll's own layout, so the canvas measures
+	-- the active page alone and scrolls to fit it.
+	local function makePage(): Frame
+		local page = make("Frame", {
+			Parent = scroll,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			Visible = false,
+		})
+		make("UIListLayout", {
+			Parent = page,
+			Padding = UDim.new(0, 8),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		})
+		return page
+	end
+	local pageSettings, pageUsage, pageContext = makePage(), makePage(), makePage()
+
+	-- The rows box, built once and re-parented per page rather than one per tab:
+	-- only ever one page is visible, so only one is ever filled, and three boxes
+	-- would be three things for refreshStatus to keep in step.
 	local statusBox = make("Frame", {
-		Parent = scroll,
 		BackgroundColor3 = Theme.BG_DARK,
 		BorderSizePixel = 0,
 		Size = UDim2.new(1, 0, 0, 0),
 		AutomaticSize = Enum.AutomaticSize.Y,
-		LayoutOrder = 2,
+		LayoutOrder = 1,
+		Parent = pageUsage,
 	})
 	make("UICorner", { Parent = statusBox, CornerRadius = UDim.new(0, 4) })
 	make("UIListLayout", { Parent = statusBox, SortOrder = Enum.SortOrder.LayoutOrder })
@@ -427,23 +517,48 @@ function Settings.mountPanel(
 		PaddingBottom = UDim.new(0, 6),
 	})
 
-	local function refreshStatus()
-		for _, child in ipairs(statusBox:GetChildren()) do
+	-- Sticky across openings: someone who left it on Context is watching the
+	-- window and wants it again next time, not a reset to Settings.
+	local activePage: Page = "settings"
+
+	-- Draws one provider page's rows into a box. Shared by the sticky row above
+	-- the tabs and by the active page below them, because the two differ only in
+	-- which page they ask for and where the result lands.
+	local function fillRows(box: Frame, page: Page)
+		for _, child in ipairs(box:GetChildren()) do
 			if child:IsA("GuiObject") then child:Destroy() end
 		end
-		for i, row in ipairs(statusProvider()) do
+		for i, row in ipairs(statusProvider(page)) do
 			local line = make("Frame", {
-				Parent = statusBox,
+				Parent = box,
 				BackgroundTransparency = 1,
 				-- A bar row keeps the same label/value line and hangs a 4px track
 				-- underneath it.
 				Size = UDim2.new(1, 0, 0, row.bar and 29 or 21),
 				LayoutOrder = i,
 			})
+			-- A legend dot, inset so the label still lines up with the rows above
+			-- it. A Frame rather than a coloured glyph in the text: the label is
+			-- one TextLabel with one colour, and turning RichText on for every
+			-- status row to tint one character would make a `<` in any other row
+			-- into markup.
+			local labelInset = 0
+			if row.swatch then
+				labelInset = 12
+				local dot = make("Frame", {
+					Parent = line,
+					BackgroundColor3 = row.swatch,
+					BorderSizePixel = 0,
+					Size = UDim2.new(0, 7, 0, 7),
+					Position = UDim2.new(0, 0, 0, 7),
+				})
+				make("UICorner", { Parent = dot, CornerRadius = UDim.new(1, 0) })
+			end
 			make("TextLabel", {
 				Parent = line,
 				BackgroundTransparency = 1,
-				Size = UDim2.new(0.4, 0, 0, 21),
+				Size = UDim2.new(0.4, -labelInset, 0, 21),
+				Position = UDim2.new(0, labelInset, 0, 0),
 				FontFace = Theme.SANS,
 				TextSize = 13,
 				TextColor3 = Theme.TEXT_LO,
@@ -472,15 +587,97 @@ function Settings.mountPanel(
 					Position = UDim2.new(0, 0, 0, 22),
 				})
 				make("UICorner", { Parent = track, CornerRadius = UDim.new(0, 2) })
-				local fill = make("Frame", {
-					Parent = track,
-					-- Red once the window is nearly spent, so a full bar reads as a
-					-- warning without needing a legend.
-					BackgroundColor3 = fraction >= 0.9 and Theme.ERR_CLR or Theme.BAR_CLR,
-					BorderSizePixel = 0,
-					Size = UDim2.fromScale(fraction, 1),
-				})
-				make("UICorner", { Parent = fill, CornerRadius = UDim.new(0, 2) })
+				if row.segments then
+					-- Stacked. The rounding comes from the track clipping its
+					-- children, so a segment is a plain rectangle and only the two
+					-- ends of the WHOLE bar are rounded — corners on each segment
+					-- would put a notch at every join.
+					track.ClipsDescendants = true
+					local offset = 0
+					for index, segment in ipairs(row.segments) do
+						local width = math.clamp(segment.fraction, 0, 1 - offset)
+						if width > 0 then
+							make("Frame", {
+								Parent = track,
+								BackgroundColor3 = segment.color,
+								BorderSizePixel = 0,
+								Size = UDim2.fromScale(width, 1),
+								Position = UDim2.fromScale(offset, 0),
+								LayoutOrder = index,
+							})
+							offset += width
+						end
+					end
+				else
+					local fill = make("Frame", {
+						Parent = track,
+						-- Red once the window is nearly spent, so a full bar reads as
+						-- a warning without needing a legend.
+						BackgroundColor3 = fraction >= 0.9 and Theme.ERR_CLR or Theme.BAR_CLR,
+						BorderSizePixel = 0,
+						Size = UDim2.fromScale(fraction, 1),
+					})
+					make("UICorner", { Parent = fill, CornerRadius = UDim.new(0, 2) })
+				end
+			end
+		end
+	end
+
+	local PAGES: { { id: Page, label: string, frame: Frame } } = {
+		{ id = "settings", label = "Settings", frame = pageSettings },
+		{ id = "usage", label = "Usage", frame = pageUsage },
+		{ id = "context", label = "Context", frame = pageContext },
+	}
+
+	-- Forward-declared: the tab buttons below need to redraw on click, and
+	-- refreshStatus needs the tab list to know which page is showing.
+	local refreshStatus: () -> ()
+	local tabButtons: { TextButton } = {}
+	local underline = make("Frame", {
+		Parent = tabStrip,
+		BackgroundColor3 = Theme.ACCENT,
+		BorderSizePixel = 0,
+		Size = UDim2.new(0, 0, 0, 2),
+		Position = UDim2.new(0, 0, 1, -2),
+	})
+
+	local TAB_W = 76
+	for index, tab in ipairs(PAGES) do
+		local button = make("TextButton", {
+			Parent = tabStrip,
+			BackgroundTransparency = 1,
+			AutoButtonColor = false,
+			Size = UDim2.new(0, TAB_W, 1, -2),
+			Position = UDim2.new(0, 18 + (index - 1) * TAB_W, 0, 0),
+			FontFace = Theme.SANS,
+			TextSize = 13,
+			TextColor3 = Theme.TEXT_LO,
+			Text = tab.label,
+		})
+		tabButtons[index] = button
+		button.MouseButton1Click:Connect(function()
+			if activePage == tab.id then return end
+			activePage = tab.id
+			refreshStatus()
+		end)
+	end
+
+	refreshStatus = function()
+		-- Above the tabs and drawn for every page, because it is what says whether
+		-- the other two have anything to report.
+		fillRows(stickyBox, "header")
+		for index, tab in ipairs(PAGES) do
+			local active = tab.id == activePage
+			tab.frame.Visible = active
+			tabButtons[index].TextColor3 = if active then Theme.TEXT_HI else Theme.TEXT_LO
+			if active then
+				underline.Size = UDim2.new(0, TAB_W, 0, 2)
+				underline.Position = UDim2.new(0, 18 + (index - 1) * TAB_W, 1, -2)
+				-- Only the visible page's rows are built, which is the whole point of
+				-- the split: Agent.contextBreakdown walks the conversation and encodes
+				-- the tool schemas, and it is not reached at all from another tab.
+				statusBox.Parent = tab.frame
+				fillRows(statusBox, tab.id)
 			end
 		end
 	end
@@ -491,8 +688,8 @@ function Settings.mountPanel(
 	-- disagree.
 
 	-- Web search --------------------------------------------------------------
-	sectionLabel(scroll, "WEB SEARCH", 8)
-	dropdown(scroll, 9, {
+	sectionLabel(pageSettings, "WEB SEARCH", 2)
+	dropdown(pageSettings, 3, {
 		{ id = 0,  label = "Disabled" },
 		{ id = 3,  label = "Up to 3 searches",  hint = "per message" },
 		{ id = 5,  label = "Up to 5 searches",  hint = "per message" },
@@ -501,7 +698,7 @@ function Settings.mountPanel(
 		Settings.setWebSearch(id :: number)
 	end)
 	make("TextLabel", {
-		Parent = scroll,
+		Parent = pageSettings,
 		BackgroundTransparency = 1,
 		Size = UDim2.new(1, 0, 0, 26),
 		AutomaticSize = Enum.AutomaticSize.Y,
@@ -515,15 +712,15 @@ function Settings.mountPanel(
 	})
 
 	-- Code execution ----------------------------------------------------------
-	sectionLabel(scroll, "RUN CODE", 11)
-	dropdown(scroll, 12, {
+	sectionLabel(pageSettings, "RUN CODE", 5)
+	dropdown(pageSettings, 6, {
 		{ id = false, label = "Disabled", hint = "recommended" },
 		{ id = true,  label = "Enabled",  hint = "the agent can execute Luau" },
 	}, Settings.allowRun, function(id)
 		Settings.setAllowRun(id :: boolean)
 	end)
 	make("TextLabel", {
-		Parent = scroll,
+		Parent = pageSettings,
 		BackgroundTransparency = 1,
 		Size = UDim2.new(1, 0, 0, 26),
 		AutomaticSize = Enum.AutomaticSize.Y,
@@ -538,9 +735,9 @@ function Settings.mountPanel(
 	})
 
 	-- System prompt -----------------------------------------------------------
-	sectionLabel(scroll, "SYSTEM PROMPT", 14)
+	sectionLabel(pageSettings, "SYSTEM PROMPT", 8)
 	local promptBox = make("TextBox", {
-		Parent = scroll,
+		Parent = pageSettings,
 		BackgroundColor3 = Theme.BG_DARK,
 		BorderColor3 = Theme.BORDER,
 		BorderSizePixel = 1,
@@ -569,7 +766,7 @@ function Settings.mountPanel(
 	end)
 
 	local resetButton = make("TextButton", {
-		Parent = scroll,
+		Parent = pageSettings,
 		BackgroundColor3 = Theme.BG_INPUT,
 		BorderSizePixel = 0,
 		Size = UDim2.new(0, 150, 0, 28),

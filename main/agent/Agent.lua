@@ -665,6 +665,89 @@ local function clearOldToolResults(messages: { any }): number
 	return saving
 end
 
+-- Token budget
+-- Claude Code's src/query/tokenBudget.ts, ported. A model that stops at 40% of a
+-- task it had room to finish is the failure this catches: when a turn ends
+-- naturally under the target, the stop is not accepted — the model is told how
+-- much it has left and asked to carry on.
+--
+-- The budget comes out of the READER'S OWN MESSAGE, which is what makes it safe
+-- to have on by default. `+500k` or "use 2m tokens" arms it for that request;
+-- type neither and there is no budget and none of this runs. Upstream gates it
+-- the same way (`budget === null` -> stop) rather than behind a setting, and it
+-- is the better design: per-message, inert unless asked for, nothing to
+-- misconfigure once and regret for a session.
+--
+-- "do not summarize" in the message below is load-bearing and is upstream's
+-- wording. Without it the answer to "keep working" is a report about the work
+-- already done, which spends the budget saying nothing new.
+local COMPLETION_THRESHOLD = 0.9
+local DIMINISHING_THRESHOLD = 500  -- tokens; two quiet rounds in a row means done
+local BUDGET_SCALE: { [string]: number } = { k = 1000, m = 1000000, b = 1000000000 }
+
+local budget: number? = nil        -- nil for every request that did not ask
+local budgetSpent = 0              -- output tokens since the reader's message
+local continuations = 0
+local lastDelta = 0
+local lastChecked = 0
+
+-- Anchored at the start or the end for the shorthand, deliberately: "+2k" in
+-- the middle of a sentence about a diff is prose, not a budget. The verbose form
+-- names tokens outright, so it can match anywhere.
+local function parseTokenBudget(text: string): number?
+	local lower = string.lower(text)
+	local function scaled(n: string, suffix: string): number?
+		local value, mult = tonumber(n), BUDGET_SCALE[suffix]
+		return if value and mult then value * mult else nil
+	end
+	local n, suffix = lower:match("^%s*%+(%d+%.?%d*)%s*([kmb])%f[%W]")
+	if n then return scaled(n, suffix) end
+	n, suffix = lower:match("%s%+(%d+%.?%d*)%s*([kmb])%s*[.!?]?%s*$")
+	if n then return scaled(n, suffix) end
+	for _, verb in ipairs({ "use", "spend" }) do
+		n, suffix = lower:match("%f[%a]" .. verb .. "%s+(%d+%.?%d*)%s*([kmb])%s*tokens?%f[%W]")
+		if n then return scaled(n, suffix) end
+	end
+	return nil
+end
+
+local function withCommas(n: number): string
+	local out = tostring(math.floor(n))
+	local more = 1
+	while more > 0 do
+		out, more = out:gsub("^(%d+)(%d%d%d)", "%1,%2")
+	end
+	return out
+end
+
+-- The nudge for a turn that stopped early, or nil to let it stop.
+--
+-- Two ways to be finished. Spending the target is the obvious one. The other is
+-- diminishing returns: three rounds in, answering a nudge with almost nothing
+-- twice running means the model is out of work, not out of budget, and nudging
+-- a fourth time buys a paragraph of throat-clearing. Both of upstream's
+-- thresholds, unchanged.
+--
+-- A missing `usage` is safe rather than a hang: budgetSpent stops growing, the
+-- deltas are 0, and the diminishing branch ends the turn after three rounds.
+local function budgetContinuation(): string?
+	if not budget or budget <= 0 then return nil end
+	local target = budget :: number
+	local delta = budgetSpent - lastChecked
+	local diminishing = continuations >= 3
+		and delta < DIMINISHING_THRESHOLD
+		and lastDelta < DIMINISHING_THRESHOLD
+	if diminishing or budgetSpent >= target * COMPLETION_THRESHOLD then
+		return nil
+	end
+	continuations += 1
+	lastDelta = delta
+	lastChecked = budgetSpent
+	return string.format(
+		"Stopped at %d%% of token target (%s / %s). Keep working — do not summarize.",
+		math.floor(budgetSpent / target * 100 + 0.5), withCommas(budgetSpent), withCommas(target))
+end
+
 -- One turn
 -- Streams a response, renders it, runs any tools it asked for, and recurses if
 -- Claude wants another round. `turn` is the recursion depth.
@@ -978,6 +1061,9 @@ local function runTurn(turn: number)
 				totals.input += prompt
 				totals.cached += result.usage.cache_read_input_tokens or 0
 				totals.output += result.usage.output_tokens or 0
+				-- Same counter, different window: totals is the session, this is
+				-- since the reader's last message, which is what a budget is for.
+				budgetSpent += result.usage.output_tokens or 0
 				-- Assigned, not accumulated. This is the only place the real prompt
 				-- size is known: the conversation table's character count is an
 				-- estimate, and the system prompt and tool schemas are not in it at
@@ -1185,6 +1271,20 @@ local function runTurn(turn: number)
 				return
 			end
 
+			-- Nothing was asked of a tool, so this is where the turn would end.
+			-- Reached only past the pause_turn and tool-result branches above, so
+			-- every tool_use in the history already has its result and the
+			-- conversation is valid to send back and to checkpoint.
+			local nudge = budgetContinuation()
+			if nudge then
+				Console.setMessage(#conversation + 1)
+				Console.appendLine(nudge, "system")
+				Console.setMessage(0)
+				table.insert(conversation, { role = "user", content = nudge })
+				continueTurn(true)
+				return
+			end
+
 			if result.usage then
 				-- input_tokens is only the UNCACHED remainder, not the prompt
 				-- size. Printing it alone made a working cache look like a broken
@@ -1329,6 +1429,11 @@ function Agent.send(text: string, isLoggedIn: () -> boolean)
 	Console.appendLine(text, "user")
 	Console.setMessage(0)
 	table.insert(conversation, { role = "user", content = text .. editorContext() })
+	-- Armed per message and reset here, not at session start: a budget is a
+	-- property of the request that asked for one, and the next message without
+	-- `+500k` in it turns the whole mechanism back off.
+	budget = parseTokenBudget(text)
+	budgetSpent, continuations, lastDelta, lastChecked = 0, 0, 0, 0
 	-- Before the first request, not after it. Otherwise the whole of turn one is
 	-- unsaved, and a crash inside it puts the session back to before the message
 	-- was ever typed — the one loss the user has to retype by hand rather than
@@ -1347,6 +1452,64 @@ end
 -- reject the request, and a cleared tool_result that loses its pairing or comes
 -- back empty poisons every later turn.
 function Agent.selfTest(): (boolean, string?)
+	-- Token budget: what arms it, and the false positive that must not.
+	for _, case in ipairs({
+		{ "+500k", 500000 },
+		{ "  +2m refactor the whole thing", 2000000 },
+		{ "refactor the whole thing +500k", 500000 },
+		{ "port the module +1.5m.", 1500000 },
+		{ "use 500k tokens on this", 500000 },
+		{ "please spend 2m tokens getting it right", 2000000 },
+		-- Prose that looks like a budget. Both anchors exist for this line: a
+		-- bare "+2k" in the middle of a sentence is a diff stat, not a target.
+		{ "the diff is +2k lines, trim it", false },
+		{ "fix the parser", false },
+	}) do
+		local text, want = case[1] :: string, case[2]
+		local got = parseTokenBudget(text)
+		if want == false then
+			if got ~= nil then
+				return false, string.format("parseTokenBudget armed on %q (%d)", text, got)
+			end
+		elseif got ~= want then
+			return false, string.format("parseTokenBudget(%q) = %s, expected %d",
+				text, tostring(got), want :: number)
+		end
+	end
+
+	-- The decision, driven directly. Restored afterwards because these are the
+	-- live counters, and /selftest runs mid-session.
+	local savedBudget, savedSpent = budget, budgetSpent
+	local savedCont, savedDelta, savedChecked = continuations, lastDelta, lastChecked
+	budget, budgetSpent, continuations, lastDelta, lastChecked = nil, 0, 0, 0, 0
+	local ok, err = pcall(function(): string?
+		if budgetContinuation() ~= nil then
+			return "budgetContinuation fired with no budget asked for"
+		end
+		budget, budgetSpent = 100000, 10000
+		if budgetContinuation() == nil then
+			return "budgetContinuation stopped at 10% of target"
+		end
+		-- At the threshold the turn is finished, not nudged.
+		budgetSpent = 90000
+		if budgetContinuation() ~= nil then
+			return "budgetContinuation nudged past COMPLETION_THRESHOLD"
+		end
+		-- Diminishing: three rounds in, and two quiet ones in a row. Without this
+		-- a model that has run out of work is nudged until it spends the budget
+		-- on filler.
+		budget, budgetSpent = 100000, 20000
+		continuations, lastDelta, lastChecked = 3, 10, 20000
+		if budgetContinuation() ~= nil then
+			return "budgetContinuation ignored diminishing returns"
+		end
+		return nil
+	end)
+	budget, budgetSpent = savedBudget, savedSpent
+	continuations, lastDelta, lastChecked = savedCont, savedDelta, savedChecked
+	if not ok then return false, "budget check threw: " .. tostring(err) end
+	if err then return false, err :: string end
+
 	-- Under the cap: byte-identical, no marker bolted on.
 	local short = "hello\nworld"
 	if forModel(short) ~= short then
