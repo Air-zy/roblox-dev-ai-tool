@@ -1379,6 +1379,86 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 	}
 end
 
+-- Replaying a stored message
+-- The live path draws a turn from stream deltas as they arrive; this draws the
+-- same shapes from what was stored. Both go through the primitives above, and
+-- they used to be two separate renderers — the live one in Agent, this one
+-- inlined in the replay loop in Sessions — over the same three block types. Two
+-- places to keep in step every time one of them changes, in different modules,
+-- and nothing that would fail if they drifted. This is the stored form's half;
+-- the live one still has its own until the streaming turn writes through the
+-- conversation rather than into a bubble it holds for the length of a turn.
+
+-- What the reader actually typed, out of either message shape. A user message is
+-- a plain string until a cache breakpoint rewrites it into text blocks, and a
+-- user message that is only a tool_result batch carries nothing they wrote.
+-- Lives here rather than in Sessions because it is what a stored message LOOKS
+-- like, which is the renderer's business; Sessions keeps using it for titles.
+function Console.userText(message: any): string?
+	local content = message.content
+	if type(content) == "string" then
+		return content ~= "" and content or nil
+	end
+	if type(content) ~= "table" then return nil end
+	local parts: { string } = {}
+	for _, block in ipairs(content) do
+		if type(block) == "table" and block.type == "text" and type(block.text) == "string" then
+			table.insert(parts, block.text)
+		end
+	end
+	return #parts > 0 and table.concat(parts, "\n") or nil
+end
+
+-- One stored message, as the blocks it was on screen as.
+--
+-- `results` maps a tool_use id to the stored result text. A result is always
+-- passed because appendToolCall spins forever without one; a server tool's
+-- result is replayed as its own block rather than through the map, so those get
+-- the placeholder.
+function Console.renderMessage(message: any, index: number, results: { [string]: string })
+	-- What Find scrolls back to. Set per message rather than per block: a tool
+	-- call and the reply above it are one message and one destination.
+	Console.setMessage(index)
+	local content = message.content
+	if message.role == "user" then
+		local typed = Console.userText(message)
+		if typed then
+			Console.appendLine(typed, "user")
+		end
+	elseif type(content) == "string" then
+		Console.createBubble().setText(content)
+	elseif type(content) == "table" then
+		-- Above the reply, which is where the live view puts it too.
+		for _, block in ipairs(content) do
+			if block.type == "thinking" and type(block.thinking) == "string"
+				and block.thinking ~= "" then
+				local drawer = Console.createThinking()
+				drawer.append(block.thinking)
+				-- Immediately: nothing is streaming, and an unfinished drawer
+				-- spins forever.
+				drawer.finish()
+			end
+		end
+		local text: { string } = {}
+		for _, block in ipairs(content) do
+			if block.type == "text" and block.text then
+				table.insert(text, block.text)
+			end
+		end
+		if #text > 0 then
+			Console.createBubble().setText(table.concat(text, "\n"))
+		end
+		for _, block in ipairs(content) do
+			if block.type == "tool_use" or block.type == "server_tool_use" then
+				Console.appendToolCall(
+					tostring(block.name),
+					type(block.input) == "table" and block.input or {},
+					results[block.id] or "(result not stored)")
+			end
+		end
+	end
+end
+
 -- Self-test
 -- The peek is bookkeeping across two frames and every way it breaks is silent:
 -- blocks that never come back, a sink left pointing at a destroyed holder, a

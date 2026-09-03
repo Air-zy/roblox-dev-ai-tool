@@ -509,8 +509,18 @@ local function refreshUsage()
 	if usageWindows and os.clock() - usageFetchedAt < USAGE_MAX_AGE then return end
 	usageInFlight = true
 	task.spawn(function()
-		local windows, err = Provider.auth.fetchUsage()
+		-- pcall'd because the reset below is the only thing that lets this run
+		-- again: any throw inside fetchUsage kills this thread with the flag still
+		-- true, and usage never refreshes again for the rest of the session. Its
+		-- request and its token refresh are guarded, the row formatting after them
+		-- is not. On the failure branch `windows` is the error message.
+		local ok, windows, err = pcall(Provider.auth.fetchUsage)
 		usageInFlight = false
+		if not ok then
+			usageError = tostring(windows)
+			refreshSettings()
+			return
+		end
 		if windows then
 			usageWindows = windows
 			usageError = nil

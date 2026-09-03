@@ -410,20 +410,11 @@ end
 -- block array, those still have to restore and still have to be titled.
 -- Returns nil for the other block shape, a tool_result batch, which is drawn
 -- with the call that produced it rather than as a message of its own.
-local function userText(message: any): string?
-	local content = message.content
-	if type(content) == "string" then
-		return content ~= "" and content or nil
-	end
-	if type(content) ~= "table" then return nil end
-	local parts: { string } = {}
-	for _, block in ipairs(content) do
-		if type(block) == "table" and block.type == "text" and type(block.text) == "string" then
-			table.insert(parts, block.text)
-		end
-	end
-	return #parts > 0 and table.concat(parts, "\n") or nil
-end
+-- Moved to Console with the rest of the stored-message rendering: what a message
+-- looks like on screen is the renderer's business. Aliased rather than called
+-- through, because titleOf below and the self-test both read better without the
+-- prefix, and this file already aliases Theme.make the same way.
+local userText = Console.userText
 
 -- First user message, which is what the reader remembers the session by.
 -- Returns nil when there isn't one, a session resumed from a stop or an error
@@ -552,13 +543,30 @@ function Sessions.save()
 	-- goes there has to stay small. Bounded at MIRROR_BYTES the file stays in the
 	-- low hundreds of KB, where the same write against the old 15 MB store was
 	-- the stall this module was rewritten to remove.
+	-- Two rungs, not a search down from KEEP_RESULTS one at a time.
+	--
+	-- The rungs between them were never worth an encode each: they differ by a
+	-- handful of tool results in a CRASH COPY, and if those few results are what
+	-- pushes this over 150 KB then they are enormous and keeping them is not the
+	-- priority. The search also had no floor check, so a session whose assistant
+	-- text and user messages ALONE exceed the limit — nothing stubOldResults can
+	-- touch — ran every rung, failed every one, and did it again on the next
+	-- checkpoint. That is 6 full encodes of a ~500 KB conversation on the
+	-- tool-results path, which fires after every tool batch, permanently, for the
+	-- rest of the session.
+	--
+	-- keep = 0 is the true floor: past it there is nothing left to stub.
 	local body = json
 	if #body > MIRROR_BYTES then
-		for keep = KEEP_RESULTS, 0, -1 do
-			body = HttpService:JSONEncode(stubOldResults(conversation, keep))
-			if #body <= MIRROR_BYTES then break end
+		body = HttpService:JSONEncode(stubOldResults(conversation, KEEP_RESULTS))
+		if #body > MIRROR_BYTES then
+			body = HttpService:JSONEncode(stubOldResults(conversation, 0))
 		end
 	end
+	-- ponytail: over the floor, the oversized body is still written. Small and
+	-- stale beats big and current for a crash copy, so the upgrade is to drop the
+	-- OLDEST messages until it fits — but that makes a recovered session
+	-- truncated, which is a product call, not a perf one.
 	pcall(function()
 		pluginRef:SetSetting(KEY_ACTIVE, HttpService:JSONEncode({
 			id = currentId,
@@ -600,6 +608,52 @@ end
 local REPLAY_MESSAGES = 25
 local shown = REPLAY_MESSAGES
 
+-- Where the drawn window ENDS. nil is the live tail, which is every case except
+-- a Find jump that lands back in history: that one draws a bounded window around
+-- the message it was asked for. Without an upper bound the window is always
+-- `first..#conversation`, so reaching a message near the START of a long session
+-- means drawing the whole session. See Sessions.reveal.
+--
+-- ponytail: a window that callers SET, not one derived from scroll position.
+-- Ceiling: the reader pages by redrawing, and a jump has to decide up front what
+-- to draw. Claude Code's transcript instead mounts only viewport + overscan and
+-- holds the rest open with spacer boxes, so its jumpToIndex is a scrollTo and
+-- nothing contends (useVirtualScroll.ts, VirtualMessageList.tsx). That needs a
+-- per-block height cache invalidated on width change; do it if paging is still
+-- the annoying part.
+local windowEnd: number? = nil
+
+-- One page, anchored at the live tail. The two move together — a window with a
+-- stale `windowEnd` draws history and appends live blocks under it — so nothing
+-- sets `shown` back to one page on its own.
+local function resetWindow()
+	shown = REPLAY_MESSAGES
+	windowEnd = nil
+end
+
+-- The two halves of the window, pulled out of their use sites so selfTest can
+-- hold them to the one invariant that matters: a Find jump draws a window that
+-- is bounded AND contains the message it was asked for. Losing either is silent
+-- — too small and the jump quietly does not happen, unbounded and it draws the
+-- whole session.
+local function windowBounds(height: number, floor: number?, count: number): (number, number)
+	local last = math.min(floor or count, count)
+	return math.max(1, last - height + 1), last
+end
+
+-- The window Find asks for: a page of lead-in below the message, `shown` above.
+-- Returns the new (shown, windowEnd); a windowEnd of nil means it reached the
+-- tail and this IS the live view.
+--
+-- `live` is "a turn is still appending". It pins the window even when it reaches
+-- the tail, because a tail that is still growing is a snapshot the moment it is
+-- drawn — and because a pinned window is what makes reveal park the live view
+-- instead of redrawing over the bubble the turn is streaming into.
+local function windowFor(index: number, count: number, live: boolean): (number, number?)
+	local target = math.min(count, index + REPLAY_MESSAGES)
+	return 2 * REPLAY_MESSAGES, if target < count or live then target else nil
+end
+
 -- Peeking
 -- Opening another session mid-turn does NOT switch: Agent keeps the conversation
 -- it is working on, `currentId` does not move, and the turn still lands in the
@@ -625,6 +679,7 @@ local function dropPeek()
 	if not holder then return end
 	previewHolder = nil
 	previewId = ""
+	resetWindow()
 	Console.discard(holder)
 end
 
@@ -634,6 +689,8 @@ function Sessions.endPeek()
 	if not holder then return end
 	previewHolder = nil
 	previewId = ""
+	-- What comes back is the live tail, so the window has to say so again.
+	resetWindow()
 	Console.reattach(holder)
 	if refreshList then refreshList() end
 end
@@ -657,7 +714,8 @@ local function replayInto(conversation: { any })
 		end
 	end
 
-	local first = math.max(1, #conversation - shown + 1)
+	-- `shown` is the window's HEIGHT and `windowEnd` its floor.
+	local first, last = windowBounds(shown, windowEnd, #conversation)
 	-- The link belongs to no message; only the loop below anchors anything.
 	Console.setMessage(0)
 	if first > 1 then
@@ -678,54 +736,42 @@ local function replayInto(conversation: { any })
 			end)
 	end
 
-	for index = first, #conversation do
-		-- What Find scrolls back to. Set per message rather than per block: a
-		-- tool call and the reply above it are one message and one destination.
-		Console.setMessage(index)
-		local message = conversation[index]
-		local content = message.content
-		if message.role == "user" then
-			local typed = userText(message)
-			if typed then
-				Console.appendLine(typed, "user")
-			end
-		elseif type(content) == "string" then
-			Console.createBubble().setText(content)
-		elseif type(content) == "table" then
-			-- Above the reply, which is where the live view puts it too.
-			for _, block in ipairs(content) do
-				if block.type == "thinking" and type(block.thinking) == "string"
-					and block.thinking ~= "" then
-					local drawer = Console.createThinking()
-					drawer.append(block.thinking)
-					-- Immediately: nothing is streaming, and an unfinished drawer
-					-- spins forever.
-					drawer.finish()
-				end
-			end
-			local text: { string } = {}
-			for _, block in ipairs(content) do
-				if block.type == "text" and block.text then
-					table.insert(text, block.text)
-				end
-			end
-			if #text > 0 then
-				Console.createBubble().setText(table.concat(text, "\n"))
-			end
-			for _, block in ipairs(content) do
-				if block.type == "tool_use" or block.type == "server_tool_use" then
-					-- A result is always passed: appendToolCall spins forever without
-					-- one. Server tool results live in their own replayed block, not
-					-- in `results`, so those show the placeholder.
-					Console.appendToolCall(
-						tostring(block.name),
-						type(block.input) == "table" and block.input or {},
-						results[block.id] or "(result not stored)")
-				end
-			end
-		end
+	for index = first, last do
+		Console.renderMessage(conversation[index], index, results)
 	end
+
+	-- Out of the loop's last message, both so the link below anchors to nothing
+	-- and so nothing appended after this replay inherits an index.
+	--
+	-- The link is the way back from a Find jump, and the mirror of the one at the
+	-- top. It lives here rather than as a one-off banner in reveal so that it
+	-- survives paging further up, and so it does not need the drawer to be open.
 	Console.setMessage(0)
+	-- On `windowEnd` rather than on `last < #conversation`: a jump made mid-turn
+	-- pins the window AT the tail, so the count below is zero and the view still
+	-- needs its way back — the turn is streaming into the parked frame, not into
+	-- this one.
+	if windowEnd then
+		local newer = #conversation - last
+		Console.appendLink(
+			if newer > 0
+				then string.format("↓ Back to the live view (%d newer)", newer)
+				else "↓ Back to the live view",
+			function()
+				-- reveal parked the live view rather than redrawing over it, so
+				-- coming back is a reparent and endPeek resets the window on the
+				-- way. The redraw below is only reachable if something set a window
+				-- without parking, which nothing does today.
+				if previewHolder then
+					Sessions.endPeek()
+					return
+				end
+				resetWindow()
+				Console.clear()
+				replay(conversation)
+				Console.scrollToBottom(true)
+			end)
+	end
 end
 
 replay = function(conversation: { any })
@@ -782,7 +828,7 @@ function Sessions.load(id: string)
 		if not previewHolder then previewHolder = Console.detach() end
 		previewId = id
 		Console.clear()
-		shown = REPLAY_MESSAGES
+		resetWindow()
 		replay(conversation)
 		local running = entryFor(currentId)
 		Console.onScreen(function()
@@ -801,7 +847,7 @@ function Sessions.load(id: string)
 	setCurrent(id)
 	Console.clear()
 	Agent.restore(conversation)
-	shown = REPLAY_MESSAGES
+	resetWindow()
 	replay(conversation)
 	Console.appendLine(string.format("Restored session — %d messages.", #conversation), "system")
 end
@@ -816,19 +862,41 @@ function Sessions.reveal(index: number)
 	Sessions.endPeek()
 	if Console.jumpToMessage(index) then return end
 
-	if Agent.isBusy() then
-		-- Redrawing would destroy the bubble the turn is streaming into.
-		Console.appendLine(
-			"That message is further back than the view — finish the turn to load it.", "system")
-		return
-	end
-	-- The same paging the link at the top of a truncated replay does, sized to
-	-- reach the message in one go rather than a page at a time, with a page of
-	-- lead-in above it so it does not land against the top edge.
 	local conversation = Agent.conversation()
-	shown = math.max(shown, #conversation - index + 1 + REPLAY_MESSAGES)
+	-- A BOUNDED window around the message, not a widening of the live one.
+	--
+	-- Reaching back used to mean growing `shown` until the window reached the
+	-- message, and the window always ends at the tail — so a jump to message 12
+	-- of 2400 drew all 2389 of them, under Console.uncapped, which switches the
+	-- MAX_BLOCKS trim off. That left the whole session on screen as live
+	-- GuiObjects (measured: ~380 Instances per block at a realistic reply size),
+	-- for the rest of the session, since `shown` never shrank; opening a panel
+	-- then paid a layout over all of it and the next Console.clear() destroyed it
+	-- in one synchronous pass, which is the freeze that read as a crash. Reaching
+	-- message 12 now costs the same 50 blocks as reaching message 2380.
+	--
+	-- Passing isBusy pins the window mid-turn, which is what makes this safe to
+	-- run during a turn at all: pinned means parked below, and parked means the
+	-- Console.clear() has nothing of the turn's to destroy. Refusing the jump
+	-- while busy was the old answer to that, and parking is a better one than
+	-- making the reader wait for the turn to end.
+	shown, windowEnd = windowFor(index, #conversation, Agent.isBusy())
+
+	-- A window that stops short of the tail is not the live view any more, so
+	-- park the live view instead of redrawing over it. Coming back is then a
+	-- reparent rather than a replay, and a turn that runs while the reader is
+	-- back in history streams into the parked frame instead of appending into
+	-- the middle of it. That is Console.detach's whole job, and peeking at
+	-- another session already leans on it the same way.
+	if windowEnd and not previewHolder then
+		previewHolder = Console.detach()
+		previewId = currentId
+	end
 	Console.clear()
 	replay(conversation)
+	-- replayInto draws the way back, at the bottom of the window. The drawer just
+	-- needs to show that this session is being viewed rather than followed.
+	if windowEnd and refreshList then refreshList() end
 	Console.jumpToMessage(index)
 end
 
@@ -921,7 +989,7 @@ function Sessions.restoreLast()
 			setCurrent(saved.id)
 			Console.clear()
 			Agent.restore(conversation)
-			shown = REPLAY_MESSAGES
+			resetWindow()
 			replay(conversation)
 			Console.appendLine(string.format(
 				"Recovered %d messages — the place was closed without saving.",
@@ -1263,6 +1331,25 @@ function Sessions.selfTest(): (boolean, string?)
 	if cleared ~= 8 - KEEP_RESULTS then
 		return false, string.format("stubOldResults cleared %d results, expected %d", cleared, 8 - KEEP_RESULTS)
 	end
+
+	-- keep = 0 is the floor Sessions.save falls back to, and the fallback is only
+	-- worth an encode if it is genuinely smaller than the rung above it. If this
+	-- ever stops clearing everything, the ladder does two encodes to arrive at
+	-- the same oversized body.
+	local floorCleared = 0
+	for _, message in ipairs(stubOldResults(conversation, 0)) do
+		if type(message.content) == "table" then
+			for _, block in ipairs(message.content) do
+				if block.type == "tool_result" and block.content == CLEARED then
+					floorCleared += 1
+				end
+			end
+		end
+	end
+	if floorCleared ~= 8 then
+		return false, string.format(
+			"stubOldResults(0) cleared %d of 8 — the save ladder's floor is not a floor", floorCleared)
+	end
 	-- The live conversation must be untouched, or saving would invalidate the
 	-- prompt cache mid-session.
 	for _, message in ipairs(conversation) do
@@ -1282,6 +1369,40 @@ function Sessions.selfTest(): (boolean, string?)
 
 	if titleOf({ { role = "user", content = "hello  world" } }) ~= "hello world" then
 		return false, "titleOf did not normalise whitespace"
+	end
+
+	-- Find's window, at both edges and in the middle of a long session. Before
+	-- this was bounded, jumping to message 12 of 2400 drew all 2389 to the tail
+	-- and left them on screen for the rest of the session.
+	local WINDOW_CAP = 2 * REPLAY_MESSAGES
+	for _, case in ipairs({
+		{ 1, 2400 }, { 12, 2400 }, { 1200, 2400 }, { 2399, 2400 }, { 2400, 2400 },
+		{ 1, 1 }, { 1, 30 },
+	}) do
+		local at, count = case[1], case[2]
+		for _, live in ipairs({ false, true }) do
+			local height, floor = windowFor(at, count, live)
+			local first, last = windowBounds(height, floor, count)
+			if at < first or at > last then
+				return false, string.format(
+					"Find window %d..%d misses message %d of %d (live=%s) — the jump would not happen",
+					first, last, at, count, tostring(live))
+			end
+			if last - first + 1 > WINDOW_CAP then
+				return false, string.format(
+					"Find window drew %d messages reaching %d of %d (live=%s), cap is %d",
+					last - first + 1, at, count, tostring(live), WINDOW_CAP)
+			end
+			-- Pinned mid-turn is what makes reveal park the live view. An
+			-- unpinned window here means the redraw destroys the bubble the
+			-- turn is streaming into, which is the hazard the old isBusy
+			-- refusal existed for.
+			if live and floor == nil then
+				return false, string.format(
+					"Find window at %d of %d did not pin mid-turn, so the redraw would not park",
+					at, count)
+			end
+		end
 	end
 
 	-- The older on-disk shape, where the cache breakpoint had rewritten the user

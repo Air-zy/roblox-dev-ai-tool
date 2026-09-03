@@ -246,7 +246,7 @@ local function splitLines(source: string): { string }
 	-- Empty text is ZERO lines, not one blank one. The scan below cannot say that
 	-- on its own — it finds no newline and emits one empty line — and the
 	-- trailing-newline guard is `#lines > 1`, so it never fired here. `wc -l` on
-	-- an empty script answered 1, and once misses stopped flowing down pipes (see FIDELITY.md
+	-- an empty script answered 1, and once misses stopped flowing down pipes (see BASH_FIDELITY.md
 	-- §3.1) it was `grep nothing . | wc -l` answering 1 as well, which is the
 	-- exact wrong number that fix exists to remove.
 	--

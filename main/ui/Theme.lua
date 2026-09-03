@@ -73,6 +73,16 @@ for _, key in ipairs(FIRST) do
 	IS_FIRST[key] = true
 end
 
+-- Parent is the mirror of FIRST and is assigned LAST, for the reason every
+-- Roblox style guide gives: an Instance already in the DataModel invalidates
+-- layout and render on each property assigned after it, so parenting first
+-- costs one invalidation per property in the table and parenting last costs
+-- one. Undefined `pairs` order means it otherwise lands somewhere different
+-- every run, which is the same nondeterminism FIRST exists to remove.
+--
+-- Kept as a property rather than a second argument on purpose: most of the
+-- ~156 make() calls across the UI pass it, and ordering it here is one place
+-- to be right instead of a hundred places to forget.
 function Theme.make(className: string, props: { [string]: any }): any
 	local obj = Instance.new(className)
 	for _, key in ipairs(FIRST) do
@@ -81,9 +91,12 @@ function Theme.make(className: string, props: { [string]: any }): any
 		end
 	end
 	for k, v in pairs(props) do
-		if not IS_FIRST[k] then
+		if not IS_FIRST[k] and k ~= "Parent" then
 			(obj :: any)[k] = v
 		end
+	end
+	if props.Parent ~= nil then
+		obj.Parent = props.Parent
 	end
 	return obj
 end

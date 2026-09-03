@@ -80,7 +80,6 @@ local EPILOGUE = {
 	'return { ok = __res[1], ret = table.move(__res, 2, __res.n, 1, { n = __res.n - 1 }), out = __out, required = __required, elapsed = os.clock() - __clock }',
 }
 local PROLOGUE_LINES = #PROLOGUE
-local MAX_OUTPUT_LINES = 40
 
 -- How long a chunk may stay suspended before the run is abandoned. This is a
 -- budget for YIELDING, not for work: a chunk that never yields never reaches the
@@ -206,10 +205,9 @@ local function runSource(self: any, code: string?, home: Instance?): (string?, s
 	-- never gets a turn and this cannot help. That one still freezes Studio until
 	-- script exhaustion, and still needs an Actor with a watchdog to fix.
 	--
-	-- ponytail: a timed-out thread is cancelled below on a best effort. task.cancel
-	-- takes a thread suspended on a wait, which is the case this exists for, but it
-	-- refuses one that cannot be cancelled and there is no second lever. The Actor
-	-- upgrade above is the only thing that collects a chunk unconditionally.
+	-- ponytail: a timed-out thread is cancelled below on a best effort, which
+	-- measured here collects every park shape a chunk can reach. The Actor upgrade
+	-- above is still the only thing that collects a chunk that never yields at all.
 	local result
 	local ranOk: boolean, requireErr: any = false, nil
 	local finished = false
@@ -229,7 +227,6 @@ local function runSource(self: any, code: string?, home: Instance?): (string?, s
 	while not finished and os.clock() < deadline do
 		task.wait()
 	end
-	local timedOut = not finished
 
 	-- One frame before disconnecting, and it is not politeness, without it this
 	-- whole listener captures NOTHING in the common case.
@@ -269,35 +266,40 @@ local function runSource(self: any, code: string?, home: Instance?): (string?, s
 		module:Destroy()
 	end)
 
+	-- Read here rather than at the deadline: the task.wait above gives the chunk
+	-- one more frame, and a chunk that finishes in it has a result that calling
+	-- this a timeout would throw away.
+	local timedOut = not finished
+
 	-- Cancel rather than abandon. A thread suspended on a WaitForChild that will
 	-- never resolve otherwise stays parked for the session holding the chunk's
-	-- upvalues, and every timed-out run leaves another one. pcall'd because
-	-- cancel refuses threads it cannot cancel, and a failure here is a leak
-	-- rather than something worth failing the run over.
+	-- upvalues, and every timed-out run leaves another one. cancel is the
+	-- documented lever and was enough on its own here; close is the fallback for a
+	-- refusal, checked by status because a refusal can return without erroring.
 	if timedOut then
 		pcall(task.cancel, thread)
+		if coroutine.status(thread) ~= "dead" then
+			pcall(coroutine.close, thread)
+		end
 	end
 
-	-- Both output blocks cap the same way, and used to say so twice.
-	local function appendCapped(lines: { string }, heading: string, from: { string })
+	-- Uncapped on purpose. Agent's forModel already caps every tool result against
+	-- the same character budget a file read gets, and a second, much harsher line
+	-- cap here only meant a print-heavy run came back cut at 40 lines with no way
+	-- to ask for the rest — a run cannot be re-run narrowed the way `sed -n` can.
+	local function appendSection(lines: { string }, heading: string, from: { string })
 		if #from == 0 then
 			return
 		end
 		table.insert(lines, heading)
-		for index, line in ipairs(from) do
-			if index > MAX_OUTPUT_LINES then
-				table.insert(lines, string.format("… %d more lines", #from - MAX_OUTPUT_LINES))
-				break
-			end
-			table.insert(lines, line)
-		end
+		table.move(from, 1, #from, #lines + 1, lines)
 	end
 
 	-- Deliberately "during this call" and not "by your code": a playtest or
 	-- another plugin printing at the same moment lands here too, and the heading
 	-- must not claim an origin it cannot check.
 	local function appendEscaped(lines: { string })
-		appendCapped(lines, "--- also printed during this call ---", escaped)
+		appendSection(lines, "--- also printed during this call ---", escaped)
 	end
 
 	-- Before the ranOk check: on this path the chunk never returned, so ranOk is
@@ -360,7 +362,7 @@ local function runSource(self: any, code: string?, home: Instance?): (string?, s
 	local lines: { string } = {}
 	table.insert(lines, string.format("ran in %.2f ms", (result.elapsed or 0) * 1000))
 
-	appendCapped(lines, "--- output ---", result.out or {})
+	appendSection(lines, "--- output ---", result.out or {})
 	appendEscaped(lines)
 
 	-- ret is packed, so `return a, b` shows both and `return nil, "why"` shows

@@ -1749,7 +1749,7 @@ HANDLERS.cat = function(self, argv, stdin)
 	-- carries on. `fail()` is deliberately NOT called — it stops the pipeline, and
 	-- `cat good.luau missing.luau | wc -l` has to still count the good one. The
 	-- cost is that the message travels as data, the same seam as every other
-	-- in-band status here; see FIDELITY.md §3.1. It gets its own newline because,
+	-- in-band status here; see BASH_FIDELITY.md §3.1. It gets its own newline because,
 	-- unlike a file, it is not text anyone chose the ending of.
 	local parts: { string } = {}
 	local notes: { string } = {}
@@ -7236,7 +7236,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 	--
 	-- Three rows, not two, on purpose: with the empty field on the last row the
 	-- result ends in an empty line, and a trailing empty line is exactly what the
-	-- no-trailing-newline convention cannot represent (see FIDELITY.md §3.6). The
+	-- no-trailing-newline convention cannot represent (see BASH_FIDELITY.md §3.6). The
 	-- assertion would then be pinning that ambiguity rather than cut's behaviour.
 	local columns = Instance.new("ModuleScript")
 	columns.Name = "Columns"
