@@ -30,9 +30,15 @@ local REGISTRY: { [string]: { label: string, hint: string, wire: string, auth: s
 		wire = "OpenRouter",
 		auth = "OpenRouterAuth",
 	},
+	nvidia = {
+		label = "NVIDIA",
+		hint = "free NIM models",
+		wire = "Nvidia",
+		auth = "NvidiaAuth",
+	},
 }
 -- Fixed order, so the picker does not reshuffle between launches.
-local ORDER = { "anthropic", "openrouter" }
+local ORDER = { "anthropic", "openrouter", "nvidia" }
 
 local KEY_PROVIDER = "cc_provider"
 local DEFAULT_PROVIDER = "anthropic"

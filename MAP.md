@@ -24,6 +24,8 @@ main.lua                        window, toolbar, popups, usage panel
           providers/AnthropicAuth   PKCE, refresh, usage
           providers/OpenRouter      chat/completions; translation both ways
           providers/OpenRouterAuth  PKCE (no refresh: the key is the credential)
+          providers/Nvidia          NIM chat/completions; the same translation
+          providers/NvidiaAuth      a pasted nvapi- key, and nothing else
         agent/Tools             registry; tools/ is one file per tool
     ui/Console -> ui/Markdown -> ui/Theme
     ui/Find                     search the open conversation
@@ -122,13 +124,15 @@ main.lua                        window, toolbar, popups, usage panel
 | `fs/Terminal.lua` | 839 | Commands as tree operations. No parsing. |
 | `fs/Fs.lua` | 843 | Paths, `.Source`, undo, mtime, globs, mode bits. |
 | `agent/providers/OpenRouter.lua` | 842 | chat/completions, and the translation both ways. |
+| `agent/providers/Nvidia.lua` | 948 | NIM chat/completions. Two reasoning switches, one per model. |
 | `agent/providers/Anthropic.lua` | 824 | One request. Knows nothing about turns. |
-| `agent/providers/Stream.lua` | 391 | The socket, the retries, the latches. One copy. |
+| `agent/providers/Stream.lua` | 419 | The socket, the retries, the latches. One copy. |
 | `ui/Sessions.lua` | 888 | Session list, filter, peek and persistence. |
 | `ui/Settings.lua` | 603 | Preferences + panel. |
 | `studio/Exec.lua` | 564 | Luau execution. Tool-only. |
 | `agent/providers/AnthropicAuth.lua` | 507 | PKCE login, refresh, usage rows. |
 | `agent/providers/OpenRouterAuth.lua` | 273 | PKCE login, or a pasted key. Credits. |
+| `agent/providers/NvidiaAuth.lua` | 137 | A pasted key. No flow to speak of. |
 | `agent/providers/Retry.lua` | 229 | What is worth retrying, and how long to wait. |
 | `agent/providers/ToolJson.lua` | 103 | Decoding arguments the model wrote. |
 | `agent/providers/Pkce.lua` | 70 | verifier / challenge / state. |

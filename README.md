@@ -4,7 +4,7 @@ A Studio plugin that puts a coding agent inside Studio. It gives the model tools
 that treat the DataModel like a filesystem, so ls, cat, grep, cd, edit and write
 all work on Instances.
 
-Two providers, both OAuth, neither needing an API key pasted from a dashboard:
+Three providers, two of them OAuth:
 
 - **Claude** — your Claude subscription, the same login Claude Code uses.
 - **OpenRouter** — for the free tier. OpenRouter fronts a rotating set of models
@@ -13,6 +13,11 @@ Two providers, both OAuth, neither needing an API key pasted from a dashboard:
   every capability here is a tool call and a model without them can only narrate
   what it would have done. Free models are capped at 50 requests/day, or 1000
   once you have bought $10 of credits at any point.
+- **NVIDIA** — the other free tier, and the one that is a pasted key rather than
+  a login: generate an `nvapi-` key at build.nvidia.com/settings/api-keys and
+  hand it to `/code`. Nemotron, Kimi, DeepSeek and gpt-oss, capped by rate
+  (~40 requests/minute, per model) rather than by day, which suits an agent turn
+  — many requests rather than one — far better than a daily allowance does.
 
 Switch with `/provider`, or from the Provider row in the model picker. Each
 provider keeps its own model choice and its own sessions: a conversation is
@@ -35,8 +40,9 @@ A simple bash tool is self explanatory and the agent is already a pro at using b
 
 Click the toolbar button, run /login, open the URL it prints, then paste the
 code back with /code. On OpenRouter, /code also takes an `sk-or-...` key
-directly if you already have one. After that just type. Enter sends,
-Shift+Enter adds a line, and / lists the commands.
+directly if you already have one; on NVIDIA a pasted `nvapi-...` key is the
+whole flow, and the URL /login prints is the page that mints one. After that
+just type. Enter sends, Shift+Enter adds a line, and / lists the commands.
 
 The button at the top left opens the sessions drawer. Conversations are saved as
 you go and the last one for the place you are in comes back when you reopen the
@@ -79,7 +85,8 @@ Studio dispatches ahead of a text box.
 
 Settings is at the bottom of that drawer: effort, web search, run code and system
 prompt, plus what you have left — the 5 hour and weekly windows on Claude,
-credits and the free-model request cap on OpenRouter. The model has its own chip
+credits and the free-model request cap on OpenRouter, the rate ceiling on
+NVIDIA. The model has its own chip
 at the right of the input row, and the provider is one page behind it. The widget floats over the viewport
 rather than docking to an edge, and hides itself during playtests.
 
@@ -322,6 +329,8 @@ main/
       AnthropicAuth.lua  PKCE login, token storage and refresh
       OpenRouter.lua     chat/completions client, and the translation both ways
       OpenRouterAuth.lua PKCE login, or a pasted key
+      Nvidia.lua         NIM chat/completions client, and the same translation
+      NvidiaAuth.lua     a pasted nvapi- key, and nothing else
     Agent.lua     history and the tool-use loop
     Tools.lua     tool registry
     tools/        one file per tool

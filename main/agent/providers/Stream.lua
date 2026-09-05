@@ -334,16 +334,33 @@ function Stream.open(config: {
 			local parseOk = pcall(function()
 				parsed = HttpService:JSONDecode(message)
 			end)
-			if parseOk and type(parsed) == "table" and (parsed :: any).error then
-				local e = (parsed :: any).error
+			local body = if parseOk and type(parsed) == "table" then parsed :: any else nil
+			local e = if body then body.error else nil
+			-- An error body in whatever shape this vendor uses, and the status is
+			-- half the test rather than the envelope alone. Anthropic and OpenRouter
+			-- send {error:{type|code, message}}; NVIDIA sends RFC-7807
+			-- {status, title, detail}, and a 401 there is not JSON at all. Matching
+			-- only on `.error` sent both of those to processFrames, where they sat in
+			-- a buffer that never sees a "\n\n" — and when the socket then closed
+			-- cleanly, nothing spoke for the attempt and the turn span forever with
+			-- no error on screen.
+			local httpFailed = responseStatus ~= nil and (responseStatus :: number) >= 400
+			if e or httpFailed then
 				-- `type` is Anthropic's spelling, `code` is OpenAI's and
-				-- OpenRouter's. Reading only the first left every OpenRouter
-				-- failure reading "HTTP error:  — ...", blank where the useful
-				-- half goes.
-				local kind = e.type or e.code
-				local msg = "HTTP error: " .. tostring(kind or status or "") .. " — " .. tostring(e.message or "")
+				-- OpenRouter's, `title` is NVIDIA's. Reading only the first left
+				-- every OpenRouter failure reading "HTTP error:  — ...", blank
+				-- where the useful half goes.
+				local kind = (if e then e.type or e.code else nil) or (if body then body.title else nil)
+				-- The raw message is the last resort, and it is what carries a
+				-- non-JSON body: NVIDIA answers a missing Authorization header with
+				-- one line of plain text.
+				local text = (if e then e.message else nil) or (if body then body.detail else nil) or message
+				-- responseStatus, not `status`: `status` is only ever `fail`'s
+				-- parameter, a different scope, so this fallback was reading a nil
+				-- global and never once fired.
+				local msg = "HTTP error: " .. tostring(kind or responseStatus or "") .. " — " .. tostring(text)
 				if config.explain then
-					msg = config.explain(status or responseStatus, message) or msg
+					msg = config.explain(responseStatus, message) or msg
 				end
 				warn("[agent] " .. msg)
 				warn("[agent] Response body: " .. message)

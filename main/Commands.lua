@@ -312,7 +312,7 @@ Commands.SLASH_COMMANDS = {
 	{ cmd = "/logout",   desc = "Clear stored tokens" },
 	{ cmd = "/status",   desc = "Show login, model, effort, current path" },
 	{ cmd = "/model",    desc = "Switch model" },
-	{ cmd = "/provider", desc = "Switch between Claude and OpenRouter" },
+	{ cmd = "/provider", desc = "Switch provider" },
 	{ cmd = "/settings", desc = "Open the settings panel" },
 	{ cmd = "/selftest", desc = "Run every module's self-test (redraws the console)" },
 	{ cmd = "/sh",       desc = "Run a terminal command, or bare to stay in the shell" },
