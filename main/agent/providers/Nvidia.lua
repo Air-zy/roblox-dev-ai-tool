@@ -4,8 +4,13 @@
 -- The point of this provider is a second free tier with a different roster.
 -- OpenRouter's free models are capped at 50 requests a DAY across all of them,
 -- and an agent turn is many requests rather than one, so that cap arrives fast
--- here. NVIDIA's hosted endpoint is about 40 a MINUTE, per model, and fronts
--- Nemotron, Kimi, DeepSeek and gpt-oss.
+-- here. NVIDIA meters by the MINUTE instead, and fronts Nemotron, Kimi, DeepSeek
+-- and gpt-oss.
+--
+-- That rate is not published and no response carries a rate-limit header, so
+-- nothing here can read it — see NvidiaAuth, which counts our own sends instead.
+-- It is also one budget for the whole KEY rather than per model, which is why
+-- the 429 message below refuses to suggest switching model.
 --
 -- The wire is OpenAI chat/completions, so the translation is OpenRouter.luau's
 -- and the header there is the one to read for how a conversation is flattened
@@ -692,6 +697,11 @@ local function streamMessage(args: {
 			if not key then
 				return nil, "Auth: " .. tostring(attemptErr)
 			end
+			-- Counted here because this hook runs once per ATTEMPT, which is the
+			-- unit the rate limit charges for — a retry spends the allowance like
+			-- anything else. NVIDIA sends no rate-limit header, so our own send
+			-- rate is the only figure the settings panel can honestly show.
+			if Auth.noteRequest then Auth.noteRequest() end
 			return {
 				url = COMPLETIONS_URL,
 				headers = {
@@ -731,20 +741,38 @@ local function streamMessage(args: {
 		-- Both of these say something the raw body does not. NVIDIA answers a bad
 		-- key with "Authorization failed" and nothing about why it might have
 		-- stopped working, and a rate limit with no headers at all.
-		explain = function(status: number?, _body: string?): string?
+		explain = function(status: number?, body: string?): string?
 			if status == 401 or status == 403 then
 				return "NVIDIA rejected the key. Personal keys EXPIRE — six months, unless the "
 					.. "key was created as \"Never Expire\" — so one that worked last month can "
 					.. "stop with no warning. Generate another at "
 					.. tostring(Auth and Auth.API_KEYS_URL) .. " and paste it with /code."
 			end
+			-- Capacity, NOT this key's rate limit, and the two are worth telling
+			-- apart because the response to them differs. NVIDIA answers a rate
+			-- limit with 429 "Too Many Requests"; "Service temporarily overloaded"
+			-- is the shared fleet being busy, arrives in-band inside a 200, and
+			-- says nothing about how much of the allowance is left.
+			if body and string.find(string.lower(body), "overload", 1, true) then
+				return "NVIDIA's capacity, not your rate limit — the fleet is busy and this is "
+					.. "retried automatically with backoff. A rate limit would say 429 / Too Many "
+					.. "Requests instead. If it keeps happening, status.build.nvidia.com has the "
+					.. "fleet status and another model often has capacity when one does not."
+			end
 			if status == 429 then
+				-- The limit is GLOBAL to the key, not per model, so switching models
+				-- cannot help — the same correction OpenRouter's 402 message makes.
+				-- Saying otherwise sends people round a loop that cannot work.
+				local sent = (Auth and Auth.recentRequests and Auth.recentRequests()) or 0
 				return string.format(
-					"Rate limited. The free tier is about %d requests a minute PER MODEL, and is "
-					.. "documented as a best-effort ceiling rather than a guarantee. An agent turn "
-					.. "is many requests rather than one, so this arrives sooner here than it "
-					.. "would in a chat window; another model has its own budget.",
-					(Auth and Auth.FREE_RPM) or 40)
+					"Rate limited after %d requests in the last minute. The limit is one budget "
+					.. "for the whole KEY, shared across every model, so switching model will not "
+					.. "help — only waiting will. NVIDIA does not publish the number or send a "
+					.. "rate-limit header; ~%d/min is the usual free-tier figure and the real one "
+					.. "for this account is on build.nvidia.com, which is also where an increase "
+					.. "is requested. An agent turn is many requests rather than one, so this "
+					.. "arrives sooner here than it would in a chat window.",
+					sent, (Auth and Auth.FREE_RPM) or 40)
 			end
 			return nil
 		end,

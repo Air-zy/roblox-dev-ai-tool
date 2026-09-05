@@ -89,10 +89,16 @@ function Retry.isRetryable(status: number?, body: string?): boolean
 	-- status is not always the thing that arrives. rate_limit_error is included
 	-- alongside overloaded_error because both can reach us through a path that
 	-- carried no usable status at all.
-	if string.find(body, '"type":"overloaded_error"', 1, true)
-		or string.find(body, '"type":"rate_limit_error"', 1, true) then
-		return true
-	end
+	if string.find(body, '"type":"rate_limit_error"', 1, true) then return true end
+	-- An overload is retryable by definition, so there is one copy of that test
+	-- and it lives in isOverload below.
+	if Retry.isOverload(nil, body) then return true end
+	-- The 429 wording, for the one case left after Stream has already tried to
+	-- recover a status from the body: a mid-stream error whose object carries no
+	-- code at all. Nothing else is matched on prose — an error that merely reads
+	-- badly is still fatal, because a retry that cannot succeed spends the user's
+	-- time twice.
+	if string.find(string.lower(body), "too many requests", 1, true) then return true end
 	for _, name in ipairs(RETRYABLE_TRANSPORT) do
 		if string.find(body, name, 1, true) then
 			return true
@@ -106,8 +112,19 @@ end
 -- streaming". That applies doubly here, where an overloaded_error arrives as an
 -- SSE `event: error` inside a response whose HTTP status was already 200.
 function Retry.isOverload(status: number?, body: string?): boolean
-	return status == 529
-		or (body ~= nil and string.find(body, '"type":"overloaded_error"', 1, true) ~= nil)
+	-- 529 ONLY, and not 503. A 503 is retryable as an ordinary 5xx and the note
+	-- above says why: it comes from infrastructure in front of the API and means
+	-- the same to a client as a 500. Counting it as an overload was a change made
+	-- here for NVIDIA's benefit, and it quietly cut Anthropic's retry budget on
+	-- that status from MAX_ATTEMPTS to the tighter MAX_OVERLOAD_ATTEMPTS.
+	-- Anthropic's own table names 529 as the overload code; leave it at that.
+	if status == 529 then return true end
+	-- One test for every spelling, because they all contain the word: Anthropic's
+	-- `"type":"overloaded_error"` and NVIDIA's "Service temporarily overloaded".
+	-- Matching the word rather than either literal is what puts a NIM overload
+	-- under the TIGHTER attempt cap, which is the point — a fleet that is already
+	-- saturated is not helped by us coming back four times.
+	return body ~= nil and string.find(string.lower(body), "overload", 1, true) ~= nil
 end
 
 -- `retry-after` out of the raw header blob WebStreamClient hands to Opened. A

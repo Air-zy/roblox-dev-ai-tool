@@ -196,14 +196,19 @@ end
 -- served for up to a day afterwards, so tightening the filter appears to do
 -- nothing and the rows it was meant to remove are still there. Sorting had the
 -- same hole. Both belong wherever the list is adopted, not where it is fetched.
-local function applyRoster(entries: { any })
+-- Returns whether it actually adopted the list. Never replaces a working roster
+-- with an empty one — and the caller has to know that happened, because
+-- refreshModels caches whatever MODELS holds afterwards: without the answer, a
+-- fetch that filtered down to nothing would quietly store the two-row SEED under
+-- a fresh timestamp and serve it for a day, having reported success.
+local function applyRoster(entries: { any }): boolean
 	local kept: { any } = {}
 	for _, entry in ipairs(entries) do
 		if type(entry) == "table" and type(entry.id) == "string" and isTextModel(entry.id) then
 			kept[#kept + 1] = entry
 		end
 	end
-	if #kept == 0 then return end
+	if #kept == 0 then return false end
 	-- Biggest window first, then id DESCENDING. The second key is a heuristic and
 	-- worth naming as one: Google's ids sort so that a later series comes out on
 	-- top ("gemini-3.8-flash" > "gemini-2.5-pro"), which is what puts something
@@ -214,6 +219,7 @@ local function applyRoster(entries: { any })
 		return a.id > b.id
 	end)
 	Gemini.MODELS = kept
+	return true
 end
 
 -- Fetches the roster, which is the only reason this provider needs no caps
@@ -287,7 +293,12 @@ function refreshModels(): (boolean, string?)
 		-- Never replace a working list with an empty one.
 		return false, "model list: nothing that can generate content"
 	end
-	applyRoster(out)
+	-- Only cache what was actually adopted. Caching unconditionally would store
+	-- the seed under a fresh timestamp whenever the filter rejected everything,
+	-- and then serve it for a day while reporting that the fetch worked.
+	if not applyRoster(out) then
+		return false, "model list: nothing that looked like a text chat model"
+	end
 	if plugin then
 		pcall(function()
 			-- Cached AFTER the filter and the sort, so the stored copy is already
@@ -1107,5 +1118,6 @@ Gemini.selfTest = selfTest
 -- Exported for the offline test harness only: the roster filter is a heuristic
 -- and the matrix of ids it has to get right is longer than a selfTest wants.
 Gemini._isTextModel = isTextModel
+Gemini._applyRoster = applyRoster
 
 return Gemini

@@ -135,7 +135,7 @@ main.lua                        window, toolbar, popups, usage panel
 | `studio/Exec.lua` | 564 | Luau execution. Tool-only. |
 | `agent/providers/AnthropicAuth.lua` | 507 | PKCE login, refresh, usage rows. |
 | `agent/providers/OpenRouterAuth.lua` | 273 | PKCE login, or a pasted key. Credits. |
-| `agent/providers/NvidiaAuth.lua` | 137 | A pasted key. No flow to speak of. |
+| `agent/providers/NvidiaAuth.lua` | 193 | A pasted key, and a rolling send-rate meter. |
 | `agent/providers/GeminiAuth.lua` | 132 | A pasted key. No flow to speak of. |
 | `agent/providers/Retry.lua` | 229 | What is worth retrying, and how long to wait. |
 | `agent/providers/ToolJson.lua` | 103 | Decoding arguments the model wrote. |

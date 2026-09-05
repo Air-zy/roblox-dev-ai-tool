@@ -22,8 +22,12 @@
 --   reset()    -> ()          clear the provider's per-attempt accumulators
 --   frame(text, ctrl) -> ()   one complete SSE frame, "\n\n"-delimited
 --   partial()  -> string?     text already accumulated, for the error handover
---   explain?(status, body) -> string?   replace the error line for a status
---                 this provider can say something more useful about
+--   explain?(status, body) -> string?   a sentence ADDED under the error line,
+--                 for a failure this provider can say something more useful
+--                 about. It never replaces what the server said: the raw line
+--                 keeps the status and the vendor's own wording, which is what
+--                 is left to go on when the explanation guesses wrong. Called on
+--                 EVERY failure route, in-band SSE errors included.
 --   closed?(ctrl) -> ()       the socket ended without the provider finishing.
 --                 A clean close raises no Error, so a protocol whose terminator
 --                 can go missing would otherwise leave the turn spinning until
@@ -135,9 +139,36 @@ function Stream.open(config: {
 	-- One decision point for every way an attempt can die: a transport Error, an
 	-- in-band SSE error event, and a JSON error body all route here rather than
 	-- each calling onError with its own idea of what is fatal.
+	-- An in-band SSE error arrives inside a response whose HTTP status was 200, so
+	-- the provider that parsed it has no status to pass and hands over nil. The
+	-- status is very often right there in the body it DID hand over —
+	-- {"error":{"code":429}} on an OpenAI-shaped stream, Gemini's error.code, and
+	-- {"status":503} in NVIDIA's problem+json — so it is read here, once, rather
+	-- than in each of the three parsers, and rather than being guessed at from the
+	-- wording of the message further down.
+	local function statusFromBody(body: string?): number?
+		if not body then return nil end
+		local parsed
+		if not pcall(function() parsed = HttpService:JSONDecode(body) end) then return nil end
+		if type(parsed) ~= "table" then return nil end
+		local obj = parsed :: any
+		local err = if type(obj.error) == "table" then obj.error else nil
+		local code = (err and (tonumber(err.code) or tonumber(err.status))) or tonumber(obj.status)
+		-- Only something that is actually an HTTP status. An OpenAI `code` is
+		-- frequently a string like "rate_limit_exceeded", which tonumber rejects,
+		-- and some other stray integer would classify worse than nil does.
+		if code and code >= 100 and code < 600 then return code end
+		return nil
+	end
+
 	local function fail(status: number?, body: string?, message: string)
 		if handle.cancelled or dead then return end
 		dead = true  -- latch first: a late MessageReceived must not race this
+
+		-- Recovered before anything classifies on it, so retry, overload and
+		-- explain all see the real number on an in-band failure too.
+		if status == nil then status = statusFromBody(body) end
+
 		pcall(function()
 			if stream then stream:Close() end
 		end)
@@ -207,6 +238,34 @@ function Stream.open(config: {
 				start()
 			end)
 			return
+		end
+
+		-- The provider's word on what went wrong, and only now that the attempt is
+		-- genuinely over.
+		--
+		-- It used to live in the MessageReceived handler, which meant it only ever
+		-- saw an error carried by an HTTP status. An SSE stream reports a
+		-- mid-flight failure as a chunk inside a 200 response, and those arrive
+		-- here from the provider's own parser: the whole in-band path was exempt,
+		-- so the vendor advice never appeared for the errors most likely to need
+		-- it — a NIM overload said "Service temporarily overloaded" and no more.
+		--
+		-- Down HERE rather than at the top of `fail`, because every retry path
+		-- above returns before it. An explanation is a paragraph, and appending
+		-- one to each of three retry lines buries the one thing those lines are
+		-- for: how long the wait is. A retry says what happened; only the failure
+		-- that ends the turn says why.
+		--
+		-- ADDED to the error, never substituted for it. An explanation is a guess
+		-- about a cause; the line above it is what the server actually said, and
+		-- that is the half worth having when the guess is wrong. Replacing it also
+		-- throws away the status and the vendor's own wording, which are the first
+		-- two things anyone needs to look a failure up.
+		if config.explain then
+			local because = config.explain(status or responseStatus, body)
+			if because and because ~= "" then
+				message = message .. "\n" .. because
+			end
 		end
 
 		if callbacks.onError then
@@ -398,10 +457,9 @@ function Stream.open(config: {
 				-- responseStatus, not `status`: `status` is only ever `fail`'s
 				-- parameter, a different scope, so this fallback was reading a nil
 				-- global and never once fired.
+				-- Not explained here: `fail` does it for every route, this one
+				-- included, so doing it twice would just apply it to its own output.
 				local msg = "HTTP error: " .. tostring(kind or responseStatus or "") .. " — " .. tostring(text)
-				if config.explain then
-					msg = config.explain(responseStatus, message) or msg
-				end
 				warn("[agent] " .. msg)
 				warn("[agent] Response body: " .. message)
 				-- The body is passed on so an overloaded_error is recognised even

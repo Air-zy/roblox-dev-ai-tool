@@ -16,8 +16,6 @@
 --
 -- Reference: https://build.nvidia.com/settings/api-keys
 
-local HttpService = game:GetService("HttpService")
-
 -- The `plugin` global only exists in the root plugin Script, not in the
 -- ModuleScripts it requires, so the caller hands it over via Initialize.
 local plugin: any = nil
@@ -37,10 +35,52 @@ local KEY_API_KEY = "nvidia_api_key"
 -- request validates a key anyway. NVIDIA keys happen to begin `nvapi-` today;
 -- that fact belongs in the message below, not in a gate.
 
--- Documented as a best-effort ceiling rather than an SLA, and per model rather
--- than per account. Worth stating in the panel because an agent turn is many
--- requests, not one, so it arrives sooner here than it would in a chat window.
+-- A REFERENCE POINT, not a fact about this account, and the distinction matters
+-- enough to spell out. NVIDIA publishes no rate limit: 40/min is the figure its
+-- staff and users quote on the developer forums, the real ceiling is only shown
+-- in the build.nvidia.com UI, and an account that asked for an increase is on
+-- 200. So this is what the bar below is drawn against and nothing more.
+--
+-- It is also GLOBAL — one budget for the key, shared across every model — not
+-- per model as this file first claimed. That error mattered: it made "switch
+-- model" sound like a way out of a 429 when the two models draw on the same
+-- allowance. Same trap OpenRouter's 402 message already warns about.
 local FREE_RPM = 40
+
+-- What we can actually measure. There is no quota endpoint and no rate-limit
+-- header on any NVIDIA response — verified against both /v1/models and
+-- /v1/chat/completions, and the developer forums list the missing headers as a
+-- standing complaint — so the server will not tell us how much is left.
+--
+-- Counting our own sends is the one honest gauge available, and for this plugin
+-- it is the interesting number anyway: a single agent turn is many requests, so
+-- the rate that matters is the one this plugin is generating right now.
+--
+-- ponytail: a plain array pruned on write, not a ring buffer. It holds at most a
+-- minute of sends — tens of entries, a couple of hundred on an upgraded key.
+local RPM_WINDOW = 60
+local sendTimes: { number } = {}
+
+-- Called once per ATTEMPT by the wire, retries included, because a retry spends
+-- the allowance exactly like a first try does.
+local function noteRequest()
+	local now = os.time()
+	local kept: { number } = {}
+	for _, at in ipairs(sendTimes) do
+		if now - at < RPM_WINDOW then kept[#kept + 1] = at end
+	end
+	kept[#kept + 1] = now
+	sendTimes = kept
+end
+
+local function recentRequests(): number
+	local now = os.time()
+	local n = 0
+	for _, at in ipairs(sendTimes) do
+		if now - at < RPM_WINDOW then n += 1 end
+	end
+	return n
+end
 
 local function getSetting(key: string): any
 	if not plugin then return nil end
@@ -111,18 +151,26 @@ end
 
 -- Rows for the settings panel, already formatted, same contract as the other two.
 --
--- NVIDIA publishes no credits or usage endpoint, so unlike OpenRouter there is
--- nothing to fetch and this never touches the network. One row rather than an
--- error: the rate limit is the thing that actually ends a session here, and it is
--- worth stating even though knowing it costs no request. Same reasoning as the
--- "Free models — N req/day" row OpenRouterAuth prints beside its real bars.
+-- NVIDIA publishes no credits or usage endpoint and sends no rate-limit header,
+-- so unlike OpenRouter there is nothing to fetch and this never touches the
+-- network. What it can report is what this plugin itself has spent, which for an
+-- agent is the number that matters: a turn is many requests, and the rate is
+-- generated here rather than by a person typing.
 local function fetchUsage(): ({ { label: string, value: string, bar: number? } }?, string?)
 	if not isLoggedIn() then
 		return nil, "Not logged in."
 	end
+	-- The first row is measured, the second is a reference. Ordered that way on
+	-- purpose: the number this plugin actually knows goes first, and the one it
+	-- is only quoting is labelled as such rather than presented as a quota.
+	local sent = recentRequests()
 	return {
-		{ label = "Rate limit", value = string.format("~%d req/min per model", FREE_RPM) },
-		{ label = "Credits", value = "no usage endpoint" },
+		{
+			label = "Sent",
+			value = string.format("%d in the last minute", sent),
+			bar = math.clamp(sent / FREE_RPM, 0, 1),
+		},
+		{ label = "Key limit", value = string.format("~%d/min, unpublished", FREE_RPM) },
 	}, nil
 end
 
@@ -130,6 +178,8 @@ return {
 	-- Exported so the wire can quote it back when a request is refused for rate,
 	-- and two copies of a limit is two things to get wrong on the day it changes.
 	FREE_RPM = FREE_RPM,
+	noteRequest = noteRequest,
+	recentRequests = recentRequests,
 	API_KEYS_URL = API_KEYS_URL,
 	Initialize = Initialize,
 	startLogin = startLogin,

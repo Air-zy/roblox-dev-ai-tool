@@ -16,8 +16,12 @@ Four providers, two of them OAuth:
 - **NVIDIA** — the other free tier, and the one that is a pasted key rather than
   a login: generate an `nvapi-` key at build.nvidia.com/settings/api-keys and
   hand it to `/code`. Nemotron, Kimi, DeepSeek and gpt-oss, capped by rate
-  (~40 requests/minute, per model) rather than by day, which suits an agent turn
-  — many requests rather than one — far better than a daily allowance does.
+  rather than by day, which suits an agent turn — many requests rather than one —
+  far better than a daily allowance does. NVIDIA does not publish that rate or
+  send a rate-limit header, and it is one budget for the whole key rather than
+  per model, so switching model does not escape a 429. Settings shows what this
+  plugin has sent in the last minute, which is the only figure anyone here can
+  actually measure.
 - **Gemini** — Google AI Studio, also a pasted key (from
   aistudio.google.com/apikey; new ones look like `AQ....`, and the older
   `AIza...` Standard keys stopped being accepted in September 2026). This one
@@ -98,9 +102,10 @@ Studio dispatches ahead of a text box.
 
 Settings is at the bottom of that drawer: effort, web search, run code and system
 prompt, plus what you have left — the 5 hour and weekly windows on Claude,
-credits and the free-model request cap on OpenRouter, the rate ceilings on
-NVIDIA and Gemini. The model has its own chip
-at the right of the input row, and the provider is one page behind it. The widget floats over the viewport
+credits and the free-model request cap on OpenRouter, what this plugin has sent
+in the last minute on NVIDIA, and where to look on Gemini. The model has its own
+chip at the right of the input row, and the provider is one page behind it. The
+widget floats over the viewport
 rather than docking to an edge, and hides itself during playtests.
 
 Plugins get no clipboard API, so instead anything worth copying is a text box
