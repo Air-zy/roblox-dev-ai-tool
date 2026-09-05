@@ -36,9 +36,15 @@ local REGISTRY: { [string]: { label: string, hint: string, wire: string, auth: s
 		wire = "Nvidia",
 		auth = "NvidiaAuth",
 	},
+	gemini = {
+		label = "Gemini",
+		hint = "AI Studio key",
+		wire = "Gemini",
+		auth = "GeminiAuth",
+	},
 }
 -- Fixed order, so the picker does not reshuffle between launches.
-local ORDER = { "anthropic", "openrouter", "nvidia" }
+local ORDER = { "anthropic", "openrouter", "nvidia", "gemini" }
 
 local KEY_PROVIDER = "cc_provider"
 local DEFAULT_PROVIDER = "anthropic"

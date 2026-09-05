@@ -26,6 +26,8 @@ main.lua                        window, toolbar, popups, usage panel
           providers/OpenRouterAuth  PKCE (no refresh: the key is the credential)
           providers/Nvidia          NIM chat/completions; the same translation
           providers/NvidiaAuth      a pasted nvapi- key, and nothing else
+          providers/Gemini          native generateContent; thought signatures
+          providers/GeminiAuth      a pasted AI Studio key, and nothing else
         agent/Tools             registry; tools/ is one file per tool
     ui/Console -> ui/Markdown -> ui/Theme
     ui/Find                     search the open conversation
@@ -125,6 +127,7 @@ main.lua                        window, toolbar, popups, usage panel
 | `fs/Fs.lua` | 843 | Paths, `.Source`, undo, mtime, globs, mode bits. |
 | `agent/providers/OpenRouter.lua` | 842 | chat/completions, and the translation both ways. |
 | `agent/providers/Nvidia.lua` | 948 | NIM chat/completions. Two reasoning switches, one per model. |
+| `agent/providers/Gemini.lua` | 1027 | Native generateContent. Carries thought signatures across turns. |
 | `agent/providers/Anthropic.lua` | 824 | One request. Knows nothing about turns. |
 | `agent/providers/Stream.lua` | 419 | The socket, the retries, the latches. One copy. |
 | `ui/Sessions.lua` | 888 | Session list, filter, peek and persistence. |
@@ -133,6 +136,7 @@ main.lua                        window, toolbar, popups, usage panel
 | `agent/providers/AnthropicAuth.lua` | 507 | PKCE login, refresh, usage rows. |
 | `agent/providers/OpenRouterAuth.lua` | 273 | PKCE login, or a pasted key. Credits. |
 | `agent/providers/NvidiaAuth.lua` | 137 | A pasted key. No flow to speak of. |
+| `agent/providers/GeminiAuth.lua` | 132 | A pasted key. No flow to speak of. |
 | `agent/providers/Retry.lua` | 229 | What is worth retrying, and how long to wait. |
 | `agent/providers/ToolJson.lua` | 103 | Decoding arguments the model wrote. |
 | `agent/providers/Pkce.lua` | 70 | verifier / challenge / state. |

@@ -237,17 +237,54 @@ function Stream.open(config: {
 		fail = fail,
 	}
 
-	-- We buffer received chunks and split on blank lines (\n\n) to get complete
-	-- SSE events, since RawStream doesn't guarantee message boundaries.
+	-- We buffer received chunks and split on a blank line to get complete SSE
+	-- events, since RawStream doesn't guarantee message boundaries.
+	--
+	-- All THREE separators, not just "\n\n". The spec allows a line to end LF,
+	-- CRLF or CR, so a blank line is any of "\n\n", "\r\n\r\n" or "\r\r" — and a
+	-- CRLF server is not hypothetical. Matching only "\n\n" against "\r\n\r\n"
+	-- finds nothing, because the two newlines in it are not adjacent: the bytes
+	-- are CR LF CR LF. Every chunk then lands in a buffer that never drains, so
+	-- the socket stays busy, the inactivity timeout never fires, and the turn
+	-- spins forever with no error and no output.
+	local SEPARATORS = { "\r\n\r\n", "\n\n", "\r\r" }
 	local sseBuffer = ""
+	-- Whether this attempt ever cut a frame ON A BOUNDARY, and whether it received
+	-- anything at all. The pair is what tells a stream that ended cleanly apart
+	-- from one whose framing we never understood — see the Closed handler. The
+	-- tail flush there deliberately does NOT count, or a mismatch would hide
+	-- behind the one frame that flush produces.
+	local realFrames = 0
+	local bytesSeen = 0
+	-- The head of the response, kept for that diagnostic. A couple of hundred
+	-- bytes is enough to see whether it was JSON, HTML from a proxy, or SSE with
+	-- separators we did not cut on.
+	local preview = ""
+
+	local function nextBoundary(s: string): (number?, number?)
+		local at: number?, len: number? = nil, nil
+		for _, sep in ipairs(SEPARATORS) do
+			local found = s:find(sep, 1, true)
+			-- Earliest wins, so a CRLF blank line is consumed whole rather than
+			-- leaving a stray CR at the head of the next frame.
+			if found and (at == nil or found < at) then
+				at, len = found, #sep
+			end
+		end
+		return at, len
+	end
+
 	local function processFrames(data: string)
 		if handle.cancelled or dead then return end
 		sseBuffer = sseBuffer .. data
+		bytesSeen += #data
+		if #preview < 200 then preview = string.sub(preview .. data, 1, 200) end
 		while true do
-			local eventEnd = sseBuffer:find("\n\n", 1, true)
+			local eventEnd, sepLen = nextBoundary(sseBuffer)
 			if not eventEnd then break end
 			local eventStr = sseBuffer:sub(1, eventEnd - 1)
-			sseBuffer = sseBuffer:sub(eventEnd + 2)
+			sseBuffer = sseBuffer:sub(eventEnd + (sepLen :: number))
+			realFrames += 1
 			config.frame(eventStr, ctrl)
 			-- A frame can finish or fail the stream. Anything buffered after that
 			-- belongs to a socket that is now closed.
@@ -258,6 +295,9 @@ function Stream.open(config: {
 	start = function()
 		dead = false
 		sseBuffer = ""
+		realFrames = 0
+		bytesSeen = 0
+		preview = ""
 		responseHeaders = nil
 		responseStatus = nil
 		config.reset()
@@ -403,12 +443,41 @@ function Stream.open(config: {
 
 		stream.Closed:Connect(function()
 			if handle.cancelled or dead or myGeneration ~= generation then return end
+
+			-- A last event with no blank line after it. The spec says to discard an
+			-- incomplete one, but a server that simply stops after its final event
+			-- is common, and on this wire that final event is the one carrying the
+			-- stop reason and the usage. Handed over as a frame: if it really is a
+			-- fragment the provider's JSON parse rejects it and nothing is lost.
+			if sseBuffer ~= "" then
+				local tail = sseBuffer
+				sseBuffer = ""
+				config.frame(tail, ctrl)
+				if handle.cancelled or dead then return end
+			end
+
 			-- The socket ended without the provider finishing, and without an
 			-- Error — so nothing else is going to speak for this attempt. A
 			-- provider whose terminator can go missing gets one chance to deliver
 			-- what it has; one that says nothing leaves the turn to the Error
 			-- path, which is where a genuinely broken stream belongs.
 			if config.closed then config.closed(ctrl) end
+			if handle.cancelled or dead then return end
+
+			-- Still nothing, after the tail and after the provider's own last
+			-- chance. If bytes arrived and none of them ever cut a frame, this is a
+			-- framing mismatch rather than an empty answer — and it is the failure
+			-- mode with no symptom at all: the socket stays busy so no inactivity
+			-- timeout fires, nothing reaches the caller, and the turn spins until
+			-- somebody presses Stop. Checked LAST so a stream the tail flush
+			-- rescued is never accused, and reported with what actually arrived,
+			-- because otherwise it is indistinguishable from a hang.
+			if realFrames == 0 and bytesSeen > 0 then
+				fail(responseStatus, nil, string.format(
+					"Stream ended after %d bytes without a readable event — the response "
+					.. "was not the SSE this expects. It began: %s",
+					bytesSeen, string.format("%q", preview)))
+			end
 		end)
 	end
 

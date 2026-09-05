@@ -29,10 +29,13 @@ local API_KEYS_URL = "https://build.nvidia.com/settings/api-keys"
 -- Setting keys (no dots, no backslashes: Plugin:SetSetting silently fails otherwise)
 local KEY_API_KEY = "nvidia_api_key"
 
--- Every personal key carries this. Checked on paste rather than on the first
--- request, because the whole flow IS a paste: the likely failure is the wrong
--- clipboard entry, and the middle of a turn is a poor place to find that out.
-local KEY_PREFIX = "nvapi-"
+-- No prefix check, deliberately, and the Gemini provider is why: the same guard
+-- there was written against "AIza" and refused every key Google now issues,
+-- because the prefix changed on Google's schedule and the copy of it here did
+-- not. A credential's format is the vendor's to change, so a check on it fails
+-- CLOSED — a working key refused with a confident, wrong message — and the first
+-- request validates a key anyway. NVIDIA keys happen to begin `nvapi-` today;
+-- that fact belongs in the message below, not in a gate.
 
 -- Documented as a best-effort ceiling rather than an SLA, and per model rather
 -- than per account. Worth stating in the panel because an agent turn is many
@@ -60,9 +63,12 @@ local function completeLogin(pasted: string): (boolean, string?)
 	if key == "" then
 		return false, "No key given."
 	end
-	if key:sub(1, #KEY_PREFIX) ~= KEY_PREFIX then
-		return false, "That does not look like an NVIDIA key — they begin `nvapi-`. "
-			.. "Generate one at " .. API_KEYS_URL
+	-- Whitespace in the middle is the one thing no key of any format has, and it
+	-- catches the realistic mis-paste: a sentence, or a whole URL with a title
+	-- attached. Everything else is the API's business.
+	if key:find("%s") then
+		return false, "That has spaces in it, so it is not a key. Copy just the key from "
+			.. API_KEYS_URL
 	end
 	if not plugin then return false, "Plugin not initialized." end
 	-- Stored as-is; the first request is what validates it, and pretending to

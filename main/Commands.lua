@@ -115,6 +115,16 @@ handlers["/code"] = function(_, raw)
 		local ok, err = Provider.auth.completeLogin(code)
 		if ok then
 			Console.appendLine("Login successful!", "assistant")
+			-- A provider whose model list needs the credential can only fetch it
+			-- now. Without this the picker keeps whatever stub it started with
+			-- until the next Studio launch, which reads as a broken roster rather
+			-- than an unfetched one. Spawned and unwaited: nothing on screen
+			-- depends on it, and a provider with a hardcoded list has no hook here
+			-- to call.
+			local wire = Provider.wire :: any
+			if wire and wire.refreshModels then
+				task.spawn(wire.refreshModels)
+			end
 		else
 			Console.appendLine("Login failed: " .. tostring(err), "error")
 		end
