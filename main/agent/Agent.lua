@@ -158,9 +158,14 @@ end
 -- that each stop just under MODEL_RESULT_CHARS put 600 000 characters into a
 -- single message, and once that pair is in the history it is there for good.
 --
--- Claude Code caps the same thing (MAX_TOOL_RESULTS_PER_MESSAGE_CHARS) and
--- spills the largest blocks to a file, handing the model a path. A plugin has
--- nowhere to spill, so the big ones are simply cut harder.
+-- Claude Code caps the same thing at the same number
+-- (MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 200 000, also per user message, also
+-- evaluated per message rather than cumulatively). The SELECTION is not the
+-- same and should not be copied: selectFreshToReplace sorts largest-first and
+-- spills whole results to a file until the message is under budget, leaving the
+-- others untouched. That only works because the bytes survive on disk. A plugin
+-- has nowhere to spill, so blanking a whole result would destroy it outright;
+-- every result is shaved instead.
 --
 -- Smallest-first fair share: every result already under its share releases the
 -- remainder to the ones over it. A turn of three short listings and one huge
@@ -381,10 +386,11 @@ end
 -- forModel() caps any single result and capTurn() caps one turn's batch of
 -- them; nothing caps the sum across turns. `conversation` is append-only, so a
 -- long session ends by hitting the context window and dying with no way back
--- from it. This is Claude Code's microcompact minus the half
--- we cannot have: it persists cleared output to disk and can restore it after a
--- compaction, and a plugin has nowhere to spill to. Cleared output here is
--- gone, which is why the stub says so, re-running the command is the recovery.
+-- from it. This is Claude Code's microcompact minus the half we cannot have:
+-- upstream a result that is too LARGE is spilled to disk and replaced by a
+-- <persisted-output> pointer first, so the bytes still exist in a file when the
+-- age-based clear later overwrites that pointer. A plugin has nowhere to spill
+-- to, so what is cleared here is gone outright.
 --
 -- Two things this has to get right, or it makes matters worse than it found
 -- them:
@@ -395,10 +401,11 @@ end
 --   outright (see the "(no output)" guard below), so the stub is a non-empty
 --   sentence: kept short, because it is paid once per cleared result and
 --   because anything it replaces has to be LONGER than it or clearing costs
---   tokens instead of saving them. Claude Code's equivalent is shorter still
---   ("[Old tool result content cleared]") and can afford to say nothing useful,
---   since it persists the cleared output and can restore it. Ours is gone, so
---   the stub has to earn its length by naming the recovery.
+--   tokens instead of saving them. Claude Code's string verbatim
+--   (TIME_BASED_MC_CLEARED_MESSAGE in microCompact.ts), which is about as short
+--   as saying what happened gets. Neither theirs nor ours names a recovery:
+--   their stub overwrites the persisted-output pointer too, so on both sides a
+--   cleared result is gone from context.
 --
 --   Run it only when the prefix is being re-written anyway. Mutating a message
 --   invalidates the cache from that index onward, and old results sit near the
@@ -415,10 +422,10 @@ end
 -- summarising compaction, which replaces spans of history with a paragraph
 -- instead of only blanking results.
 local KEEP_RECENT = 5
-local CLEARED = "[old tool result cleared — re-run the command if needed]"
+local CLEARED = "[Old tool result content cleared]"
 local TRIGGER_CHARS = 200000    -- ~50k tokens of history before this is worth looking at
 local MIN_SAVING_CHARS = 80000  -- ~20k tokens; below this even a paid-for re-write is not worth it
-local URGENT_CHARS = 600000     -- ~150k tokens; past here the window, not the cache, is the risk
+local URGENT_BUFFER_TOKENS = 13000 -- headroom left below the window; theirs, AUTOCOMPACT_BUFFER_TOKENS
 local COLD_AFTER = 60 * 60      -- seconds; the full 1h TTL withMessageCache asks for, not a hair under
 
 -- Past COLD_AFTER the 1h TTL has expired, the whole prefix is re-written on the
@@ -488,7 +495,7 @@ end
 --
 -- tool_use inputs USED to go uncounted, which mattered more than it looked:
 -- `write` and `multiedit` carry their whole payload there, nothing ever clears a
--- tool_use, and URGENT_CHARS is the only backstop against a history that will
+-- tool_use, and the urgent gate is the only backstop against a history that will
 -- not fit. It was the largest object in the conversation and scored zero. That
 -- was survivable while max_tokens scaled with effort and capped a single write
 -- at ~8k tokens; it is not now that the ceiling is the model's real 128k.
@@ -650,6 +657,32 @@ function Agent.contextBreakdown(): ({ ContextRow }?, boolean)
 	return rows, measured
 end
 
+-- The point past which the window, not the cache, is the risk, in the same
+-- character unit as historyChars so the caller compares one number.
+--
+-- Sized off the model, which is the whole reason this is a function rather than
+-- the constant it used to be: a fixed 600 000 characters (~150k tokens) was
+-- wrong at both ends of the range it has to cover, firing at 15% full on a
+-- 1M-token model and never before the window itself on a 200k one. Claude Code
+-- sizes the same gate the same way, getEffectiveContextWindowSize(model) minus
+-- AUTOCOMPACT_BUFFER_TOKENS.
+--
+-- nil when the provider cannot name the window (OpenRouter returns number? for
+-- a model it has never heard of). There is then no urgent line at all and only
+-- the cold path clears, which is the conservative direction: a warm pass costs
+-- a full prefix re-write, and inventing a window to justify one would spend
+-- real tokens on a guess.
+--
+-- The estimate leaves out the system prompt and the tool schemas, which
+-- historyChars does not walk. A few hundred tokens against 13 000 of headroom.
+local function urgentChars(): number?
+	local wire = Provider.wire
+	if not (wire and wire.contextWindow) then return nil end
+	local window = wire.contextWindow(Settings.model())
+	if not window then return nil end
+	return (window - URGENT_BUFFER_TOKENS) * BYTES_PER_TOKEN_TEXT
+end
+
 -- Returns the number of characters dropped; 0 means nothing was touched and the
 -- cache is intact.
 local function clearOldToolResults(messages: { any }): number
@@ -664,7 +697,8 @@ local function clearOldToolResults(messages: { any }): number
 	-- enough to the window that the next few turns could fail outright, there
 	-- the re-write is the cheaper of two bad options, because nothing else here
 	-- reclaims anything.
-	if not cold and chars < URGENT_CHARS then return 0 end
+	local urgent = urgentChars()
+	if not cold and (urgent == nil or chars < urgent) then return 0 end
 
 	local results: { any } = {}
 	for _, message in ipairs(messages) do
@@ -1664,7 +1698,7 @@ function Agent.selfTest(): (boolean, string?)
 
 	-- Clearing. Sizes derive from the thresholds for the same reason the
 	-- truncation fixtures do, and here it matters twice: the warm case has to sit
-	-- BETWEEN TRIGGER_CHARS and URGENT_CHARS, so a hand-typed size stops
+	-- BETWEEN TRIGGER_CHARS and the urgent line, so a hand-typed size stops
 	-- exercising the gate the moment either constant moves.
 	local function pairedHistory(count: number, size: number): { any }
 		local body = string.rep("x", size)
@@ -1732,15 +1766,23 @@ function Agent.selfTest(): (boolean, string?)
 	-- Warm: the same history moments after a request. Clearing now would re-write
 	-- the entire cached prefix to save a fraction of it, which is the failure this
 	-- gate exists to prevent, and it is silent, so only a test catches it.
+	--
+	-- Both warm cases need an urgent line to sit either side of, so both are
+	-- skipped when the provider cannot name the model's window, and when the
+	-- window is small enough that 12 x coldSize is already past the line — there
+	-- is then no size that is over the trigger and under the urgent line at once.
+	local urgent = urgentChars()
 	lastRequestAt = os.time()
-	if clearOldToolResults(pairedHistory(12, coldSize)) ~= 0 then
-		return false, "clearOldToolResults re-wrote a warm cached prefix to save a fraction of it"
-	end
+	if urgent and urgent > 12 * coldSize then
+		if clearOldToolResults(pairedHistory(12, coldSize)) ~= 0 then
+			return false, "clearOldToolResults re-wrote a warm cached prefix to save a fraction of it"
+		end
 
-	-- Warm, but past URGENT_CHARS: the window is now the risk rather than the
-	-- cache, and nothing else here reclaims anything, so it has to clear anyway.
-	if clearOldToolResults(pairedHistory(12, URGENT_CHARS // 10)) <= 0 then
-		return false, "clearOldToolResults left a history near the context window uncleared"
+		-- Past the urgent line: the window is now the risk rather than the cache,
+		-- and nothing else here reclaims anything, so it has to clear anyway.
+		if clearOldToolResults(pairedHistory(12, urgent // 10)) <= 0 then
+			return false, "clearOldToolResults left a history near the context window uncleared"
+		end
 	end
 
 	lastRequestAt = savedStamp
