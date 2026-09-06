@@ -180,12 +180,24 @@ local function toResponseInput(messages: { any }, model: string?): { any }
 						if item then out[#out + 1] = item end
 					elseif block.type == "tool_use" then
 						appendMessage("assistant", textParts)
-						out[#out + 1] = {
-							type = "function_call",
-							call_id = block.id,
-							name = block.name,
-							arguments = toolArguments(block.input),
-						}
+						-- Codex puts the exact ResponseItem back into the next
+						-- sampling request. Most turns preserve the whole output in
+						-- the reasoning envelope above, but a function-only response
+						-- has no such envelope. Keep its provider-owned item on the
+						-- neutral block so ids/status survive that path as well.
+						local state = block.providerState
+						local exact = type(state) == "table" and state.provider == "openai"
+							and state.item or nil
+						if type(exact) == "table" and exact.type == "function_call" then
+							out[#out + 1] = exact
+						else
+							out[#out + 1] = {
+								type = "function_call",
+								call_id = block.id,
+								name = block.name,
+								arguments = toolArguments(block.input),
+							}
+						end
 					elseif isServerResult(block) then
 						appendMessage("assistant", textParts)
 						local item = block._openai_item
@@ -264,6 +276,57 @@ local function failureStatus(err: any): number?
 	return nil
 end
 
+-- Codex's turn loop has two independent reasons to sample again: a function
+-- call was emitted, or the completed response explicitly says `end_turn=false`.
+-- The latter can be an empty bridge response after tool output, so inferring
+-- completion only from output items makes a valid Codex turn stop silently.
+local function responseStopReason(response: any, hasFunction: boolean,
+	forcedStop: string?): string
+	if forcedStop then return forcedStop end
+	if hasFunction then return "tool_use" end
+	if type(response) == "table" and response.end_turn == false then
+		return "continue_turn"
+	end
+	return "end_turn"
+end
+
+-- The ChatGPT Codex stream has two representations of output: incremental
+-- output_item events and the response.completed payload. The latter is normally
+-- complete, but gateways are allowed to omit its output array after already
+-- streaming the items. Throwing the streamed copy away makes tools run on screen
+-- yet disappear from history, so Agent sees no function call and ends the turn.
+local function completedOutput(response: any, streamed: { any }): { any }
+	local final = if type(response) == "table" and type(response.output) == "table"
+		then response.output else nil
+	if not final or #final == 0 then return streamed end
+	if #streamed == 0 then return final end
+
+	-- Preserve final-event fields where present and fill holes from the streamed
+	-- item at the same output_index. Some relays leave `arguments`, `content` or a
+	-- whole trailing item empty in the final envelope even though its done event
+	-- was complete.
+	local merged: { any } = {}
+	for index = 1, math.max(#final, #streamed) do
+		local finalItem = final[index]
+		local streamedItem = streamed[index]
+		if type(finalItem) == "table" and type(streamedItem) == "table"
+			and finalItem.type == streamedItem.type then
+			local item = table.clone(finalItem)
+			for key, value in pairs(streamedItem) do
+				local current = item[key]
+				if current == nil or current == ""
+					or (type(current) == "table" and next(current) == nil) then
+					item[key] = value
+				end
+			end
+			merged[index] = item
+		else
+			merged[index] = finalItem or streamedItem
+		end
+	end
+	return merged
+end
+
 local function needsTokenRefresh(status: number?, _body: string?): boolean
 	return status == 401
 end
@@ -323,6 +386,7 @@ local function assemble(output: any, fallbackText: string, model: string?): ({ a
 				name = item.name,
 				input = arguments,
 				inputParsed = parsed,
+				providerState = { provider = "openai", item = item },
 			}
 		elseif item.type == "web_search_call" then
 			local id = item.id
@@ -397,7 +461,6 @@ local function streamMessage(args: {
 		model = model,
 		stream = true,
 		store = false,
-		stream_options = { include_obfuscation = false },
 		include = { "reasoning.encrypted_content" },
 		input = toResponseInput(args.messages, model),
 		parallel_tool_calls = true,
@@ -412,7 +475,10 @@ local function streamMessage(args: {
 		bodyTable.tool_choice = "auto"
 	end
 	if args.webSearch and args.webSearch > 0 then
-		bodyTable.max_tool_calls = args.webSearch
+		-- The account-backed Codex endpoint enables hosted search by the tool's
+		-- presence but rejects the public Responses `max_tool_calls` parameter.
+		-- Treat the shared numeric setting as an enable switch on this provider;
+		-- the other providers retain their own hard per-message ceilings.
 		table.insert(bodyTable.include, "web_search_call.action.sources")
 	end
 	local bodyStr = HttpService:JSONEncode(bodyTable)
@@ -490,8 +556,7 @@ local function streamMessage(args: {
 		-- The completed response is the authoritative full object. output_item.done
 		-- populates the same data in slots and is the fallback for proxies that omit
 		-- the output array from their final event.
-		local output = if type(response) == "table" and type(response.output) == "table"
-			then response.output else outputFromSlots()
+		local output = completedOutput(response, outputFromSlots())
 
 		-- A compliant stream announces these earlier. Doing it again here only for
 		-- missing events keeps the tool loop usable through proxies that coalesce
@@ -506,7 +571,7 @@ local function streamMessage(args: {
 		end
 
 		local blocks, hasFunction = assemble(output, textAcc, model)
-		local stopReason = forcedStop or (hasFunction and "tool_use" or "end_turn")
+		local stopReason = responseStopReason(response, hasFunction, forcedStop)
 		local usage = if type(response) == "table" then rebaseUsage(response.usage) else nil
 		ctrl.finish(function()
 			if callbacks.onComplete then
@@ -517,6 +582,11 @@ local function streamMessage(args: {
 					usage = usage,
 					stopReason = stopReason,
 					contentBlocks = blocks,
+					-- Unlike message-based APIs, Codex may complete a bridge
+					-- response without a visible output item. Agent must not invent
+					-- an assistant message for it; Codex itself records only the
+					-- ResponseItems that actually arrived.
+					omitEmpty = true,
 				})
 			end
 		end)
@@ -549,6 +619,11 @@ local function streamMessage(args: {
 					callbacks.onToolInput(item and (item.call_id or item.id), delta)
 				end
 			end
+		elseif kind == "response.function_call_arguments.done" then
+			-- Usually redundant with the deltas and output_item.done, but it is the
+			-- authoritative complete JSON when an intermediary coalesces deltas.
+			local slot = byItemId[event.item_id] or slotFor(event)
+			if type(event.arguments) == "string" then slot.arguments = event.arguments end
 		elseif kind == "response.output_text.delta" or kind == "response.refusal.delta" then
 			local slot = byItemId[event.item_id] or slotFor(event)
 			local delta = type(event.delta) == "string" and event.delta or ""
@@ -752,6 +827,46 @@ local function selfTest(): (boolean, string?)
 		or exactReplay[3].id ~= "fc_1" then
 		return false, "the complete Responses output sequence did not survive history"
 	end
+	local functionOnly = {
+		{ type = "function_call", id = "fc_only", call_id = "call_only", name = "bash",
+			arguments = '{"command":"ls"}', status = "completed" },
+	}
+	local functionBlocks = assemble(functionOnly, "", "gpt-6-astra")
+	local functionReplay = toResponseInput({ { role = "assistant", content = functionBlocks } },
+		"gpt-6-astra")
+	if #functionReplay ~= 1 or functionReplay[1].id ~= "fc_only"
+		or functionReplay[1].status ~= "completed" then
+		return false, "a function-only response lost its exact ResponseItem"
+	end
+	local restoredConversation = HttpService:JSONDecode(HttpService:JSONEncode({
+		{ role = "assistant", content = functionBlocks },
+		{ role = "user", content = {
+			{ type = "tool_result", tool_use_id = "call_only", content = "workspace listing" },
+		} },
+	}))
+	local restoredReplay = toResponseInput(restoredConversation, "gpt-6-astra")
+	if #restoredReplay ~= 2 or restoredReplay[1].id ~= "fc_only"
+		or restoredReplay[2].type ~= "function_call_output"
+		or restoredReplay[2].call_id ~= "call_only"
+		or restoredReplay[2].output ~= "workspace listing" then
+		return false, "a saved OpenAI tool call/result did not survive session restore"
+	end
+	local streamedOnly = completedOutput({ output = {} }, functionOnly)
+	if #streamedOnly ~= 1 or streamedOnly[1].call_id ~= "call_only" then
+		return false, "an empty completed output discarded streamed function calls"
+	end
+	local finalWins = completedOutput({ output = { { type = "message", id = "final" } } },
+		{ { type = "message", id = "streamed" } })
+	if #finalWins ~= 1 or finalWins[1].id ~= "final" then
+		return false, "a complete final output was not authoritative"
+	end
+	local filledFinal = completedOutput({ output = {
+		{ type = "function_call", id = "fc", call_id = "call", name = "bash", arguments = "" },
+	} }, { { type = "function_call", id = "fc", call_id = "call", name = "bash",
+		arguments = '{"command":"pwd"}' } })
+	if filledFinal[1].arguments ~= '{"command":"pwd"}' then
+		return false, "streamed function arguments did not fill an incomplete final item"
+	end
 	local crossModel = toResponseInput({ { role = "assistant", content = blocks } }, "gpt-5.6-sol")
 	if #crossModel ~= 3 or crossModel[1].role ~= "assistant"
 		or crossModel[2].type ~= "function_call" or crossModel[3].type ~= "web_search_call" then
@@ -782,6 +897,12 @@ local function selfTest(): (boolean, string?)
 		or failureStatus({ code = "slow_down" }) ~= 503
 		or failureStatus({ code = "insufficient_quota" }) ~= nil then
 		return false, "Responses stream errors did not map to the right retry policy"
+	end
+	if responseStopReason({ end_turn = false }, false, nil) ~= "continue_turn"
+		or responseStopReason({ end_turn = true }, false, nil) ~= "end_turn"
+		or responseStopReason({ end_turn = true }, true, nil) ~= "tool_use"
+		or responseStopReason({ end_turn = false }, false, "max_tokens") ~= "max_tokens" then
+		return false, "Codex end_turn did not map to the right agent continuation"
 	end
 	if RESPONSES_URL ~= "https://chatgpt.com/backend-api/codex/responses"
 		or RESPONSES_URL:find("api.openai.com", 1, true) then

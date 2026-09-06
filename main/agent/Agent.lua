@@ -1197,6 +1197,10 @@ local function runTurn(turn: number)
 						id = block.id,
 						name = block.name,
 						input = toolInput(block),
+						-- Opaque and optional. OpenAI uses this to retain the exact
+						-- Responses function_call item on function-only turns; every
+						-- other provider leaves it nil and keeps the old history shape.
+						providerState = block.providerState,
 					})
 					table.insert(toolUses, block)
 				elseif block.type == "server_tool_use" then
@@ -1219,14 +1223,19 @@ local function runTurn(turn: number)
 				end
 			end
 
-			table.insert(conversation, {
-				role = "assistant",
-				-- "(empty)" here is for the wire, not the screen: an assistant
-				-- message with empty content is rejected, and this branch only
-				-- runs when the turn produced no blocks at all.
-				content = #assistantContent > 0 and assistantContent or (result.text or "(empty)"),
-			})
-			committed = true
+			local storedContent = if #assistantContent > 0 then assistantContent else result.text
+			-- Codex can send an empty response as a continuation bridge. Its
+			-- native loop records no invented message in that case, and inserting
+			-- "(empty)" changes the next prompt as well as polluting restored
+			-- sessions. Only OpenAI opts into omission; the other providers retain
+			-- the previous non-empty fallback exactly.
+			if not result.omitEmpty or (storedContent ~= nil and storedContent ~= "") then
+				table.insert(conversation, {
+					role = "assistant",
+					content = storedContent ~= nil and storedContent or "(empty)",
+				})
+				committed = true
+			end
 
 			-- Run the tools. Every tool_use needs a matching tool_result, including
 			-- ones whose input failed to parse, an unanswered tool_use is a
@@ -1337,9 +1346,11 @@ local function runTurn(turn: number)
 				return
 			end
 
-			-- Anthropic expects the paused assistant content sent straight back so
-			-- it can carry on; there are no tool results to attach.
-			if result.stopReason == "pause_turn" and #toolResults == 0 then
+			-- Anthropic's pause_turn and Codex's response.end_turn=false both mean
+			-- sample again with the committed history; there are no local tool
+			-- results to attach in this branch.
+			if (result.stopReason == "pause_turn" or result.stopReason == "continue_turn")
+				and #toolResults == 0 then
 				continueTurn()
 				return
 			end

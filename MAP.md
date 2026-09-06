@@ -121,14 +121,14 @@ main.lua                        window, toolbar, popups, usage panel
 | File | Lines | Owns |
 |---|---:|---|
 | `fs/Shell.lua` | 7342 | The command line. The biggest thing here we actually wrote — see below. |
-| `agent/Agent.lua` | 1352 | Turn loop, conversation state, trimming, stop. |
+| `agent/Agent.lua` | 1842 | Turn loop, conversation state, trimming, stop. |
 | `ui/Console.lua` | 1355 | Bubbles, thinking drawers, tool-call blocks, the detached sink. |
 | `text/Regex.lua` | 957 | BRE/ERE engine. Requires nothing. |
 | `vendor/LuauParser.lua` | 7718 | VENDORED, do not edit. Luau's own Parser.cpp ported to Luau. Two patched require lines, see the header. `LuauSyntax` 1043 and `LuauConfusables` 1790 sit beside it. |
 | `main.lua` | 1168 | Widget, toolbar, popups, shell mode on the input row. Owns `plugin`, hands it to Provider / Sessions / Settings / Git — the only five that touch it. |
 | `fs/Terminal.lua` | 839 | Commands as tree operations. No parsing. |
 | `fs/Fs.lua` | 843 | Paths, `.Source`, undo, mtime, globs, mode bits. |
-| `agent/providers/OpenAI.lua` | 799 | Responses API, and the translation both ways. |
+| `agent/providers/OpenAI.lua` | 920 | Responses API, and the translation both ways. |
 | `agent/providers/OpenRouter.lua` | 842 | chat/completions, and the translation both ways. |
 | `agent/providers/Nvidia.lua` | 948 | NIM chat/completions. Two reasoning switches, one per model. |
 | `agent/providers/Gemini.lua` | 1027 | Native generateContent. Carries thought signatures across turns. |
