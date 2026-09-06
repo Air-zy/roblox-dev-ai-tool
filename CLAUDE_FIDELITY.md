@@ -1,4 +1,4 @@
-# FIDELITY — the agent, measured against Claude Code
+# CLAUDE_FIDELITY — the agent, measured against Claude Code
 
 Scope: `agent/Agent.lua`, `agent/Tools.lua`, `agent/providers/Anthropic.lua`,
 and the console's replay path where it decides what the model or the reader
