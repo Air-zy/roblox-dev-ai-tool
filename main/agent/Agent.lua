@@ -1035,9 +1035,9 @@ local function runTurn(turn: number)
 		messages = conversation,
 		effort = Settings.effort(),
 		tools = buildTools(),
-		-- How many searches are allowed, not what a search IS. Anthropic runs it
-		-- as a server tool in the tools array; OpenRouter runs it as a body-level
-		-- plugin. Both are the provider's business, and neither is Agent's.
+		-- How many searches are allowed, not what a search IS. Anthropic and OpenAI
+		-- put server tools in their tool arrays; OpenRouter uses a body-level plugin.
+		-- Those wire details are the provider's business, not Agent's.
 		webSearch = Settings.webSearchMaxUses(),
 	}, {
 		onThinking = function(delta: string)

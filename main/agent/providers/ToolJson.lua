@@ -3,8 +3,8 @@
 --
 -- Extracted from Anthropic.luau when OpenRouter arrived. The failure it repairs
 -- is the model's, not the transport's, so it happens identically on any wire:
--- both providers hand over a JSON string some language model generated a token
--- at a time, and both get the same illegal byte in the same place.
+-- every JSON-tool provider hands over a string some language model generated a
+-- token at a time, and each gets the same illegal byte in the same place.
 
 local HttpService = game:GetService("HttpService")
 

@@ -12,7 +12,7 @@
 --     wrapper; here they are a field on the part that owns them.
 --   * GET /v1beta/models returns `inputTokenLimit`, `outputTokenLimit` and a
 --     `thinking` boolean PER MODEL. That is every number the rest of this plugin
---     wants, so unlike the other three providers there is no hand-written caps
+--     wants, so unlike the other providers there is no hand-written caps
 --     table here at all and the context bar is a real reading. The OpenAI list
 --     endpoint degrades to {id, object, created} and would have needed one.
 --   * `thoughtsTokenCount`. Thinking tokens are billed and are NOT part of

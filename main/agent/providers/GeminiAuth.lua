@@ -2,7 +2,7 @@
 --!optimize 2
 -- GeminiAuth.luau: Google AI Studio credentials. A pasted key, like NVIDIA's.
 --
--- Answers the same calls the other three auth modules do, because Commands and
+-- Answers the same calls the other auth modules do, because Commands and
 -- the settings panel drive all of them through one code path. There is no OAuth
 -- here: AI Studio issues a project-scoped API key and that is the whole
 -- credential, so `startLogin` hands back the page that mints one and
@@ -58,7 +58,7 @@ local function Initialize(pluginRef: any)
 end
 
 -- Nothing is begun and nothing is stored: there is no flow to be half way
--- through. `state` is in the return shape only because the other three auth
+-- through. `state` is in the return shape only because the other auth
 -- modules share it.
 local function startLogin(): { authorizeUrl: string, state: string }
 	return { authorizeUrl = API_KEYS_URL, state = "" }

@@ -22,6 +22,8 @@
 --   reset()    -> ()          clear the provider's per-attempt accumulators
 --   frame(text, ctrl) -> ()   one complete SSE frame, "\n\n"-delimited
 --   partial()  -> string?     text already accumulated, for the error handover
+--   opened?(status, headers) -> ()   observe response metadata without owning
+--                 transport state. Used for account quota snapshots.
 --   explain?(status, body) -> string?   a sentence ADDED under the error line,
 --                 for a failure this provider can say something more useful
 --                 about. It never replaces what the server said: the raw line
@@ -64,6 +66,7 @@ function Stream.open(config: {
 	reset: () -> (),
 	frame: (string, Ctrl) -> (),
 	partial: () -> string?,
+	opened: ((number, string) -> ())?,
 	closed: ((Ctrl) -> ())?,
 	explain: ((number?, string?) -> string?)?,
 	refresh: (() -> ())?,
@@ -417,6 +420,9 @@ function Stream.open(config: {
 			-- explaining it arrives separately through MessageReceived.
 			responseHeaders = headers
 			responseStatus = statusCode
+			-- Metadata observers must never be able to break the transport state
+			-- machine. Quota rendering is useful, but streaming the answer wins.
+			if config.opened then pcall(config.opened, statusCode, headers) end
 		end)
 
 		stream.MessageReceived:Connect(function(message: string)

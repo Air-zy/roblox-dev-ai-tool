@@ -93,7 +93,7 @@ end
 
 -- No flow to begin, so nothing is stored and nothing expires between this call
 -- and the next. `state` is in the return shape only because Commands and the
--- other two auth modules share it.
+-- other auth modules share it.
 local function startLogin(): { authorizeUrl: string, state: string }
 	return { authorizeUrl = API_KEYS_URL, state = "" }
 end
@@ -149,7 +149,7 @@ local function tokenExpiry(): number?
 	return nil
 end
 
--- Rows for the settings panel, already formatted, same contract as the other two.
+-- Rows for the settings panel, already formatted, same contract as every auth module.
 --
 -- NVIDIA publishes no credits or usage endpoint and sends no rate-limit header,
 -- so unlike OpenRouter there is nothing to fetch and this never touches the

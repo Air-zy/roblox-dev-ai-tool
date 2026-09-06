@@ -144,8 +144,8 @@ function Retry.retryAfterSeconds(headers: string?): number?
 end
 
 -- Seconds until a named unix-timestamp header comes due, or nil if it is absent
--- or already past. Both providers report a quota window this way and only the
--- header name differs, so the name is the argument.
+-- or already past. Providers that report a quota window this way differ only in
+-- the header name, so the name is the argument.
 function Retry.resetSeconds(headers: string?, header: string): number?
 	if not headers then return nil end
 	local pattern = header:lower():gsub("%-", "%%-") .. ":%s*(%d+)"

@@ -84,21 +84,50 @@ handlers["/help"] = function()
 		"   (writes undoable with Ctrl+Z)", "info")
 end
 
+local function reportLogin(ok: boolean, err: string?, auth: any)
+	if ok then
+		Console.appendLine("Login successful!", "assistant")
+		-- Only refresh a dynamic model roster if the reader did not switch providers
+		-- while a browser or device flow was waiting for approval.
+		if Provider.auth == auth then
+			local wire = Provider.wire :: any
+			if wire and wire.refreshModels then task.spawn(wire.refreshModels) end
+		end
+	else
+		Console.appendLine("Login failed: " .. tostring(err), "error")
+	end
+end
+
 handlers["/login"] = function()
 	if Provider.auth.isLoggedIn() then
 		Console.appendLine("Already logged in. Use /logout first.", "info")
 		return
 	end
 	Console.appendLine("Starting OAuth login…", "info")
+	local auth = Provider.auth
 	task.spawn(function()
-		local ok, result = pcall(Provider.auth.startLogin)
+		local ok, result = pcall(auth.startLogin)
 		if not ok then
 			Console.appendLine("Failed: " .. tostring(result), "error")
 			return
 		end
 		Console.appendLine("Open this URL in your browser:", "info")
 		Console.appendLine((result :: any).authorizeUrl, "info")
-		Console.appendLine("Then: /code YOUR_CODE", "info")
+		local userCode = (result :: any).userCode
+		if type(userCode) == "string" and userCode ~= "" then
+			Console.appendLine("Enter this one-time code on that page:", "info")
+			Console.appendLine(userCode, "assistant")
+			if (result :: any).waitForApproval == true then
+				Console.appendLine("Waiting for browser approval…", "info")
+				local callOk, loggedIn, loginErr = pcall(auth.completeLogin, userCode)
+				reportLogin(callOk and loggedIn == true,
+					if callOk then loginErr else tostring(loggedIn), auth)
+			else
+				Console.appendLine("After approval: /code " .. userCode, "info")
+			end
+		else
+			Console.appendLine("Then: /code YOUR_CODE", "info")
+		end
 	end)
 end
 
@@ -111,23 +140,10 @@ handlers["/code"] = function(_, raw)
 		return
 	end
 	Console.appendLine("Exchanging code…", "info")
+	local auth = Provider.auth
 	task.spawn(function()
-		local ok, err = Provider.auth.completeLogin(code)
-		if ok then
-			Console.appendLine("Login successful!", "assistant")
-			-- A provider whose model list needs the credential can only fetch it
-			-- now. Without this the picker keeps whatever stub it started with
-			-- until the next Studio launch, which reads as a broken roster rather
-			-- than an unfetched one. Spawned and unwaited: nothing on screen
-			-- depends on it, and a provider with a hardcoded list has no hook here
-			-- to call.
-			local wire = Provider.wire :: any
-			if wire and wire.refreshModels then
-				task.spawn(wire.refreshModels)
-			end
-		else
-			Console.appendLine("Login failed: " .. tostring(err), "error")
-		end
+		local callOk, ok, err = pcall(auth.completeLogin, code)
+		reportLogin(callOk and ok == true, if callOk then err else tostring(ok), auth)
 	end)
 end
 

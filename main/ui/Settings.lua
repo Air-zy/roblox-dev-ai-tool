@@ -3,9 +3,10 @@
 --
 -- State lives in plugin:SetSetting, so it survives Studio restarts.
 --
--- EFFORT is a real, first-class parameter on both providers, spelled
--- differently by each — Anthropic takes output_config.effort, OpenRouter takes
--- reasoning.effort — and carrying the same five levels either way. It governs
+-- EFFORT is a real, first-class parameter on the providers that support it,
+-- spelled differently by each — Anthropic takes output_config.effort while
+-- OpenRouter and OpenAI take reasoning.effort — and carries the same five
+-- levels either way. It governs
 -- total token spend for the whole response: prose, tool calls, and thinking
 -- alike. "high" is the API default.
 --
@@ -17,7 +18,7 @@
 -- budget is not an effort dial.
 --
 -- MODEL is stored per provider. An id belongs to exactly one of them, so one
--- shared slot would hand OpenRouter a Claude id the moment you switched.
+-- shared slot would hand the next provider an incompatible id when you switched.
 
 local Theme = require(script.Parent:WaitForChild("Theme"))
 -- Reaches into agent/ for the model list only. Settings is the one module that

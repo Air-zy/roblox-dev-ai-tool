@@ -4,9 +4,14 @@ A Studio plugin that puts a coding agent inside Studio. It gives the model tools
 that treat the DataModel like a filesystem, so ls, cat, grep, cd, edit and write
 all work on Instances.
 
-Four providers, two of them OAuth:
+Five providers, three of them OAuth:
 
 - **Claude** — your Claude subscription, the same login Claude Code uses.
+- **OpenAI** — your ChatGPT Codex subscription, through the same device OAuth,
+  account-backed Responses endpoint and rolling limits as open-source Codex.
+  Platform API keys are deliberately not accepted, so this provider has no
+  separately billed per-token mode. Complete Responses output items, including
+  encrypted reasoning and paired server IDs, survive sessions and Studio restarts.
 - **OpenRouter** — for the free tier. OpenRouter fronts a rotating set of models
   that cost nothing, which is how to run this without a subscription. The model
   list is fetched and filtered to the free models that can call tools, because
@@ -52,13 +57,11 @@ A simple bash tool is self explanatory and the agent is already a pro at using b
 
 ## Use
 
-Click the toolbar button, run /login, open the URL it prints, then paste the
-code back with /code. On OpenRouter, /code also takes an `sk-or-...` key
-directly if you already have one; on NVIDIA and Gemini a pasted key is the whole
-flow, and the URL /login prints is the page that mints one. Nothing checks the
-shape of a pasted key beyond "it has no spaces in it" — a key's format belongs to
-the vendor and changes on their schedule, so a check here would fail closed and
-refuse a working key. The first request is what validates it. After that just
+Click the toolbar button and run /login. Claude and OpenRouter return a code to
+paste with /code. OpenAI prints a one-time device code: enter it on the ChatGPT
+page and approve access while the plugin polls and finishes automatically.
+OpenAI never accepts an API key. On OpenRouter, /code also takes an `sk-or-...`
+key directly; on NVIDIA and Gemini the pasted key is the whole flow. After that just
 type. Enter sends, Shift+Enter adds a line, and / lists the commands.
 
 The button at the top left opens the sessions drawer. Conversations are saved as
@@ -103,9 +106,9 @@ Studio dispatches ahead of a text box.
 Settings is at the bottom of that drawer: effort, web search, run code and system
 prompt, plus what you have left — the 5 hour and weekly windows on Claude,
 credits and the free-model request cap on OpenRouter, what this plugin has sent
-in the last minute on NVIDIA, and where to look on Gemini. The model has its own
-chip at the right of the input row, and the provider is one page behind it. The
-widget floats over the viewport
+in the last minute on NVIDIA, and where to look for live usage on OpenAI and
+Gemini. The model has its own chip at the right of the input row, and the
+provider is one page behind it. The widget floats over the viewport
 rather than docking to an edge, and hides itself during playtests.
 
 Plugins get no clipboard API, so instead anything worth copying is a text box
@@ -345,6 +348,8 @@ main/
       Pkce.lua           verifier, challenge, state
       Anthropic.lua      Messages API client, SSE streaming
       AnthropicAuth.lua  PKCE login, token storage and refresh
+      OpenAI.lua         Responses API client, and the translation both ways
+      OpenAIAuth.lua     ChatGPT device OAuth, refresh and Codex plan limits
       OpenRouter.lua     chat/completions client, and the translation both ways
       OpenRouterAuth.lua PKCE login, or a pasted key
       Nvidia.lua         NIM chat/completions client, and the same translation
@@ -390,10 +395,10 @@ one copy of it. A provider supplies a request and reads frames.
 What a provider does own is translation. The conversation this plugin keeps is
 Anthropic-shaped — typed content blocks, reasoning carrying a signature, tool
 calls inline, a batch of tool results in one message — and Agent, Sessions and
-Find all read that shape. OpenRouter converts to and from OpenAI's shape at its
-own edge rather than teaching four more modules a second one. That direction is
-what makes it work: the Anthropic shape is the richer of the two, so going out
-is a flattening and coming back is a rebuild.
+Find all read that shape. OpenRouter and OpenAI convert at their own edges
+rather than teaching four more modules another shape. Provider-owned reasoning
+state rides inside the existing opaque signature field, so it is replayed
+without Agent or session storage interpreting it.
 
 Adding a tool means adding a file in tools/ that exports name, description,
 input_schema and run. The registry finds it and /help lists it. They stay sorted
@@ -424,7 +429,7 @@ tools, and Stop or Escape ends it.
 ## Self-tests
 
 `/selftest` runs them: Sha256 against the FIPS vectors, PKCE against the RFC 7636
-vector, retry classification and backoff, tool-argument repair, both providers'
+vector, retry classification and backoff, tool-argument repair, every provider's
 request translation, Markdown parsing plus every streaming prefix leaving
 RichText balanced, Terminal across its commands, flags and globs, Regex, Sed and
 Git underneath it, and Props against the API dump. Every provider's tests run,

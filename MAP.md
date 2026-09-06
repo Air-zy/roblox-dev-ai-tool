@@ -22,6 +22,8 @@ main.lua                        window, toolbar, popups, usage panel
           providers/Pkce            verifier, challenge, state
           providers/Anthropic       Messages API; one request, SSE back
           providers/AnthropicAuth   PKCE, refresh, usage
+          providers/OpenAI          Responses API; translation both ways
+          providers/OpenAIAuth      ChatGPT device OAuth and subscription limits
           providers/OpenRouter      chat/completions; translation both ways
           providers/OpenRouterAuth  PKCE (no refresh: the key is the credential)
           providers/Nvidia          NIM chat/completions; the same translation
@@ -48,16 +50,17 @@ main.lua                        window, toolbar, popups, usage panel
 
 | Question | Answer |
 |---|---|
-| the system prompt is built | `providers/Anthropic.lua:305` `systemBlocks` — identity first, user block if non-empty, cache_control on the last. OpenRouter has no identity block and builds a plain system message in `toChatMessages:273` |
+| the system prompt is built | `providers/Anthropic.lua:305` `systemBlocks` — identity first, user block if non-empty, cache_control on the last. OpenRouter builds a system message in `toChatMessages`; OpenAI sends `instructions` |
 | the user's system prompt is stored | `Settings.lua:85` `Settings.system()`, default `DEFAULT_SYSTEM:35` (one line, edit-mode framing) |
-| a request is assembled | `providers/Anthropic.lua:259` `streamMessage` -> `applyReasoning:160` -> tools+cache -> `withMessageCache:211`. OpenRouter: `streamMessage:396` -> `toChatMessages:273` + `toChatTools:370` |
-| a response is parsed | `providers/Anthropic.lua:~420` `onFrame`, dispatching on the SSE `event:` name. OpenRouter: `OpenRouter.lua:599` `onFrame`, which has no `event:` lines at all — every frame is a `data:` chunk |
+| a request is assembled | `providers/Anthropic.lua` `streamMessage` -> `applyReasoning` -> tools+cache -> `withMessageCache`. OpenRouter uses `toChatMessages` + `toChatTools`; OpenAI uses `toResponseInput` + `toResponseTools` |
+| a response is parsed | each wire module's `onFrame`; OpenAI dispatches Responses event types, Anthropic dispatches SSE event names, and OpenRouter reads chat-completion data chunks |
 | the socket, the retries, the latches | `providers/Stream.lua:56` `Stream.open` — `fail:135` is the one decision point, `processFrames:240` splits frames, `start:255` opens each attempt. There is exactly ONE copy of this; providers supply a request and read frames |
 | when a failure is worth retrying | `providers/Retry.lua` — `isRetryable`, `isOverload`, `delay`, `retryAfterSeconds`. Header names stay with the provider that spells them |
 | a tool call's arguments are decoded | `providers/ToolJson.lua:57` `ToolJson.decode` — strict first, then `escapeControlChars:34` for a raw newline the model owed a `\n`. Shared: the failure is the model's, not the wire's |
 | effort / thinking / the output ceiling | `providers/Anthropic.lua:160` `applyReasoning` against `MODEL_CAPS:80`; the ceiling is `maxOutput` on the same table. OpenRouter sends `reasoning.effort` and NO `max_tokens` — the model's own ceiling is the right default across several hundred models. `Settings` picks a level and nothing else |
-| Anthropic blocks <-> OpenAI messages | `providers/OpenRouter.lua:273` `toChatMessages` out, `:599` `onFrame` back. The internal conversation is Anthropic-shaped; OpenRouter converts at its own edge so Agent, Sessions and Find never learn a second shape |
+| Anthropic blocks <-> chat-completion messages | `providers/OpenRouter.lua:273` `toChatMessages` out, `:599` `onFrame` back. The internal conversation is Anthropic-shaped; OpenRouter converts at its own edge so Agent, Sessions and Find never learn a second shape |
 | a thinking block's signature, on OpenRouter | a JSON envelope holding `reasoning_details` (or plain reasoning text). Written in `assemble` inside `streamMessage`, read back by `reasoningFrom:263`. Opaque to everything else, which is what the signature contract already said |
+| a thinking block's signature, on OpenAI | a JSON envelope holding the complete Responses output sequence, including encrypted reasoning and the server IDs of its paired following items; `toResponseInput` replays it verbatim for the same model and falls back to visible blocks after a model switch |
 | which provider is live | `agent/Provider.lua` — `REGISTRY:20`, `use:64`, `list:47`. Read `Provider.wire.x` AT THE POINT OF USE: the pair is replaced on a switch, and a `local Wire = Provider.wire` would keep talking to the old one |
 | the free model list | `providers/OpenRouter.lua:160` `refreshModels` — fetched, filtered to free AND tool-capable, cached in plugin settings for a day. The seed list at `:77` is only a fallback |
 | the turn loop | `Agent.lua:510` `runTurn` |
@@ -71,7 +74,7 @@ main.lua                        window, toolbar, popups, usage panel
 | history trimming | `Agent.lua:448` `clearOldToolResults`, gated by `cacheIsCold:~392` |
 | one result capped / a turn's batch capped | `Agent.lua:139` `forModel`, `:167` `capTurn` |
 | open-editor hint on each message | `Agent.lua:1098` `editorContext` — `""` when nothing is open; capped by `MAX_OPEN_DOCS`/`MAX_OPEN_CHARS` just above it |
-| login | `providers/AnthropicAuth.lua:~160` `startLogin` -> `completeLogin`; refresh, used by `getAccessToken`. OpenRouter: `OpenRouterAuth.lua:69` `startLogin` -> `:88` `completeLogin`, which also accepts a pasted `sk-or-` key. No refresh there — the credential is a key and does not expire |
+| login | `providers/AnthropicAuth.lua` owns PKCE and refresh. OpenRouter owns its PKCE/key exchange. OpenAI uses Codex's ChatGPT device OAuth and refresh-token flow; it rejects API keys. NVIDIA and Gemini store a pasted project key |
 | the usage rows in Settings | each `auth.fetchUsage()` returns rows ALREADY FORMATTED (`{label, value, bar?}`). Anthropic reports two rolling utilisation windows, OpenRouter reports credits and the free request cap; `main.lua` `usageRows` just draws whatever it is handed |
 | a shell line runs | `Shell.lua:4762` `Shell.run` -> `runLine:4770` -> `runTokens:4632` -> `runStatements:4436` -> `runCommand:4237`; entered from `Terminal:shell:761` |
 | a line becomes tokens | `Shell.lua:86` `tokenize` |
@@ -125,15 +128,17 @@ main.lua                        window, toolbar, popups, usage panel
 | `main.lua` | 1168 | Widget, toolbar, popups, shell mode on the input row. Owns `plugin`, hands it to Provider / Sessions / Settings / Git — the only five that touch it. |
 | `fs/Terminal.lua` | 839 | Commands as tree operations. No parsing. |
 | `fs/Fs.lua` | 843 | Paths, `.Source`, undo, mtime, globs, mode bits. |
+| `agent/providers/OpenAI.lua` | 799 | Responses API, and the translation both ways. |
 | `agent/providers/OpenRouter.lua` | 842 | chat/completions, and the translation both ways. |
 | `agent/providers/Nvidia.lua` | 948 | NIM chat/completions. Two reasoning switches, one per model. |
 | `agent/providers/Gemini.lua` | 1027 | Native generateContent. Carries thought signatures across turns. |
 | `agent/providers/Anthropic.lua` | 824 | One request. Knows nothing about turns. |
-| `agent/providers/Stream.lua` | 419 | The socket, the retries, the latches. One copy. |
+| `agent/providers/Stream.lua` | 552 | The socket, the retries, the latches. One copy. |
 | `ui/Sessions.lua` | 888 | Session list, filter, peek and persistence. |
 | `ui/Settings.lua` | 603 | Preferences + panel. |
 | `studio/Exec.lua` | 564 | Luau execution. Tool-only. |
 | `agent/providers/AnthropicAuth.lua` | 507 | PKCE login, refresh, usage rows. |
+| `agent/providers/OpenAIAuth.lua` | 520 | ChatGPT device OAuth, refresh and Codex subscription-limit rows. |
 | `agent/providers/OpenRouterAuth.lua` | 273 | PKCE login, or a pasted key. Credits. |
 | `agent/providers/NvidiaAuth.lua` | 193 | A pasted key, and a rolling send-rate meter. |
 | `agent/providers/GeminiAuth.lua` | 132 | A pasted key. No flow to speak of. |
@@ -192,7 +197,7 @@ Refactor steps not yet done.
 | # | Step |
 |---|---|
 | 2 | move `onComplete` block assembly + `clearOldToolResults` from Agent into the provider. Still open, and now clearly worth it: `Agent.lua:~820` still walks Anthropic block types by name, which is why OpenRouter has to speak that shape |
-| 3 | neutral tool schema in `Tools.lua`; provider maps to `input_schema`. Half-done by accident — `OpenRouter.toChatTools:370` already maps it, so `Tools.definitions` is the only thing still emitting Anthropic's spelling |
+| 3 | neutral tool schema in `Tools.lua`; provider maps to `input_schema`. Half-done by accident — OpenRouter and OpenAI already map it, so `Tools.definitions` is the only thing still emitting Anthropic's spelling |
 | 6 | extract `Diff` and `Argv` from Shell into `text/` |
 | 8 | rename `Terminal:run` -> `Terminal:exec` (`Shell.run` already means a command line) |
 

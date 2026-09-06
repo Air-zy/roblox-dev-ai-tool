@@ -2,7 +2,7 @@
 -- The active provider. Nothing outside providers/ names a vendor.
 --
 -- `wire` sends one request and streams the reply; `auth` owns login and tokens.
--- A third provider is a third pair of files plus an entry in REGISTRY.
+-- Another provider is another pair of files plus an entry in REGISTRY.
 --
 -- Read `Provider.wire.x` at the point of use, never `local Wire = Provider.wire`
 -- at the top of a file: the pair below is REPLACED when the user switches, and
@@ -42,9 +42,15 @@ local REGISTRY: { [string]: { label: string, hint: string, wire: string, auth: s
 		wire = "Gemini",
 		auth = "GeminiAuth",
 	},
+	openai = {
+		label = "OpenAI",
+		hint = "ChatGPT subscription",
+		wire = "OpenAI",
+		auth = "OpenAIAuth",
+	},
 }
 -- Fixed order, so the picker does not reshuffle between launches.
-local ORDER = { "anthropic", "openrouter", "nvidia", "gemini" }
+local ORDER = { "anthropic", "openai", "openrouter", "nvidia", "gemini" }
 
 local KEY_PROVIDER = "cc_provider"
 local DEFAULT_PROVIDER = "anthropic"
