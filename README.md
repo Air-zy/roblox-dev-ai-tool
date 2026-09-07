@@ -118,11 +118,11 @@ word would hand you the markup around it.
 
 ## Tools
 
-bash runs a command line with pipes, ; && ||, redirects, heredocs, globs,
-`$(...)` and `for f in <words>; do ... ; done`. A loop is a pipeline stage like
-any other command, so it can follow a `;`, sit behind `&&`, or feed a pipe with
-more statements after it. There is no `while`: nothing here changes between two
-iterations, so it would run zero times or forever.
+bash runs a Bash-style language over Instances: pipes, ; && ||, redirects,
+heredocs, variables, globs, brace expansion, command substitution, arithmetic,
+`if`, `case`, functions, grouped commands, and `for`/`while`/`until` loops.
+Compound commands can feed pipelines or have their own redirections. This is
+an interpreter inside Studio, not an OS process or a complete GNU Bash port.
 edit and multiedit swap unique substrings, write replaces a whole .Source
 (creating the script if it is missing), run executes Luau, reload uncaches a
 module so the next require reads it again, and catalog searches and loads free
@@ -284,18 +284,19 @@ grep is BRE, `.` is a metacharacter there exactly as it is everywhere else:
 `grep game.Workspace` also matches `gameXWorkspace`, and `\.` or `-F` is how you
 ask for the literal.
 
-A command that finds nothing exits 1, the way it does in bash, and a command
-that failed exits 2. Keeping those apart is what makes `grep X f || echo miss`
-fall back and `[ -f X ] && cat X` guard, while still letting `grep X f | wc -l`
-run wc rather than stopping the pipeline the moment a search came back empty. A
-pipeline still stops on a real error, because there is no stderr here and the
-message would flow on as data. One divergence stays: grep prints `no matches`
-where bash prints nothing, so a piped count is 1 rather than 0 and `grep -c` is
-the number to pipe.
+A search that finds nothing exits 1; a command-handler error exits 2. `true`,
+`false`, `!`, and `$?` work with `&&`/`||`. Pipelines pass only stdout to the
+next stage, retain diagnostics on stderr, and use the last stage's status.
+`2>/dev/null` silences diagnostics without changing that status. Both streams
+reach the console in the order they were written, so a diagnostic appears beside
+the command that produced it rather than in a block after everything else. A
+standalone
+search can still explain a miss for a human, but that prose is omitted in pipes
+and when a following `||` handles the miss: `grep X f | wc -l` reports zero.
 
 `test` and `[` are that guard. `-e -f -d -s` ask about a path, `-z -n = !=` about
-a string, `-eq -ne -lt -le -gt -ge` about numbers, and `!` negates. There is no
-`if`: `[ x ] && a || b` is the form, and `[ x ] && [ y ]` chains, which is why
+a string, `-eq -ne -lt -le -gt -ge` about numbers, and `!` negates. Use
+`if [ x ]; then ...; fi`, or chain `[ x ] && [ y ]`, which is why
 `-a` and `-o` are refused with that as the reason. `-r -w -x` are refused too —
 an Instance has no permissions, and `-f` is the readable question.
 
@@ -309,13 +310,34 @@ count. Modification time has no property behind it at all, so it is observed:
 edits this plugin makes, edits you make in the Script Editor, and anything
 parented after we loaded. Everything else reads "-" under ls -t and sorts last.
 
-Composition is `|`, `;`, `&&`, `||`, `>`/`>>`, heredocs, `for f in WORDS; do
-... ; done` and `$(...)`. A loop is a pipeline stage like any other command, so
-`cd x; for ...` and `done | wc -l; ls` are ordinary lines rather than special
-cases. `$(...)` runs its inner line and splices the output in as words, with
-bash's quoting rules — single quotes suppress it, double quotes keep the result
-one word. Output carrying `; | & ' " \` is refused rather than spliced, because
-splicing happens on the text of the line and tokenize would read those as syntax.
+The whole line is parsed before any command runs. Words expand only when their
+command executes, so skipped branches do not run substitutions. Both `$(...)`
+and backticks capture stdout; expanded punctuation stays data and is never
+re-parsed as shell syntax. Single quotes suppress expansion, double quotes keep
+values together, and unquoted expansions split on `IFS` and expand pathname
+patterns. Heredocs expand parameters and substitutions unless their delimiter
+is quoted; `<<-` strips leading tabs.
+
+Variables and function definitions belong to the Terminal and survive shell
+calls. `HOME` starts at `/`; `PWD` and `OLDPWD` are ordinary exported variables that
+`cd` maintains. `NAME=value`, `export`, `unset`,
+function arguments (`$1`, `$#`, `"$@"`), and function-local `local` are supported.
+`export` marks shell variables, not the host computer's environment. Pipelines,
+subshells and command substitutions use isolated variable/cwd state; brace
+groups and functions share the caller's state. None of this state is persisted
+across Studio restarts.
+
+`while IFS= read -r line; do ...; done` consumes one input line per iteration;
+`break`, `continue`, `return` and `exit` control execution. Loops share a yielding
+10,000-step budget. Arithmetic such as `$((1 + 2))` uses a dedicated integer
+parser, with exact results restricted to ±(2^53−1), not Luau code execution.
+
+`printf` supports reusable formats, `-v`, `%s`, `%b`, `%c`, `%q`, integer and
+floating-point conversions, flags, widths, precisions and escapes. Its format
+parser and 64-bit integer conversion are explicit; only floating-point digits
+use Luau formatting, with validated arguments. Floats are finite IEEE-754
+doubles with precision at most 99, not Bash's long doubles. See
+[BASH_FIDELITY.md](BASH_FIDELITY.md) for the exact limits and test commands.
 
 `seq` is what makes a COUNTED loop possible without either: `for i in $(seq 1
 20); do mkdir Part$i; done`. It takes LAST, FIRST LAST or FIRST STEP LAST the way
@@ -324,14 +346,29 @@ thousand values rather than truncating, since half a sequence is the wrong
 sequence and the loop built from one quietly does the wrong number of things.
 
 `!` before a pipeline inverts its status, which is worth something now that a
-miss reports one: `! grep -q X f && echo absent`. `cd -` goes back to wherever
-the last cd came from. Globs are expanded by whichever command takes paths —
-every one that iterates them does, and the three that walk from a single root
-(grep, du, tree) say so rather than answering for whichever match sorted first.
+miss reports one: `! grep -q X f && echo absent`. `cd` prints nothing; `cd -`
+reads `$OLDPWD` and prints where it landed, as bash does. Globs expand in every unquoted argument, including
+`echo *.luau`; quoted wildcards remain literal. `*`, `?`, bracket ranges and
+multi-segment paths work; dotfiles need an explicit leading dot and an unmatched
+pattern stays literal. `{probe,verify}.luau` and `{1..3}` expand before variables.
+`ls`, `cat` and `grep` accept multiple expanded paths; `du` and `tree` still
+require one root and refuse multiple operands explicitly.
 
-There are still no variables beyond a loop's own, no arithmetic and no
-backticks. HOWEVER we will try to make this a real shell harness (so all args and
-commands possible) for the roblox data model.
+Copy destinations distinguish files from containers even though a Roblox script
+can have children. `cp -n source existingScript` leaves it untouched. Overwriting
+a script updates its contents while preserving the destination's class, identity
+and unrelated children. `cp -T` addresses the destination itself, rejecting
+file/directory mismatches; `cp -rT sourceFolder destinationFolder` merges entries
+without creating duplicate siblings. Copy plans validate conflicts before
+mutation and preserve editor buffers. `rm -rf` removes the named node as well
+as its descendants, including script roots; `/`, services and the cwd remain
+protected.
+
+Text files are ModuleScripts with explicit filenames. Writes to `.txt`, `.json`,
+`.md`, or other non-code extensions skip Luau syntax diagnostics. `.lua`, `.luau`
+and extensionless scripts are still checked after writes. `cat` only reads; it
+does not parse text as Luau. Source writes retain the existing CRLF-to-LF
+normalization used by the Script Editor integration.
 
 ## Layout
 
@@ -362,7 +399,12 @@ main/
   fs/
     Fs.lua        paths, .Source access, undo, globs
     Terminal.lua  the commands themselves
-    Shell.lua     tokenizer, pipes, redirection, heredocs, for loops, $(...)
+    Shell.lua     command table, flags, DataModel-to-stream adapter
+    ShellSyntax.lua    lexer and compound-command grammar
+    ShellWords.lua     variables, substitutions, arithmetic, braces, globs
+    ShellRuntime.lua   shell state, control flow, pipelines, redirections
+    ShellBuiltins.lua  printf format parsing and rendering
+    ShellTests.lua     language and filesystem regression fixtures
   studio/
     Props.lua     property names and defaults
     Exec.lua      runs Luau                (run tool only)
@@ -445,3 +487,10 @@ that quietly stops covering things while still looking like it covers them.
 
 Console's test is last because what it tests is the console, and it finishes by
 clearing it; the conversation is redrawn from storage immediately after.
+
+For shell development outside Studio, `node tests/run.mjs <path-to-luau>
+<path-to-bash>` runs the real modules against a small test-only Roblox boundary,
+the full `Shell.selfTest`, copy-buffer/failure checks, and Bash differential
+tests. See [tests/README.md](tests/README.md). This does not verify Studio's actual
+undo/redo, UI, network services, or engine-only Git checks; `/selftest` remains
+the integration check in Studio.

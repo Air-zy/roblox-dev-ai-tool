@@ -12,11 +12,8 @@
 -- A new command is a HANDLERS entry; a new piece of syntax is a change here and
 -- nowhere else.
 --
--- It is still not a general shell interpreter, and the line is worth stating
--- because it has moved twice: there is no `if`, no `while`, no assignment, no
--- `$?`, no environment and no arithmetic, and the only variable is a loop's own.
--- Anything that needs more than that should use the `run` tool instead of
--- growing a language here.
+-- ShellSyntax parses compound commands, ShellWords expands their words, and
+-- ShellRuntime executes them with per-terminal variables and bounded loops.
 
 local Fs = require(script.Parent:WaitForChild("Fs"))
 -- Only for find's -type, which has to reject a name that is not a class BEFORE
@@ -69,154 +66,12 @@ local MAX_LIST = 100
 
 local Shell = {}
 
--- Command-line parsing
--- Inside double quotes bash only escapes these four; a backslash before anything
--- else is an ordinary character. Getting that wrong is not cosmetic: `grep -nE
--- "^\t###"` used to arrive as `^t###`, so the search ran against a pattern nobody
--- wrote and came back "no matches", a still-broken command reading as a
--- verified-absent result, which is the one output there is no way to doubt.
-local DOUBLE_QUOTE_ESCAPES: { [string]: boolean } = {
-	['"'] = true, ["\\"] = true, ["$"] = true, ["`"] = true,
-}
-
--- Split a shell-ish line into argv, honouring quotes so instance names with
--- spaces survive: `cd "My Model"` is the common case, and a plain split on
--- whitespace gets it wrong on day one.
---
--- ponytail: no assignment, no `$?`, no arithmetic and no backticks, and no
--- reason to add them — anything that needs those should use `run`. Ceiling: the
--- quote/escape rules are bash's, but the grammar is hand-rolled rather than
--- parsed, and both `for` and `$(...)` were fitted onto it a pass at a time. A
--- real grammar is the upgrade path if a third one comes along.
---
--- Returns a third value: which argv POSITIONS came out of quotes, so the
--- metacharacter check can tell `grep "<" f` from an input redirection.
-local function tokenize(line: string): ({ string }?, string?, { [number]: boolean })
-	local args: { string } = {}
-	local buf: { string } = {}
-	local quoted: { [number]: boolean } = {}
-	local sawQuote = false
-	local quote: string? = nil
-
-	local function flush()
-		if #buf > 0 then
-			args[#args + 1] = table.concat(buf)
-			if sawQuote then
-				quoted[#args] = true
-			end
-			buf = {}
-			sawQuote = false
-		end
-	end
-
-	local i = 1
-	while i <= #line do
-		local c = line:sub(i, i)
-		if c == "\\" and quote == nil then
-			i += 1
-			buf[#buf + 1] = line:sub(i, i)
-			-- A backslash literalises exactly the way a quote does, and the flag is
-			-- what says so downstream. Without this, `\;` `\|` `\>` produced tokens
-			-- byte-identical to the OPERATORS and nothing could tell them apart:
-			-- `find . -exec cat {} \;` had its statement cut at the `\;`, and
-			-- `echo \> f.luau` was §3.10 all over again — the arrow taken as a
-			-- redirection, the argument dropped and f.luau truncated.
-			sawQuote = true
-		elseif c == "\\" and quote == '"' then
-			local following = line:sub(i + 1, i + 1)
-			if DOUBLE_QUOTE_ESCAPES[following] then
-				i += 1
-				buf[#buf + 1] = following
-			else
-				buf[#buf + 1] = c
-			end
-		elseif quote then
-			if c == quote then
-				quote = nil
-			else
-				buf[#buf + 1] = c
-			end
-		elseif c == "'" or c == '"' then
-			quote = c
-			sawQuote = true
-			buf[#buf + 1] = ""          -- mark: "" is a real, empty argument
-		elseif c == ";" then
-			-- Its own token even when glued to a word, so `echo foo;` is two
-			-- commands rather than one argument ending in a semicolon. A quoted
-			-- ";" never reaches here, the quote branch above claims it first.
-			flush()
-			args[#args + 1] = ";"
-		elseif c == "|" or c == "&" then
-			-- Doubled or single, glued or spaced: `ls|wc`, `a && b`, `a||b`.
-			flush()
-			if line:sub(i + 1, i + 1) == c then
-				args[#args + 1] = c .. c
-				i += 1
-			else
-				args[#args + 1] = c
-			end
-		elseif c == ">" then
-			-- A redirection operator is a word delimiter in bash whether or not it
-			-- is glued to what precedes it. Here it was an ordinary character, so
-			-- `echo hi>f.luau` tokenized as the single word `hi>f.luau` and printed
-			-- it: a redirect that wrote nothing, reported nothing, and produced
-			-- output that looked like it had worked. `echo hi> f.luau` was the same
-			-- failure with a space in it. Only the fully-spaced `echo hi > f.luau`
-			-- and the `>f.luau` form ever landed.
-			--
-			-- A bare `1` or `2` immediately in front of the arrow is part of the
-			-- OPERATOR, not an operand. Without that clause this fix would break
-			-- something worse than it repaired: `find x 2>/dev/null` would split
-			-- into `2` — searched for as a name — and a `>` aimed at /dev/null,
-			-- which silently discards the real output. Only an unquoted digit, so
-			-- `echo "2">f` still echoes the character.
-			local pending = table.concat(buf)
-			local stream = ""
-			if not sawQuote and (pending == "1" or pending == "2") then
-				stream = pending
-				buf = {}
-			end
-			flush()
-			local arrow = ">"
-			if line:sub(i + 1, i + 1) == ">" then
-				arrow = ">>"
-				i += 1
-			end
-			args[#args + 1] = stream .. arrow
-		elseif c == "<" then
-			-- Same delimiter rule as `>`, and it needs no stream digit or doubled
-			-- form: `2<` is not a thing anyone writes, and `<<` never reaches here
-			-- because extractHeredoc lifts every heredoc off the line before
-			-- tokenizing and refuses a `<<` it cannot find a delimiter for.
-			flush()
-			args[#args + 1] = "<"
-		elseif c == "\n" then
-			-- A newline ends a command, exactly as it does in a shell script.
-			-- It used to fall through to the whitespace branch below and act as
-			-- an ARGUMENT separator, so a perfectly ordinary two-line tool call
-			--     ls /Workspace
-			--     cat Main.luau
-			-- ran as the single command `ls /Workspace cat Main.luau`, one
-			-- listing, the second line silently swallowed as operands. Nothing
-			-- errored, which is what made it expensive: the model saw plausible
-			-- output and moved on. A quoted newline never reaches here, so
-			-- multi-line strings still survive intact.
-			flush()
-			args[#args + 1] = ";"
-		elseif c:match("%s") then
-			flush()
-		else
-			buf[#buf + 1] = c
-		end
-		i += 1
-	end
-	-- Same as bash: `grep don't` is an error, not a silently mangled pattern.
-	if quote then
-		return nil, "unterminated " .. quote .. " quote", quoted
-	end
-	flush()
-	return args, nil, quoted
-end
+-- Words and grammar are shared with the runtime; this alias also keeps the
+-- existing quote/escape regression vectors on the production lexer.
+local Syntax = require(script.Parent:WaitForChild("ShellSyntax"))
+local Runtime = require(script.Parent:WaitForChild("ShellRuntime"))
+local Builtins = require(script.Parent:WaitForChild("ShellBuiltins"))
+local tokenize = Syntax.tokenize
 
 -- What a command accepts, declared once and checked once, in runCommand,
 -- before the handler runs, so an unknown flag fails on its own terms instead of
@@ -438,97 +293,11 @@ local function takeCount(operands: { string }): (string?, number?)
 	return path, count
 end
 
--- Split a trailing glob off a path: `/Workspace/Part*` -> "/Workspace", "Part*".
--- Returns nil for the pattern when there is no wildcard, so callers can treat
--- the whole thing as an ordinary path.
-local function splitGlob(target: string?): (string?, string?)
-	if not target or not target:find("[%*%?]") then
-		return target, nil
-	end
-	local parent, leaf = target:match("^(.*)/([^/]*)$")
-	if not leaf then
-		return nil, target                      -- bare `ls *.luau`, relative to cwd
-	end
-	return (parent == "" and "/" or parent), leaf
-end
+-- Pathname expansion belongs to ShellWords and is complete before dispatch.
 
--- Lift a heredoc off the front of a line, returning the command line and the
--- body. This has to happen BEFORE tokenizing: the body is arbitrary source, and
--- one apostrophe in a comment would otherwise blow up the quote tracker.
---
--- There is no parameter expansion here, so `<< EOF` and `<< 'EOF'` mean exactly
--- the same thing, the distinction that makes them differ in bash doesn't exist.
--- `<<-` strips leading tabs from the body and the terminator, as bash does.
-local function extractHeredoc(raw: string): (string, string?, string?)
-	local head, dash, quote, delim, tail =
-		raw:match("^(.-)<<(%-?)[ \t]*(['\"]?)([%w_%-%.]+)%3(.*)$")
-	if not delim then
-		if raw:find("<<", 1, true) then
-			return raw, nil, "heredoc needs a delimiter word, e.g. `cat > x.luau << EOF`"
-		end
-		return raw, nil, nil
-	end
-
-	-- The rest of the first line still belongs to the command: `<< EOF > file`
-	-- and `> file << EOF` both have to work.
-	local firstLineRest, rawBody = tail:match("^([^\n]*)\n?(.*)$")
-	local commandLine = head .. " " .. (firstLineRest or "")
-
-	local content: { string } = {}
-	local terminated = false
-	local trailing = 0
-	local bodyLines = splitLines(rawBody or "")
-	for index, line in ipairs(bodyLines) do
-		local stripped = line
-		if dash == "-" then
-			stripped = line:gsub("^\t+", "")
-		end
-		if stripped == delim then
-			terminated = true
-			trailing = #bodyLines - index
-			break
-		end
-		content[#content + 1] = stripped
-	end
-
-	if not terminated then
-		return raw, nil, string.format("heredoc was never terminated by %s", delim)
-	end
-	if trailing > 0 then
-		-- bash would silently ignore this. Here it almost always means the
-		-- delimiter appeared inside the body and truncated the script early,
-		-- which is the one failure mode worth refusing rather than committing.
-		return raw, nil, string.format(
-			"%d line(s) came after the closing %s — if %s appears inside the body, " ..
-				"pick a delimiter that doesn't", trailing, delim, delim)
-	end
-
-	local body = #content > 0 and (table.concat(content, "\n") .. "\n") or ""
-	return commandLine, body, nil
-end
-
--- The bit bucket. A path to recognise, not an instance to create: a real
--- Folder named "dev" would live in the place file forever, turn up in every
--- find, and sync to disk.
+-- Redirects on argv assembled by find -exec still use this adapter. Ordinary
+-- shell redirection, including heredocs, is parsed and executed by ShellRuntime.
 local DEV_NULL = "/dev/null"
-
--- Pull redirection out of argv: `> path`, `>> path`, `2> path`, glued or spaced.
---
--- `2>` USED to be recognised and thrown away, on the reasoning that there is no
--- stderr stream to aim it at. Recognising it was necessary — otherwise the token
--- falls through as a positional argument and `find x 2>/dev/null` searches for
--- an instance literally named "2>/dev/null" — but throwing it away made
--- `2>/dev/null` a lie: the most reflexive way there is to quiet a probe, quietly
--- doing nothing, with the noise still in the output.
---
--- There is still no stderr STREAM, and there does not need to be one. `failed`
--- already means "this errored and its whole output is the message" — that is the
--- invariant the pipeline is built on — so when a command fails, its output IS
--- stderr, and a `2>` target is somewhere to send it. Errors are the only thing
--- that goes there; a command that succeeded has nothing for it.
---
--- `&>` is rewritten to `>` before tokenizing and never reaches here: both streams
--- to one place is what already happens.
 local function takeRedirect(argv: { string }): ({ string }, string?, boolean, string?, boolean, string?)
 	local kept: { string } = {}
 	local target: string? = nil
@@ -595,8 +364,6 @@ local UNSUPPORTED: { [string]: string } = {
 	-- list: a model typing it has finished and thinks it has to close something,
 	-- and a person typing it has left shell mode already or is not in it. Named
 	-- so both get one line instead of thirty-five.
-	exit = "nothing to exit — there is no session here; `exit` on its own line " ..
-		"leaves the widget's shell mode, and a tool call simply ends when it returns",
 	quit = "nothing to quit; see `exit`",
 	-- Generates completions, and nothing here completes: no terminal, no tab. Its
 	-- one useful action, "what commands exist", is what `help` answers. Named
@@ -621,14 +388,6 @@ local UNSUPPORTED: { [string]: string } = {
 	tar = "no archives here; see `unzip`",
 	xargs = "no xargs; `for f in $(grep -rl Foo); do ... $f; done` runs a command " ..
 		"per item, and a filter can be piped straight into grep/head/tail/wc/sort/uniq/cut/sed/tr",
-	-- A loop is claimed as a whole pipeline stage, so `for` never reaches here as
-	-- a command. `do` and `done` still can, stranded by a loop with no `for`, and
-	-- "unknown command" would print the entire command list beside each.
-	["do"] = "only appears inside a loop — `for f in *.luau; do head -5 $f; done`",
-	["done"] = "only appears inside a loop — `for f in *.luau; do head -5 $f; done`",
-	["while"] = "no `while`: nothing here changes between two iterations, so it " ..
-		"would run zero times or forever. `for f in <words>; do ... ; done` is the loop",
-	["until"] = "no `until`; see `while`",
 }
 
 -- Which script class a suffix asks for. Owned by Fs, because `write` creates
@@ -701,6 +460,20 @@ end
 local trailer: string? = nil
 local function note(text: string)
 	trailer = text
+end
+
+-- What a mutation DID is a diagnostic, not data. The POSIX equivalents are
+-- silent on success; this harness reports instead, because a transcript that
+-- never says what changed is unreadable. It reports on STDERR, though: riding on
+-- stdout meant `X=$(touch f)` captured "created /path/f [ModuleScript]" and a
+-- pipe carried it as content, so the announcement corrupted the value it was
+-- announcing. The console shows stderr, so nothing is lost to a reader.
+local function announce(lines: { string }): string
+	local text = table.concat(lines, "\n")
+	if text ~= "" then
+		note(text)
+	end
+	return ""
 end
 
 local function applyRedirect(self: any, path: string, content: string, append: boolean): string
@@ -1314,27 +1087,32 @@ end
 
 HANDLERS.cd = function(self, argv)
 	local _, _, operands = parse(argv)
+	if #operands > 1 then return fail("cd", "too many arguments") end
+	local vars = self.shellState and self.shellState.vars
 	local where = operands[1]
+	-- bash prints the destination for `cd -` and NOTHING for an ordinary cd. This
+	-- printed every time, so `cd x && cmd` put a stray path above every answer and
+	-- `cd x | wc -l` counted a line the command never wrote.
+	local announce = false
 	if not where then
-		-- bash goes home; there is no home here, and inventing one would mean
-		-- picking a container and calling it that. Through fail() so the status is
-		-- honest: this used to return the message as ordinary output, so `cd ||
-		-- echo lost` never fired.
-		return fail("cd", "requires a path — `cd /` is the root and `cd -` goes back")
+		where = vars and vars.HOME
+		if not where then return fail("cd", "HOME is not set") end
+	elseif where == "-" then
+		-- OLDPWD, not private terminal state, so `cd -` follows an assignment to it
+		-- and a script can read where it came back from.
+		where = vars and vars.OLDPWD
+		if not where or where == "" then return fail("cd", "OLDPWD not set") end
+		announce = true
 	end
-	-- `cd -` returns to wherever the last successful cd came from, and bash
-	-- prints the new directory, which is what this returns anyway.
-	if where == "-" then
-		if not self.previous then
-			return fail("cd", "nothing to go back to yet")
-		end
-		where = instancePath(self.previous)
-	end
+	local from = self:pwd()
 	local ok, err = self:cd(where)
 	if not ok then
 		return fail("cd", err)
 	end
-	return self:pwd()
+	-- Read back rather than echoed: `cd ..` and `cd -` both arrive as a path that
+	-- is not the spelling the shell ends up reporting.
+	if vars then vars.OLDPWD, vars.PWD = from, self:pwd() end
+	return announce and self:pwd() or ""
 end
 
 -- Sort rows for ls. By name unless asked otherwise; -U turns sorting off, which
@@ -1450,19 +1228,7 @@ end
 
 HANDLERS.ls = function(self, argv)
 	local flags, _, operands = parse(argv)
-	local target, glob = splitGlob(operands[1])
-	local matcher = glob and nameMatcher(glob) or nil
-
-	-- -d is about the container itself, not its contents, the only way to
-	-- `ls -l` one instance without listing everything inside it. With a glob
-	-- there is nothing to descend into anyway, so the ordinary path covers it.
-	if flags["-d"] and not glob then
-		local inst, err = self:resolve(target)
-		if not inst then
-			return fail("ls", err)
-		end
-		return lsRow({ inst = inst, name = target or displayName(inst) }, flags)
-	end
+	local target = operands[1]
 
 	-- find and grep stop at a cap; ls did not, so `ls /Workspace` in a place with
 	-- a few thousand parts returned every one of them and only `forModel`'s
@@ -1503,20 +1269,35 @@ HANDLERS.ls = function(self, argv)
 	--
 	-- Only the root, only without a glob, and only for containers with nothing
 	-- in them. An empty Folder somewhere in a place is a real answer to `ls`.
-	local hideEmpty = atRoot and not matcher and not flags["-a"] and not flags["-A"]
+	local hideEmpty = atRoot and #operands <= 1 and not flags["-a"] and not flags["-A"]
 	local hidden = 0
 
-	-- `ls -R /` re-resolves a path string for every container it descends into,
-	-- so on a large place this walk is long enough to freeze Studio on its own.
+	-- `ls -R /` used to re-resolve a path string for every container it descended
+	-- into: long enough to freeze Studio on a large place, and wrong as soon as
+	-- two siblings shared a name, since the path it printed no longer named one
+	-- instance. It carries the instance down instead.
 	local breathe = Fs.breather()
 
-	local function listOne(path: string?, header: boolean): string?
-		local rows, err = self:ls(path, matcher)
+	local function listOne(path: string?, header: boolean, known: Instance?): string?
+		local inst, resolveErr = known, nil
+		if not inst then
+			inst, resolveErr = self:resolve(path)
+		end
+		if not inst then return resolveErr end
+		local entryOnly = flags["-d"] or path ~= nil and isScript(inst)
+		local rows, err
+		if entryOnly then rows = { { inst = inst, name = path or displayName(inst) } }
+		else
+			rows = {}
+			for _, child in ipairs(inst:GetChildren()) do
+				rows[#rows + 1] = { inst = child, name = displayName(child) }
+			end
+		end
 		if not rows then
 			return err
 		end
 		lsSort(rows, flags)
-		if header then
+		if header and not entryOnly then
 			if #out > 0 then
 				out[#out + 1] = ""
 			end
@@ -1539,10 +1320,10 @@ HANDLERS.ls = function(self, argv)
 			end
 		end
 		-- -R descends after listing, which is the order bash prints them in.
-		if flags["-R"] then
+		if flags["-R"] and not entryOnly then
 			for _, row in ipairs(rows) do
 				if not isScript(row.inst) and #row.inst:GetChildren() > 0 then
-					local err2 = listOne(instancePath(row.inst), true)
+					local err2 = listOne(instancePath(row.inst), true, row.inst)
 					if err2 then
 						return err2
 					end
@@ -1564,9 +1345,14 @@ HANDLERS.ls = function(self, argv)
 		return nil
 	end
 
-	local walkErr = listOne(target, false)
-	if walkErr then
-		return fail("ls", walkErr)
+	if #operands == 0 then
+		local walkErr = listOne(nil, false)
+		if walkErr then return fail("ls", walkErr) end
+	else
+		for _, path in ipairs(operands) do
+			local walkErr = listOne(path, #operands > 1)
+			if walkErr then return fail("ls", walkErr) end
+		end
 	end
 	if #out == 0 and emptyLabel then
 		-- Prose either way, so `ls empty | wc -l` answers 0 rather than 1 for the
@@ -1574,8 +1360,7 @@ HANDLERS.ls = function(self, argv)
 		-- the difference comes from. An empty directory is a success (exit 0); a
 		-- glob that matched nothing is an error (exit 2). Same sentence, and
 		-- `ls empty && echo ok` has to run the echo.
-		local text = string.format("(%s) %s", glob and "no matches" or "empty", emptyLabel)
-		return if glob then miss(text) else prose(text)
+		return prose(string.format("(empty) %s", emptyLabel))
 	end
 	-- Both of these say what was left out and how to see it, so an absence is
 	-- never something the reader has to infer from a count that does not add up.
@@ -1602,32 +1387,7 @@ end
 -- instance literally named "*.luau" and reported it missing. cat is the command
 -- that actually needs this: grep and find already walk descendants on their own,
 -- so `grep foo .` covers what `grep foo *.luau` would have meant.
-local function expandGlobs(self: any, operands: { string }): { string }
-	local out: { string } = {}
-	for _, operand in ipairs(operands) do
-		local dir, pattern = splitGlob(operand)
-		if not pattern then
-			out[#out + 1] = operand
-			continue
-		end
-		local matched = self:ls(dir, nameMatcher(pattern))
-		if not matched or #matched == 0 then
-			-- Same as bash with nullglob off: an unmatched pattern is passed
-			-- through untouched, so the command reports it by name rather than
-			-- silently doing nothing.
-			out[#out + 1] = operand
-		else
-			local prefix = (dir and dir ~= "" and dir ~= "/") and (dir .. "/") or (dir == "/" and "/" or "")
-			table.sort(matched, function(a, b)
-				return a.name < b.name
-			end)
-			for _, row in ipairs(matched) do
-				out[#out + 1] = prefix .. row.name
-			end
-		end
-	end
-	return out
-end
+-- cat's flags render text; they never expand a path a second time.
 
 -- cat's display flags, applied in the order coreutils applies them.
 local function catRender(text: string, flags: { [string]: boolean }): string
@@ -1686,18 +1446,7 @@ end
 --
 -- Handlers that ITERATE their operands do not come through here: they call
 -- expandGlobs and take everything it returns, which is what bash does.
-local function oneGlobbed(self: any, cmd: string, path: string?,
-	alternative: string): (string?, string?)
-	if not path then
-		return nil, nil
-	end
-	local matched = expandGlobs(self, { path })
-	if #matched > 1 then
-		return nil, fail(cmd, string.format("%q matches %d paths and %s takes one — %s",
-			path, #matched, cmd, alternative))
-	end
-	return matched[1], nil
-end
+-- Arguments arriving here have already undergone shell expansion.
 
 HANDLERS.cat = function(self, argv, stdin)
 	local flags, _, operands = parse(argv)
@@ -1718,7 +1467,6 @@ HANDLERS.cat = function(self, argv, stdin)
 	if #operands == 0 and stdin then
 		return plain and stdin or catRender(stdin, flags)
 	end
-	operands = expandGlobs(self, operands)
 	if #operands <= 1 then
 		local s, err, truncated = self:cat(operands[1])
 		if not s then
@@ -1791,7 +1539,6 @@ local STAT_FIELDS: { [string]: (Instance) -> string } = {
 HANDLERS.stat = function(self, argv)
 	local _, values, operands = parse(argv)
 	-- `stat *.luau` is a listing over every match, the same as ls.
-	operands = expandGlobs(self, operands)
 	local format = valueOf(values, "-c")
 	if format then
 		local out: { string } = {}
@@ -1954,7 +1701,7 @@ local function headTail(self: any, cmd: string, argv: { string }, stdin: string?
 	end
 	count = count or bare or 10
 
-	local files, err = inputs(self, expandGlobs(self, paths), stdin)
+	local files, err = inputs(self, paths, stdin)
 	if not files then
 		return fail(cmd, err)
 	end
@@ -2000,7 +1747,7 @@ end
 -- second field for them to mistake it for.
 HANDLERS.wc = function(self, argv, stdin)
 	local flags, _, operands = parse(argv)
-	local files, inputErr = inputs(self, expandGlobs(self, operands), stdin)
+	local files, inputErr = inputs(self, operands, stdin)
 	if not files then
 		-- Not a script. A container's only size is its children, which is a real
 		-- answer to `wc /Workspace` and not one wc can compute from text.
@@ -2065,14 +1812,9 @@ end
 HANDLERS.tree = function(self, argv)
 	local flags, values, operands = parse(argv)
 	local target, depth = takeCount(operands)
-	local globErr
-	target, globErr = oneGlobbed(self, "tree", target,
-		"a tree is drawn from one root; `tree .` covers everything under the cwd")
-	if globErr then
-		return globErr
-	end
+	if #operands > (depth ~= nil and 2 or 1) then return fail("tree", "takes one root; use a for loop to draw several trees") end
 	depth = numberOf(values, "-L") or depth
-	local s, err = self:tree(target, depth, {
+	local s, err, cut = self:tree(target, depth, {
 		dirsOnly = flags["-d"],
 		fullPath = flags["-f"],
 		classify = flags["-F"],
@@ -2080,17 +1822,19 @@ HANDLERS.tree = function(self, argv)
 		include = valueOf(values, "-P"),
 		exclude = valueOf(values, "-I"),
 	})
-	return s or fail("tree", err)
+	if not s then
+		return fail("tree", err)
+	end
+	if cut then
+		note(cut)
+	end
+	return s
 end
 
 HANDLERS.du = function(self, argv)
 	local flags, values, operands = parse(argv)
-	local only, globErr = oneGlobbed(self, "du", operands[1],
-		"`du -a .` sizes everything below a container in one walk")
-	if globErr then
-		return globErr
-	end
-	local target, err = self:resolve(only)
+	if #operands > 1 then return fail("du", "takes one root; use a for loop to size several trees") end
+	local target, err = self:resolve(operands[1])
 	if not target then
 		return fail("du", err)
 	end
@@ -2230,6 +1974,18 @@ HANDLERS.find = function(self, argv)
 	local maxDepth: number? = nil
 	local deleting = false
 	local exec: { command: { string }, batch: boolean }? = nil
+	-- Which `-o` branch each action was written in. GNU binds -a tighter than -o
+	-- and evaluates left to right, so in `-name x -o -name E -delete` the delete
+	-- belongs to the SECOND branch only, and a file matching the first short
+	-- circuits before the action is ever reached. Held globally, `-delete` fired
+	-- for every match of every branch: the flag deleted files the branch carrying
+	-- it never named.
+	local actions: { { [string]: boolean } } = {}
+	local function act(kind: string)
+		local at = #groups
+		actions[at] = actions[at] or {}
+		actions[at][kind] = true
+	end
 	local negateNext = false
 	local now = os.time()
 
@@ -2460,10 +2216,12 @@ HANDLERS.find = function(self, argv)
 				return fail("find", "-exec needs a command, as `-exec cat {} \\;`")
 			end
 			exec = { command = command, batch = terminator == "+" }
+			act("exec")
 		elseif arg == "-print" then
 			-- The default action, and printing is all this find does.
 		elseif arg == "-delete" then
 			deleting = true
+			act("delete")
 		elseif FIND_UNSUPPORTED[arg] then
 			return fail("find", arg .. " " .. FIND_UNSUPPORTED[arg])
 		elseif arg:sub(1, 1) == "-" and #arg > 1 and not arg:match("^%-%d") then
@@ -2529,6 +2287,11 @@ HANDLERS.find = function(self, argv)
 			"the whole subtree, which is what `ls -R` is for")
 	end
 
+	local matched: { [Instance]: number } = {}
+	local function claims(inst: Instance, kind: string): boolean
+		local group = matched[inst]
+		return group ~= nil and actions[group] ~= nil and actions[group][kind] == true
+	end
 	local function test(inst: Instance): boolean
 		-- No tests at all is `find /x -maxdepth 2`, which in GNU find lists the
 		-- subtree down to that depth. The fold below returns false on an empty
@@ -2537,9 +2300,10 @@ HANDLERS.find = function(self, argv)
 		-- `-maxdepth` on its own was dead, and dead in the direction that looks
 		-- like an empty place rather than a broken flag.
 		if total == 0 then
+			matched[inst] = 1
 			return true
 		end
-		for _, group in ipairs(groups) do
+		for index, group in ipairs(groups) do
 			local all = true
 			for _, one in ipairs(group) do
 				if not one(inst) then
@@ -2550,6 +2314,9 @@ HANDLERS.find = function(self, argv)
 			-- An empty group is the `-o` with nothing after it; it must not match
 			-- everything, which is what an all-true fold over zero tests gives.
 			if all and #group > 0 then
+				-- The FIRST branch that matches claims the instance, which is what
+				-- `-o` short circuiting means and what decides whose action runs.
+				matched[inst] = index
 				return true
 			end
 		end
@@ -2589,6 +2356,11 @@ HANDLERS.find = function(self, argv)
 		return miss("no matches")
 	end
 
+	if deleting and exec then
+		return fail("find", "-delete and -exec in one expression run in an order this " ..
+			"find does not model — run the two searches separately")
+	end
+
 	if deleting then
 		-- Deepest first, so removing a parent cannot invalidate a child still on
 		-- the list. Destroy() takes the subtree with it.
@@ -2612,21 +2384,44 @@ HANDLERS.find = function(self, argv)
 			return depth[a] > depth[b]
 		end)
 		local removed: { string } = {}
+		local refused = false
 		for _, inst in ipairs(found) do
-			if inst.Parent then
+			if inst.Parent and claims(inst, "delete") then
 				local path = instancePath(inst)
-				local _, removeErr = self:remove(path)
-				removed[#removed + 1] = removeErr and ("find: " .. tostring(removeErr))
-					or ("removed " .. path)
+				-- find(1) unlinks a directory with rmdir, which refuses a non-empty
+				-- one. Destroy() does not, so one matched folder used to take every
+				-- unmatched child with it: `find . -name build -delete` deleted the
+				-- sources inside build as well, and nothing said so. Deepest-first
+				-- ordering above means children the expression DID match are already
+				-- gone by the time their parent is reached, so a whole matched
+				-- subtree still deletes in one pass.
+				if not isScript(inst) and #inst:GetChildren() > 0 then
+					refused = true
+					removed[#removed + 1] = string.format(
+						"cannot delete %s: Directory not empty", path)
+				else
+					local _, removeErr = self:remove(path)
+					if removeErr then
+						refused = true
+						removed[#removed + 1] = tostring(removeErr)
+					else
+						removed[#removed + 1] = "removed " .. path
+					end
+				end
 			end
 		end
-		return table.concat(removed, "\n")
+		if refused then
+			return fail("find", table.concat(removed, "\n"))
+		end
+		return announce(removed)
 	end
 
 	if exec then
 		local paths: { string } = {}
 		for _, inst in ipairs(found) do
-			paths[#paths + 1] = instancePath(inst)
+			if claims(inst, "exec") then
+				paths[#paths + 1] = instancePath(inst)
+			end
 		end
 		-- `{}` is replaced wherever it appears, which is what find(1) does; with no
 		-- `{}` at all the command still runs per result, also as find(1) has it.
@@ -2650,6 +2445,8 @@ HANDLERS.find = function(self, argv)
 					out[#out + 1] = value
 				end
 			end
+			;(out :: any).quoted = {}
+			for index = 1, #out do (out :: any).quoted[index] = true end
 			return out
 		end
 
@@ -2710,6 +2507,7 @@ HANDLERS.which = function(self, argv)
 	-- searched the DataModel for an INSTANCE named "grep" and reported whichever
 	-- unrelated thing it happened to hit, an answer that looked authoritative
 	-- and was never right for the question actually being asked.
+	if self.shellState and self.shellState.functions[name] then return name .. ": shell function" end
 	if HANDLERS[name] then
 		return name .. ": shell builtin"
 	end
@@ -2882,7 +2680,7 @@ HANDLERS["["] = HANDLERS.test
 --
 -- The bare `command NAME args` form never reaches here: runCommand strips the
 -- prefix, so the command that runs is the real one, with its own spec.
-HANDLERS.command = function(_, argv)
+HANDLERS.command = function(self, argv)
 	local flags, _, operands = parse(argv)
 	local name = operands[1]
 	if not name or name == "" then
@@ -2898,7 +2696,9 @@ HANDLERS.command = function(_, argv)
 	-- as a helper: they are the source tables themselves, so there is nothing to
 	-- drift, and the two commands word their answers differently on purpose.
 	local what: string? = nil
-	if HANDLERS[name] then
+	if self.shellState and self.shellState.functions[name] then
+		what = "a shell function"
+	elseif HANDLERS[name] then
 		what = "a shell builtin"
 	elseif isSeparateTool(name) then
 		what = "a separate tool, not a shell command"
@@ -3059,12 +2859,8 @@ HANDLERS.grep = function(self, argv, stdin)
 		patterns = { pattern }
 		firstOperand = 2
 	end
-	local path, globErr = oneGlobbed(self, "grep", operands[firstOperand],
-		"`grep -r --include='*.luau' PATTERN .` filters a walk, which is what a " ..
-		"pattern over files means here")
-	if globErr then
-		return globErr
-	end
+	local path: any = operands[firstOperand]
+	if #operands > firstOperand then path = table.move(operands, firstOperand, #operands, 1, {}) end
 
 	-- The dialect, exactly as the real tools define it: plain grep is BRE, -E and
 	-- egrep are ERE, -F and fgrep are fixed strings, -P is ERE plus the
@@ -3216,28 +3012,9 @@ HANDLERS.grep = function(self, argv, stdin)
 				withMatch[hit.path] = true
 			end
 		end
-		local target, resolveErr = self:resolve(path)
-		if not target then
-			return flags["-s"] and "" or fail("grep", resolveErr)
-		end
-		local searched = target:GetDescendants()
-		table.insert(searched, 1, target)
 		local out: { string } = {}
-		for _, inst in ipairs(searched) do
-			-- isScript, NOT getSource. The only question here is "is this a file",
-			-- and getSource answers it by handing back a COPY of the whole script:
-			-- this re-walk was reading every source in the place a second time for
-			-- a boolean that getSource's own first line already had. The two agree
-			-- exactly — getSource returns nil for everything isScript rejects — so
-			-- this is the same answer without the second read of the whole place.
-			if isScript(inst) then
-				-- Built once. It was called twice per instance, once to look up and
-				-- once to emit, which is two whole paths walked to game per script.
-				local instPath = instancePath(inst)
-				if not withMatch[instPath] then
-					out[#out + 1] = instPath
-				end
-			end
+		for _, instPath in ipairs((hits :: any).searched or {}) do
+			if not withMatch[instPath] then out[#out + 1] = instPath end
 		end
 		return table.concat(out, "\n")
 	end
@@ -3280,7 +3057,7 @@ HANDLERS.grep = function(self, argv, stdin)
 		-- named script counts bare and a subtree counts per file — which is what
 		-- `grep -rc X dir | grep -v ":0"` is written against. -h forces the bare
 		-- total, -H forces the prefix, as everywhere else.
-		local target = self:resolve(path)
+		local target = type(path) ~= "table" and self:resolve(path) or nil
 		local perFile = not flags["-h"] and (flags["-H"] == true or not (target and getSource(target)))
 		if not perFile then
 			local total = 0
@@ -3310,10 +3087,19 @@ HANDLERS.grep = function(self, argv, stdin)
 		return table.concat(paths, "\n")
 	end
 
-	-- -h drops the path header, -H forces it. The default prints it, because a
-	-- match with no path is unusable when the search covered a whole subtree.
-	local showPath = not flags["-h"]
-	local body = formatHits(hits, showPath, true, before + after > 0)
+	-- One named file is grep's simplest form and GNU prints the bare matching
+	-- line for it: no path, and no line number without -n. This printed both, so
+	-- `X=$(grep alpha data.txt)` captured a path header and `  1: ` prefixes that
+	-- the piped spelling of the same question did not produce.
+	--
+	-- The path header stays for a subtree or several files, where a match with no
+	-- path is unusable. That rendering is a deliberate divergence from GNU's
+	-- `path:line` (see BASH_FIDELITY §4); printing it for ONE file was not.
+	local only = type(path) ~= "table" and path ~= nil and self:resolve(path) or nil
+	local single = only ~= nil and getSource(only) ~= nil
+	local showPath = flags["-H"] == true or (not flags["-h"] and not single)
+	local body = formatHits(hits, showPath, flags["-n"] == true or not single,
+		before + after > 0)
 	local skipped = (hits :: any).skipped
 	if skipped then
 		-- A note, not a match: `grep -rn X . | wc -l` used to answer 101 for a
@@ -3400,7 +3186,7 @@ end
 
 HANDLERS.sort = function(self, argv, stdin)
 	local flags, values, operands = parse(argv)
-	local files, inputErr = inputs(self, expandGlobs(self, operands), stdin)
+	local files, inputErr = inputs(self, operands, stdin)
 	if not files then
 		return fail("sort", inputErr)
 	end
@@ -3600,6 +3386,11 @@ HANDLERS.mkdir = function(self, argv)
 			else
 				-- mkdir names a path, so split the last segment off.
 				local parentPath, leaf = splitPath(dir)
+				if self:resolve(dir) then
+					-- GNU exits 1 here. Reporting "already exists" on stdout with a
+					-- zero status made `mkdir d && cd d` run against someone else's d.
+					return fail("mkdir", string.format("cannot create directory %q: File exists", dir))
+				end
 				local s, err = self:create("Folder", leaf, parentPath)
 				if not s then
 					return fail("mkdir", err)
@@ -3608,7 +3399,7 @@ HANDLERS.mkdir = function(self, argv)
 			end
 		end
 	end
-	return table.concat(out, "\n")
+	return announce(out)
 end
 
 HANDLERS.touch = function(self, argv)
@@ -3617,7 +3408,6 @@ HANDLERS.touch = function(self, argv)
 	-- nothing passes through as bash leaves it, and touch then creates a script
 	-- under that literal name — which is bash's behaviour too, and the reason
 	-- nullglob exists there.
-	operands = expandGlobs(self, operands)
 	if #operands == 0 then
 		return fail("touch", "requires a name")
 	end
@@ -3678,7 +3468,7 @@ HANDLERS.touch = function(self, argv)
 			end
 		end
 	end
-	return table.concat(out, "\n")
+	return announce(out)
 end
 
 HANDLERS.rm = function(self, argv)
@@ -3690,7 +3480,7 @@ HANDLERS.rm = function(self, argv)
 	-- Every operand, not just the first: `rm a b c` used to destroy a and say
 	-- nothing at all about b and c.
 	local out: { string } = {}
-	for _, path in ipairs(expandGlobs(self, operands)) do
+	for _, path in ipairs(operands) do
 		-- Real rm refuses a directory without -r, and that refusal is the whole
 		-- reason a mistyped path costs a turn instead of a subtree. This used to
 		-- recurse silently, so `rm /Workspace/Model` took 500 descendants with it
@@ -3699,6 +3489,7 @@ HANDLERS.rm = function(self, argv)
 		-- A script is a file here and needs no flag; everything else is a
 		-- directory: the same split `-type f` / `-type d` already uses.
 		local doomed = self:resolve(path)
+		if not doomed and flags["-f"] then continue end
 		if doomed and not isScript(doomed) and not (flags["-r"] or flags["-R"]) then
 			local children = #doomed:GetChildren()
 			-- -d removes an empty container, which is the one case that needs no -r.
@@ -3713,14 +3504,12 @@ HANDLERS.rm = function(self, argv)
 		if not s then
 			-- -f makes a missing path a no-op rather than a failure, which is what
 			-- lets `rm -f x` be safe to run whether or not x is there.
-			if not flags["-f"] then
-				return fail("rm", err)
-			end
+			return fail("rm", err)
 		else
 			out[#out + 1] = s
 		end
 	end
-	return table.concat(out, "\n")
+	return announce(out)
 end
 
 -- mv and cp differ only in whether the original survives, so they share their
@@ -3733,64 +3522,36 @@ end
 local function moveOrCopy(self: any, cmd: string, argv: { string }): string
 	local flags, values, operands = parse(argv)
 	local destination = valueOf(values, "-t")
+	local targetDirectory = destination ~= nil
+	if targetDirectory and flags["-T"] then return fail(cmd, "-t and -T are mutually exclusive") end
 	local sources = operands
 	if not destination then
-		if #operands < 2 then
-			return fail(cmd, "requires a source path and a destination path")
-		end
+		if #operands < 2 then return fail(cmd, "requires a source path and a destination path") end
 		destination = operands[#operands]
 		sources = table.move(operands, 1, #operands - 1, 1, {})
 	end
-	sources = expandGlobs(self, sources)
-
-	-- With more than one source the destination has to be an existing container;
-	-- otherwise the last one silently wins the name and the rest are lost.
-	if #sources > 1 and not self:resolve(destination) then
-		return fail(cmd, string.format(
-			"target %q is not an existing container, and %d sources need one",
-			destination, #sources))
+	if #sources == 0 then return fail(cmd, "requires a source path") end
+	if flags["-T"] and #sources ~= 1 then return fail(cmd, "-T requires exactly one source") end
+	if targetDirectory or #sources > 1 then
+		local target = self:resolve(destination)
+		if not target or isScript(target) then
+			return fail(cmd, string.format("target %q is not an existing directory", destination))
+		end
 	end
-
-	-- -T refuses to treat the destination as a directory, so `mv a b` renames
-	-- even when b already exists as a container.
-	local name: string? = nil
-	local parent = destination
-	if flags["-T"] then
-		local parentPath, leaf = splitPath(destination :: string)
-		parent, name = parentPath or ".", leaf
-	end
-
+	local opts = {
+		noTargetDirectory = flags["-T"], noClobber = flags["-n"],
+		recursive = flags["-r"] or flags["-R"] or flags["-a"],
+	}
 	local out: { string } = {}
 	for _, source in ipairs(sources) do
-		-- -n declines to overwrite. Checked against the resolved container so it
-		-- means the same thing whether the destination is a folder or a new name.
-		if flags["-n"] then
-			local existing = self:resolve(destination)
-			local leaf = select(2, splitPath(source))
-			if existing and existing:FindFirstChild(Fs.stripScriptSuffix(leaf) or leaf) then
-				continue
-			end
-		end
-		-- Written out rather than as `cmd == "mv" and move(...) or copy(...)`,
-		-- which was wrong twice over: `a and b or c` yields ONE value, so `err`
-		-- was always nil and every failure reported as "cp: nil", and when a
-		-- move FAILED it returned nil, so the `or` fell through and performed a
-		-- COPY instead. A refused move silently left a duplicate behind.
 		local s, err
-		if cmd == "mv" then
-			s, err = self:move(source, parent, name)
-		else
-			s, err = self:copy(source, parent, name)
-		end
-		if not s then
-			if flags["-f"] then
-				continue
-			end
-			return fail(cmd, err)
-		end
-		out[#out + 1] = s
+		if cmd == "mv" then s, err = self:move(source, destination, opts)
+		else s, err = self:copy(source, destination, opts) end
+		-- -f is permission to overwrite, never permission to conceal a failure.
+		if not s then return fail(cmd, err) end
+		if s ~= "" then out[#out + 1] = s end
 	end
-	return table.concat(out, "\n")
+	return announce(out)
 end
 
 HANDLERS.mv = function(self, argv)
@@ -3811,7 +3572,7 @@ HANDLERS.chmod = function(self, argv)
 	-- From the second: the first operand is the MODE, and `chmod +x *.luau` would
 	-- otherwise try to match `+x` against the children of the cwd.
 	if mode then
-		local targets = expandGlobs(self, table.move(operands, 2, #operands, 1, {}))
+		local targets = table.move(operands, 2, #operands, 1, {})
 		operands = { mode }
 		table.move(targets, 1, #targets, 2, operands)
 	end
@@ -4068,7 +3829,6 @@ HANDLERS.sed = function(self, argv, stdin)
 	for index = firstFile, #operands do
 		files[#files + 1] = operands[index]
 	end
-	files = expandGlobs(self, files)
 
 	-- Both refusals BEFORE anything is read, so a bad flag combination cannot
 	-- rewrite the first file and only then stop.
@@ -4112,8 +3872,15 @@ HANDLERS.sed = function(self, argv, stdin)
 			break
 		end
 	end
-	-- -i already names every file it wrote, so a header would say it twice.
-	return joinFiles(parts, nil, flags["-i"])
+	-- -i already names every file it wrote, so a header would say it twice. Under
+	-- -i that naming is a diagnostic and goes to stderr with every other mutation
+	-- report: `sed -i` edits in place and writes NOTHING to stdout, so a
+	-- `$(sed -i ...)` is empty rather than a list of paths.
+	local rendered = joinFiles(parts, nil, flags["-i"])
+	if flags["-i"] then
+		return announce({ rendered })
+	end
+	return rendered
 end
 
 -- diff
@@ -4341,31 +4108,66 @@ HANDLERS.diff = function(self, argv)
 	local b, errB = self:resolve(operands[2])
 	if not b then return fail("diff", errB) end
 
+	-- GNU diff: 0 same, 1 different, 2 trouble. Always returning 0 meant
+	-- `if diff -r a b` could never detect a difference, which is the entire
+	-- reason the command is scriptable. The output was right and only the status
+	-- lied, which is the combination that gets believed.
 	if not flags["-r"] then
-		return diffOne(self, a, b, flags, values)
+		local text = diffOne(self, a, b, flags, values)
+		if text ~= "" and not failed then
+			unmatched = true
+		end
+		return text
 	end
 
 	-- -r walks two containers together, pairing children by name. A name present
 	-- on one side only is reported as such rather than skipped: "only in" is
 	-- most of what a recursive diff is asked for.
+	--
+	-- It DESCENDS into a pair of directories present on both sides. It used to
+	-- compare one level and stop, so `diff -r L R` over trees that differ only
+	-- below the top printed nothing at all — a clean bill of health for two trees
+	-- that do not match, which is the one answer a diff must never invent.
 	local out: { string } = {}
-	local seen: { [string]: boolean } = {}
-	for _, childA in ipairs(a:GetChildren()) do
-		seen[childA.Name] = true
-		local childB = b:FindFirstChild(childA.Name)
-		if not childB then
-			out[#out + 1] = string.format("Only in %s: %s", instancePath(a), childA.Name)
-		elseif getSource(childA) and getSource(childB) then
-			local text = diffOne(self, childA, childB, flags, values)
-			if text ~= "" then
-				out[#out + 1] = text
+	local breathe = Fs.breather()
+	local function walk(left: Instance, right: Instance)
+		breathe()
+		-- GetChildren has no defined order, and diff(1) reports in name order.
+		-- Without this the same two trees compare differently between runs.
+		local children = left:GetChildren()
+		table.sort(children, function(x, y) return x.Name < y.Name end)
+		local seen: { [string]: boolean } = {}
+		for _, childA in ipairs(children) do
+			seen[childA.Name] = true
+			local childB = right:FindFirstChild(childA.Name)
+			local fileA, fileB = isScript(childA), childB ~= nil and isScript(childB)
+			if not childB then
+				out[#out + 1] = string.format("Only in %s: %s", instancePath(left), childA.Name)
+			elseif fileA ~= fileB then
+				-- diff(1) names the mismatch rather than reporting the pair as equal.
+				out[#out + 1] = string.format("File %s is a %s while file %s is a %s",
+					instancePath(childA), fileA and "regular file" or "directory",
+					instancePath(childB), fileB and "regular file" or "directory")
+			elseif fileA then
+				local text = diffOne(self, childA, childB, flags, values)
+				if text ~= "" then
+					out[#out + 1] = text
+				end
+			else
+				walk(childA, childB)
+			end
+		end
+		local others = right:GetChildren()
+		table.sort(others, function(x, y) return x.Name < y.Name end)
+		for _, childB in ipairs(others) do
+			if not seen[childB.Name] then
+				out[#out + 1] = string.format("Only in %s: %s", instancePath(right), childB.Name)
 			end
 		end
 	end
-	for _, childB in ipairs(b:GetChildren()) do
-		if not seen[childB.Name] then
-			out[#out + 1] = string.format("Only in %s: %s", instancePath(b), childB.Name)
-		end
+	walk(a, b)
+	if #out > 0 then
+		unmatched = true
 	end
 	return table.concat(out, "\n")
 end
@@ -4452,7 +4254,7 @@ HANDLERS.cut = function(self, argv, stdin)
 	local skipUndelimited = flags["-s"] == true
 	local outputDelimiter = valueOf(values, "--output-delimiter") or delimiter
 
-	local files, inputErr = inputs(self, expandGlobs(self, operands), stdin)
+	local files, inputErr = inputs(self, operands, stdin)
 	if not files then
 		return fail("cut", inputErr)
 	end
@@ -4631,7 +4433,7 @@ HANDLERS.file = function(self, argv)
 		return fail("file", "requires a path")
 	end
 	local out: { string } = {}
-	for _, path in ipairs(expandGlobs(self, operands)) do
+	for _, path in ipairs(operands) do
 		local target, err = self:resolve(path)
 		if not target then
 			return fail("file", err)
@@ -4657,7 +4459,7 @@ HANDLERS.rmdir = function(self, argv)
 		return fail("rmdir", "requires a path")
 	end
 	local out: { string } = {}
-	for _, path in ipairs(expandGlobs(self, operands)) do
+	for _, path in ipairs(operands) do
 		local target, err = self:resolve(path)
 		if not target then
 			return fail("rmdir", err)
@@ -4673,19 +4475,34 @@ HANDLERS.rmdir = function(self, argv)
 					"`rm -r` removes one and everything inside",
 				instancePath(target), children))
 		end
-		-- -p walks up removing each parent that the removal just emptied. The
-		-- service guard in Fs stops the climb at the top on its own.
+		-- -p removes the components NAMED IN THE PATH and stops. It used to climb
+		-- until it met something non-empty, which walked past the operand into the
+		-- cwd and its ancestors -- harmless while the climb failed silently, and a
+		-- spurious error the moment it stopped doing that.
 		local climbing = target.Parent
+		local remaining = 0
+		for _ in path:gmatch("[^/]+") do
+			remaining += 1
+		end
+		remaining -= 1
 		local s, removeErr = self:remove(instancePath(target))
 		if not s then
 			return fail("rmdir", removeErr)
 		end
 		out[#out + 1] = s
-		while flags["-p"] and climbing and #climbing:GetChildren() == 0 do
+		while flags["-p"] and climbing and remaining > 0 do
+			remaining -= 1
+			-- A non-empty named component is where GNU rmdir -p STOPS AND FAILS: it
+			-- removed what it could and the path it was given is still there.
+			-- Returning 0 with no diagnostic said the whole path was gone.
+			if #climbing:GetChildren() > 0 then
+				return fail("rmdir", string.format("failed to remove %s: Directory not empty",
+					instancePath(climbing)))
+			end
 			local parent = climbing.Parent
 			local up, upErr = self:remove(instancePath(climbing))
 			if not up then
-				-- Hitting a service is where the climb is SUPPOSED to stop, so it
+				-- Hitting a service is where the climb is SUPPOSED to stop, and it
 				-- ends the loop rather than failing the command.
 				if upErr then break end
 			else
@@ -4694,7 +4511,7 @@ HANDLERS.rmdir = function(self, argv)
 			climbing = parent
 		end
 	end
-	return table.concat(out, "\n")
+	return announce(out)
 end
 HANDLERS.egrep = HANDLERS.grep
 HANDLERS.fgrep = HANDLERS.grep
@@ -6066,6 +5883,16 @@ HANDLERS.git = function(self, argv)
 		"What exists: %s", sub, sub, GIT_SUB_LIST))
 end
 
+local runtimeApi
+for _, name in ipairs(Runtime.COMMANDS) do
+	HANDLERS[name] = function(self, argv)
+		local words = {}; for _, value in ipairs(argv) do words[#words + 1] = Builtins.quote(value) end
+		local out, code = Runtime.run(self, table.concat(words, " "), runtimeApi())
+		failed, unmatched = code > 1, code == 1
+		return out
+	end
+end
+
 local COMMANDS: { string } = {}
 for name in pairs(HANDLERS) do
 	COMMANDS[#COMMANDS + 1] = name
@@ -6101,19 +5928,8 @@ local STDIN_COMMANDS: { [string]: boolean } = {
 -- Forward-declared: a `for` loop is a pipeline STAGE, so runCommand has to be
 -- able to reach it, and the loop body runs back through runTokens, which is
 -- defined below both of them.
-local runLoopStage: (any, { string }) -> (string, boolean)
-
 function runCommand(self: any, argv: { string }, stdin: string?): (string, boolean)
 	failed, unmatched, missText, trailer = false, false, false, nil
-	-- Before takeRedirect, which would otherwise steal a `>` out of the loop's
-	-- BODY: `for f in a; do echo $f > out.luau; done` is a redirect per
-	-- iteration, not one on the loop.
-	if argv[1] == "for" then
-		if stdin then
-			return fail("bash", "for: a loop does not read input — pipe its output instead"), false
-		end
-		return runLoopStage(self, argv)
-	end
 	local args, redirect, append, errRedirect, errAppend, inRedirect = takeRedirect(argv)
 	-- `< path` replaces stdin. A pipe on the left loses to it, which is bash's
 	-- rule and the only one that can be right: the redirect is the more specific
@@ -6159,9 +5975,6 @@ function runCommand(self: any, argv: { string }, stdin: string?): (string, boole
 	end
 
 	local cmd = args[1]
-	if stdin and not STDIN_COMMANDS[cmd] then
-		return fail("bash", cmd .. " does not read input — pipe into cat, grep, head, tail, wc, sort, uniq, cut, sed or tr"), false
-	end
 	-- Before the handler, so an unknown flag fails on its own terms instead of
 	-- surviving as an ignored flag and a stray positional argument.
 	local _, _, _, flagErr = partition(args, SPECS[cmd])
@@ -6229,670 +6042,89 @@ function runCommand(self: any, argv: { string }, stdin: string?): (string, boole
 	return output, ok
 end
 
--- A pipeline: each stage's output becomes the next stage's input. A failing
--- stage stops the pipeline rather than feeding an error message downstream as
--- if it were data.
-local function runPipeline(self: any, stages: { { string } }, stdin: string?): (string, boolean)
-	local input = stdin
-	local output, ok = "", true
-	-- Trailers from EVERY stage, not just the last. They are this harness's
-	-- stderr, and in bash stderr reaches the terminal from any stage of a
-	-- pipeline while only stdout is piped onward. Dropping a non-final stage's
-	-- note would be worse than leaving it in the data: `cat big.luau | wc -l`
-	-- would answer 1000 with nothing anywhere to say the file has 3182 lines,
-	-- so the truncation would become invisible rather than merely mis-counted.
-	local notes: { string } = {}
-	for index, stage in ipairs(stages) do
-		output, ok = runCommand(self, stage, input)
-		-- Stops on an ERROR, never on a merely false status. There is no stderr
-		-- here, so an error message flowing on would be read as data — but a stage
-		-- that found nothing did not error, and bash runs the next stage anyway.
-		-- `failed` still holds this stage's state: runCommand clears it on entry
-		-- and nothing has run since it returned.
-		if failed then
-			return output, false
-		end
-		if trailer then
-			notes[#notes + 1] = trailer
-		end
-		-- A miss's prose is not data, so a downstream stage gets nothing to read,
-		-- which is what real grep hands it. Not accumulated the way a trailer is:
-		-- "no matches" is grep's exit status spelled out, and bash prints nothing
-		-- at all for it — where a cap warning is a real thing that happened.
-		if index < #stages and missText then
-			output = ""
-		end
-		input = output
-	end
-	if #notes > 0 then
-		local tail = table.concat(notes, "\n")
-		output = if output == "" then tail else output .. "\n" .. tail
-	end
-	-- The pipeline's status is the LAST stage's, as bash has it.
-	return output, ok
-end
-
--- Split tokenized argv into statements joined by `;`, `&&` or `||`, each of
--- which is a list of pipeline stages split on `|`.
-local SEPARATORS: { [string]: boolean } = { [";"] = true, ["&&"] = true, ["||"] = true }
-
-type Statement = { joiner: string, stages: { { string } } }
-
--- `quoted` is by position in `argv`, and the whole reason it is threaded this
--- far is `takeRedirect`. A quoted `>` and an operator `>` are the same STRING by
--- the time a stage is assembled, and telling them apart is not cosmetic:
--- `grep '>' f.luau` used to lose its pattern to the redirect parser and write
--- an empty f.luau — a command that searched for nothing, said nothing, and
--- destroyed the file it was supposed to read.
---
--- Positions shift when argv is cut into stages, so the flag is copied onto each
--- stage as it is built. It rides on the stage array the way `skipped` rides on
--- a result list elsewhere here. Absent (a loop body rebuilt by expandVar) means
--- "nothing known to be quoted", which is exactly the old behaviour rather than
--- a new failure.
-local function parseStatements(argv: { string }): { Statement }
-	local wasQuoted = (argv :: any).quoted or {}
-	local statements: { Statement } = {}
-	local current: Statement = { joiner = ";", stages = { {} } }
-
-	local function flush()
-		local stages: { { string } } = {}
-		for _, stage in ipairs(current.stages) do
-			if #stage > 0 then
-				stages[#stages + 1] = stage
+-- The runtime passes already-expanded argv to the command table and receives
+-- separate data, status and diagnostics. Legacy handlers return line-oriented
+-- text; cat and echo retain their byte semantics at this boundary.
+function runtimeApi()
+	return {
+		consumes = STDIN_COMMANDS,
+		breathe = Fs.breather(),
+		list = function(term, path)
+			local rows = term:ls(path) or {}
+			local names = {}; for _, row in ipairs(rows) do names[#names + 1] = row.name end
+			return names
+		end,
+		read = function(term, path)
+			if path == "/dev/null" then return "" end
+			local inst, err = term:resolve(path)
+			if not inst then return nil, err end
+			local source = getSource(inst)
+			return source, source == nil and ("not a file: " .. path) or nil
+		end,
+		write = function(term, path, content, append)
+			local existing = term:resolve(path)
+			if existing and not isScript(existing) then return "not a file: " .. path end
+			local text = append and ((existing and getSource(existing) or "") .. content) or content
+			local message, err = term:write(path, text)
+			if err then return err end
+			return nil, message and message:match("(syntax error:.*)")
+		end,
+		command = function(term, argv, stdin, stream)
+			local out, ok = runCommand(term, argv, stdin)
+			local erroring, isProse, notes = failed, missText, trailer
+			local code = ok and 0 or erroring and 2 or 1
+			local function line(text) return text ~= "" and text:sub(-1) ~= "\n" and text .. "\n" or text end
+			if erroring then return { out = "", code = code, err = line(out) } end
+			if isProse then return { out = "", code = code, err = notes and line(notes) or "", prose = out } end
+			local rawOutput = argv[1] == "cat" or argv[1] == "tr"
+			if argv[1] == "head" or argv[1] == "tail" then
+				local _, values = parse(argv)
+				rawOutput = values["-c"] ~= nil
 			end
-		end
-		if #stages > 0 then
-			current.stages = stages
-			statements[#statements + 1] = current
-		end
-	end
-
-	local i = 1
-	while i <= #argv do
-		local arg = argv[i]
-		local stage = current.stages[#current.stages]
-		if arg == "for" and #stage == 0 and not wasQuoted[i] then
-			-- A loop is ONE stage, taken whole. It used to be claimed before the
-			-- split instead, by a parser that only looked at the head of the line,
-			-- which is why `cd x; for f in ...` came back as "a `for` loop has to
-			-- start the command line" — the `;` had already cut the loop into four
-			-- unrunnable pieces. Depth-counted so a nested loop takes its own `done`.
-			local depth = 0
-			while i <= #argv do
-				local token = argv[i]
-				stage[#stage + 1] = token
-				;(stage :: any).quoted = (stage :: any).quoted or {}
-				;(stage :: any).quoted[#stage] = wasQuoted[i] or nil
-				-- Quoted, these are DATA: `echo 'done'` in a body must not close
-				-- the loop the way a bare `done` does. parseLoop applies the same
-				-- rule, and the two have to agree about where the stage ends, or
-				-- the body it re-parses is not the one claimed here.
-				if token == "for" and not wasQuoted[i] then
-					depth += 1
-				elseif token == "done" and not wasQuoted[i] then
-					depth -= 1
-					if depth == 0 then
-						break
-					end
+			if argv[1] == "echo" then
+				local newline = true
+				for at = 2, #argv do
+					local flags = argv[at]:match("^%-([neE]+)$")
+					if not flags then break end
+					if flags:find("n", 1, true) then newline = false end
 				end
-				i += 1
-			end
-		-- Quoted or backslashed, a separator is DATA. This read the token text
-		-- alone, so `echo ';'` and `echo '|'` were cut into pieces at the very
-		-- character they were quoted to protect, and `find ... -exec cat {} \;`
-		-- lost everything after the `\;` to a second statement that began with a
-		-- pipe. takeRedirect learned this in §3.10; parseStatements did not, and
-		-- it is the same set riding on the same argv.
-		elseif SEPARATORS[arg] and not wasQuoted[i] then
-			flush()
-			current = { joiner = arg, stages = { {} } }
-		elseif arg == "|" and not wasQuoted[i] then
-			current.stages[#current.stages + 1] = {}
-		else
-			stage[#stage + 1] = arg
-			;(stage :: any).quoted = (stage :: any).quoted or {}
-			;(stage :: any).quoted[#stage] = wasQuoted[i] or nil
-		end
-		i += 1
-	end
-	flush()
-	return statements
+				if newline then out ..= "\n" end
+			elseif not rawOutput then out = line(out) end
+			return { out = out, code = code, err = notes and line(notes) or "",
+				preserveNewline = rawOutput and (stdin == nil or stream.preserveNewline == true) }
+		end,
+	}
 end
 
--- Run a statement list. `lastOk` seeds the `&&`/`||` chain, which matters when
--- something ran before these statements did — see the loop below, where `done &&
--- echo ok` has to know whether the loop failed.
-local function runStatements(self: any, statements: { Statement },
-	stdin: string?, lastOk: boolean): (string, boolean)
-	local outputs: { string } = {}
-	-- Whether the statement just run produced nothing but a miss's prose. Read by
-	-- the `||` branch below, and nowhere else.
-	local lastWasProse = false
-	for index, statement in ipairs(statements) do
-		local skip = (statement.joiner == "&&" and not lastOk)
-			or (statement.joiner == "||" and lastOk)
-		if not skip then
-			-- `grep X f || echo absent` is the idiomatic "is this missing?", and in
-			-- bash it prints exactly `absent`: grep's miss is an exit status, not
-			-- text. Here the miss carries prose, because a false status is
-			-- invisible to whoever is reading — but once the `||` branch actually
-			-- FIRES, that prose has been superseded by the fallback it triggered,
-			-- and printing `no matches` above `absent` is saying the same thing
-			-- twice in two vocabularies.
-			--
-			-- Only prose is dropped. A statement that produced real data and a
-			-- false status — `grep -c X f` returning "0" — keeps it, which is the
-			-- whole reason miss() and a bare `unmatched` are different things.
-			if statement.joiner == "||" and lastWasProse then
-				outputs[#outputs] = nil
-			end
-			-- `! pipeline` inverts the STATUS and nothing else, which is bash's
-			-- own reading of it. Newly useful rather than newly possible: while a
-			-- miss reported no status there was nothing worth inverting, and now
-			-- `! grep -q X f && echo absent` is the natural way to ask.
-			--
-			-- The stage list is cloned rather than edited, so the parsed statement
-			-- is left as it was written.
-			local stages = statement.stages
-			local negate = stages[1] ~= nil and stages[1][1] == "!"
-			if negate then
-				stages = table.clone(stages)
-				stages[1] = table.move(stages[1], 2, #stages[1], 1, {})
-				if #stages[1] == 0 then
-					table.remove(stages, 1)
-				end
-				if #stages == 0 then
-					return fail("bash", "`!` inverts a command's status, so it needs one"), false
-				end
-			end
-			-- A heredoc body belongs to the last statement, the way a shell
-			-- attaches it to the command it followed.
-			local output, ok = runPipeline(self, stages,
-				index == #statements and stdin or nil)
-			lastOk = if negate then not ok else ok
-			if #statements == 1 then
-				-- lastOk, not ok: on a lone `! cmd` the inversion is the whole
-				-- point, and returning the raw status would drop it.
-				return output, lastOk
-			end
-			-- Concatenated, with nothing announcing which statement produced what.
-			-- `$ <command>` used to be printed over each block, on the reasoning
-			-- that several outputs need telling apart — but bash prints no such
-			-- thing, and the cost was paid on the commonest line there is:
-			-- `cd /Workspace && ls` came back as an empty labelled block for the
-			-- cd followed by a labelled listing, four lines of ceremony around one
-			-- answer, and `echo a; echo b` returned four lines where every shell on
-			-- earth returns two.
-			--
-			-- The label also carried a diagnostic — it re-quoted each token, so an
-			-- agent could see that `grep -E 'a|b'` had NOT had its quotes eaten.
-			-- That argument does not survive contact with when the label appeared:
-			-- only ever with two or more statements, and a single command, which is
-			-- where that worry actually arises, was never labelled at all. The
-			-- tokenizer cases above pin the same property down permanently, and
-			-- requote/label are gone with this.
-			--
-			-- Empty output contributes nothing, so a statement that printed
-			-- nothing leaves no blank line behind.
-			if output ~= "" then
-				outputs[#outputs + 1] = output
-			end
-			lastWasProse = missText and output ~= ""
-		end
-	end
-	return table.concat(outputs, "\n"), lastOk
-end
-
--- Loops
---
--- `for NAME in WORDS; do BODY; done`, and only that one. There is no `while`
--- and no `until`: nothing in this shell can change a condition between two
--- iterations, so either would run zero times or forever, and forever is a frozen
--- Studio with no way out. A word list is finite by construction.
---
--- What it buys is the thing that had no spelling before: one command per
--- instance over a set. `head -5 a b c` prints three files, but `sed -i` on each,
--- or a grep whose pattern differs per file, was a separate tool call each time.
-type Loop = { name: string, words: { string }, body: { string }, rest: { string } }
-
-local LOOP_SYNTAX = "`for f in *.luau; do head -5 $f; done`"
-
--- nil, nil means "not a loop"; nil with a message means it is one and it is
--- malformed. Silently falling through on a malformed loop would run `for` as a
--- command and report an unknown one, which points at the wrong thing.
-local function parseLoop(argv: { string }): (Loop?, string?)
-	-- Which positions came out of quotes, tagged on by parseStatements. EVERY
-	-- structural token below — `;`, `in`, `do`, `done`, `for` — is checked
-	-- against it, because a quoted one is an argument rather than syntax.
-	--
-	-- takeRedirect reads this set and so does parseStatements. parseLoop was the
-	-- one parser that did not, and it is the one that cuts up a loop BODY, so
-	-- the omission surfaced as `for d in x; do find "$d" -exec stat {} \; ; done`
-	-- reporting that -exec had no terminator: the `\;` it was handed had already
-	-- been read as the end of the command. The body is rebuilt below, so the map
-	-- has to be rebuilt with it or the information is gone by the time it counts.
-	local wasQuoted = (argv :: any).quoted or {}
-	local function bareWord(at: number, word: string): boolean
-		return argv[at] == word and not wasQuoted[at]
-	end
-
-	-- Leading `;` tokens are skipped first. A body written on its own line starts
-	-- with the one tokenize made from the newline, and a NESTED loop is exactly
-	-- that shape: without this, the inner loop of
-	--     for a in 1 2; do
-	--       for b in x y; do ... ; done
-	--     done
-	-- is not recognised as a loop at all, and `for` comes back as an unknown
-	-- command with the whole command list printed beside it.
-	local i = 1
-	while bareWord(i, ";") do
-		i += 1
-	end
-	if not bareWord(i, "for") then
-		return nil, nil
-	end
-	local name = argv[i + 1]
-	if not name or not name:match("^[%a_][%w_]*$") then
-		return nil, string.format("for: %q is not a variable name — %s",
-			tostring(name), LOOP_SYNTAX)
-	end
-	if not bareWord(i + 2, "in") then
-		-- bash also has `for f; do`, which iterates the positional parameters.
-		-- There are none here, so it can only ever be a typo for the `in` form.
-		return nil, "for: expected `in` after the variable — " .. LOOP_SYNTAX
-	end
-
-	local words: { string } = {}
-	i += 3
-	while i <= #argv and not bareWord(i, ";") and not bareWord(i, "do") do
-		words[#words + 1] = argv[i]
-		i += 1
-	end
-	-- `; do`, or `do` on the next line, which tokenize has already turned into a
-	-- `;`. Several in a row is a blank line between them.
-	while bareWord(i, ";") do
-		i += 1
-	end
-	if not bareWord(i, "do") then
-		return nil, "for: expected `do` after the word list — " .. LOOP_SYNTAX
-	end
-	i += 1
-
-	-- Depth-counted so a loop inside a loop takes its own `done` rather than the
-	-- outer one's. Nesting costs three lines here and mis-parses silently
-	-- without them: the inner body would become the outer's trailing statements.
-	local body: { string } = {}
-	local bodyQuoted: { [number]: boolean } = {}
-	local depth = 1
-	while i <= #argv do
-		local token = argv[i]
-		if token == "for" and not wasQuoted[i] then
-			depth += 1
-		elseif token == "done" and not wasQuoted[i] then
-			depth -= 1
-			if depth == 0 then
-				i += 1
-				break
-			end
-		end
-		body[#body + 1] = token
-		-- Re-keyed to the body's OWN positions: the map on `argv` is indexed by
-		-- the stage's, and the body starts partway into it.
-		bodyQuoted[#body] = wasQuoted[i] or nil
-		i += 1
-	end
-	if depth ~= 0 then
-		return nil, "for: missing `done` — " .. LOOP_SYNTAX
-	end
-	;(body :: any).quoted = bodyQuoted
-
-	local rest: { string } = {}
-	local restQuoted: { [number]: boolean } = {}
-	table.move(argv, i, #argv, 1, rest)
-	-- What follows `done`. takeRedirect reads the same map to tell a redirect
-	-- from a quoted `>`.
-	for at = i, #argv do
-		restQuoted[at - i + 1] = wasQuoted[at] or nil
-	end
-	;(rest :: any).quoted = restQuoted
-	return { name = name, words = words, body = body, rest = rest }, nil
-end
-
--- $NAME and ${NAME} in the body tokens, replaced per iteration.
---
--- AFTER tokenizing, not before, so a word containing a space stays ONE argument.
--- bash re-splits an expanded variable and needs "$f" to stop it; here a path
--- with a space in it simply survives, which is the behaviour every caller wanted
--- from the quotes anyway.
---
--- The frontier is what keeps `$f` out of `$file`: it requires the character
--- after the name to be a non-word one, and end-of-token counts.
-local function expandVar(tokens: { string }, name: string, value: string): { string }
-	-- A `%` in the value is a capture reference in a gsub replacement, so a path
-	-- containing one would corrupt the substitution or throw.
-	local replacement = value:gsub("%%", "%%%%")
-	local braced = "%${" .. name .. "}"
-	local bare = "%$" .. name .. "%f[^%w_]"
-	local out: { string } = {}
-	for index, token in ipairs(tokens) do
-		out[index] = (token:gsub(braced, replacement):gsub(bare, replacement))
-	end
-	-- Substitution is one token in, one token out, so the quoted map transfers
-	-- position for position. Dropping it here was the other half of the `\;`
-	-- bug: parseLoop could hand over a perfectly good map and this would rebuild
-	-- the body without it, one call before parseStatements went looking.
-	;(out :: any).quoted = (tokens :: any).quoted
-	return out
-end
-
--- Forward-declared: a loop body is run through the same entry point that
--- detects a loop, which is what makes nesting work without a second parser.
-local runTokens: (any, { string }, string?, boolean) -> (string, boolean)
-
-local function runLoop(self: any, loop: Loop, lastOk: boolean): (string, boolean)
-	-- Globbed, because `for f in *.luau` is the whole reason to have this.
-	local words = expandGlobs(self, loop.words)
-	local outputs: { string } = {}
-	local ok = lastOk
-	for _, word in ipairs(words) do
-		local output
-		output, ok = runTokens(self, expandVar(loop.body, loop.name, word), nil, true)
-		if output ~= "" then
-			outputs[#outputs + 1] = output
-		end
-	end
-	-- Iterations run together, exactly as bash does, and NOT under a per-iteration
-	-- header: injecting one would corrupt `done | wc -l` and every other pipe.
-	-- The commands that need attribution already carry it — `head` prints
-	-- `==> path <==` per file, `grep` and `wc` name theirs — so a header here
-	-- would be a second, disagreeing one.
-	--
-	-- bash keeps going after a failing iteration, and so does this: covering the
-	-- list is the point, and one missing instance must not silently drop the rest.
-	return table.concat(outputs, "\n"), ok
-end
-
--- One loop, as a pipeline stage. `done | wc -l`, `done && echo ok` and
--- `cd x; for ...` all fall out of that: the statement and pipeline machinery
--- already knows what to do with a stage, and each of those shapes used to need
--- its own branch up here, or was refused outright.
-function runLoopStage(self: any, argv: { string }): (string, boolean)
-	local loop, loopErr = parseLoop(argv)
-	if not loop then
-		return fail("bash", loopErr or ("for: " .. LOOP_SYNTAX)), false
-	end
-	-- parseStatements ends the stage at `done`, so anything still in `rest` was
-	-- written between `done` and the next separator. A redirect there belongs to
-	-- the loop as a whole, which is why it is taken HERE rather than in
-	-- runCommand, where it would have reached into the body.
-	local rest, redirect, append = takeRedirect(loop.rest)
-	if #rest > 0 then
-		return fail("bash", "for: unexpected " .. rest[1] .. " after `done`"), false
-	end
-	local output, ok = runLoop(self, loop, true)
-	if redirect == DEV_NULL then
-		return "", ok
-	end
-	if redirect then
-		-- Cleared first: `failed` has been reset and set again by every command the
-		-- body ran, so the only way to hear about a failing write is to ask about
-		-- this one alone.
-		failed = false
-		local written = applyRedirect(self, redirect, output, append)
-		return written, ok and not failed
-	end
-	return output, ok
-end
-
-function runTokens(self: any, argv: { string }, stdin: string?,
-	lastOk: boolean): (string, boolean)
-	return runStatements(self, parseStatements(argv), stdin, lastOk)
-end
-
--- Forward-declared: `$(...)` runs a whole line of its own.
-local runLine: (any, string?, number) -> (string, boolean)
-
--- The closing `)` of a `$(`, skipping quoted text and nested parens. A plain
--- paren count is not enough, and the command that made this necessary is the one
--- that reported the bug: `$(grep -rl "feintWait(" Weps)` carries an unbalanced
--- `(` INSIDE quotes, and counting it reads the whole rest of the line as open.
-local function takeSubstitution(line: string, start: number): (string?, number)
-	local depth = 1
-	local quote: string? = nil
-	local i = start
-	while i <= #line do
-		local c = line:sub(i, i)
-		if c == "\\" and quote ~= "'" then
-			i += 2
-			continue
-		end
-		if quote then
-			if c == quote then
-				quote = nil
-			end
-		elseif c == "'" or c == '"' then
-			quote = c
-		elseif c == "(" then
-			depth += 1
-		elseif c == ")" then
-			depth -= 1
-			if depth == 0 then
-				return line:sub(start, i - 1), i + 1
-			end
-		end
-		i += 1
-	end
-	return nil, 0
-end
-
--- Characters that must not arrive from a substitution, because splicing happens
--- on the TEXT of the line and tokenize would read them as syntax rather than as
--- part of a name. bash splices post-parse and has no such problem; refusing is
--- the honest version of the difference, and the alternative is an instance whose
--- name contains a `;` quietly becoming two commands.
-local UNQUOTED_RISK = "[;|&'\"\\]"
-local QUOTED_RISK = "[\"\\]"
-
--- `$(...)`: run the inner line and splice its output in where it stood.
---
--- On the RAW line, before tokenize, which is where bash does it too — the result
--- has to be re-split into words, and the whole reason to have it is
--- `for f in $(grep -rl Foo)`, one command producing the list the next consumes.
--- Without it that line did not fail: it iterated ONCE, over the literal text
--- `$(grep`, which is the silent kind of wrong.
---
--- Quoting is bash's. Single quotes suppress it; double quotes do not, and inside
--- them the output is spliced whole, so `"$(...)"` stays one word — outside,
--- whitespace collapses to single spaces so tokenize word-splits it instead of
--- reading each output LINE as a new command.
---
--- ponytail: no `${VAR}`, no arithmetic, no backticks, and no expansion inside a
--- heredoc body, which is lifted out before this runs and is meant to be literal
--- text. Ceiling: MAX_SUBSTITUTION_DEPTH levels of shell-in-a-string; `run` is
--- the upgrade path past it.
-local MAX_SUBSTITUTION_DEPTH = 4
-
--- The variables a `for` on THIS line binds.
---
--- `$(...)` is spliced on the raw text, before any loop has run, so a
--- substitution mentioning one of these is reading a name that has no value yet.
--- bash defers a body's substitutions to each iteration; this shell cannot,
--- because splicing happens pre-tokenize and the result has to survive being
--- re-split into words.
---
--- What made this worth a refusal is that the old behaviour was not a failure.
--- The name stayed LITERAL, the inner command ran against the two characters
--- `$m`, and it answered:
---     for m in Xyzzy Plugh; do echo "$(grep -rlw $m / | grep -c .)"; done
--- printed 0 for every module in the list, because grep searched for the string
--- `$m` and honestly found none. That reads as a finding — "no requirers" — and
--- it is not one. A wrong answer that looks like data is worse than an error.
---
--- Some spellings survived by accident: `$(echo $m)` returns the literal `$m`,
--- which expandVar then substitutes on the way past, so it appeared to work.
--- `$(basename $f)` appeared to work too, and quietly stopped the moment a value
--- had a slash in it. Those are not worth preserving.
-local function loopNames(line: string): { [string]: boolean }
-	-- Quoted text is DATA, the same rule the scanner below runs on: `echo 'for f
-	-- in x'` binds nothing, and reading the raw line instead invented an `f` that
-	-- then refused a legitimate `$(wc -l $f)` later on the same line. Escapes go
-	-- first so a backslashed quote cannot open a span, and each span becomes a
-	-- SPACE rather than vanishing, so its neighbours cannot close up into a `for`
-	-- nobody wrote.
-	local bare = line:gsub("\\.", "  "):gsub("'[^']*'", " "):gsub('"[^"]*"', " ")
-	local names: { [string]: boolean } = {}
-	for name in bare:gmatch("%f[%w_]for%s+([%a_][%w_]*)%s+in%f[^%w_]") do
-		names[name] = true
-	end
-	return names
-end
-
-local function expandSubstitutions(self: any, line: string, depth: number): (string?, string?)
-	if not line:find("$(", 1, true) then
-		return line, nil
-	end
-	if depth >= MAX_SUBSTITUTION_DEPTH then
-		return nil, string.format("`$(...)` nested more than %d deep", MAX_SUBSTITUTION_DEPTH)
-	end
-	local bound = loopNames(line)
-
-	local out: { string } = {}
-	local quote: string? = nil
-	local i = 1
-	while i <= #line do
-		local c = line:sub(i, i)
-		if c == "\\" and quote ~= "'" then
-			out[#out + 1] = line:sub(i, i + 1)
-			i += 2
-		elseif quote ~= "'" and c == "$" and line:sub(i + 1, i + 1) == "(" then
-			local inner, after = takeSubstitution(line, i + 2)
-			if not inner then
-				return nil, "unclosed `$(`"
-			end
-			-- Read before the loop that would define it: see loopNames above.
-			for name in bound do
-				local reads = inner:match("%$" .. name .. "%f[^%w_]") ~= nil
-					or inner:find("${" .. name .. "}", 1, true) ~= nil
-				if reads then
-					return nil, string.format(
-						"`$(%s)` reads $%s, and the `for` on this line has not bound it " ..
-						"yet — `$(...)` is spliced in before the loop runs, so the inner " ..
-						"command would see the literal text `$%s` and answer about that. " ..
-						"Put the substitution's command in the loop body on its own, or " ..
-						"use `run` where a variable is a variable.", inner, name, name)
-				end
-			end
-			local text = runLine(self, inner, depth + 1)
-			-- ERRORED, not merely false. Splicing a refusal in as words is how `for
-			-- f in $(grep ...)` would come to iterate over the words of an error
-			-- message — but a grep that found nothing did not refuse, and bash
-			-- iterates zero times there rather than aborting the line. Reading the
-			-- status instead would make every empty search a hard failure.
-			--
-			-- `failed` is the last command inside the substitution, which is the
-			-- one whose status bash would take.
-			if failed then
-				return nil, string.format("`$(%s)` failed — %s", inner, text)
-			end
-			local risk = quote == nil and UNQUOTED_RISK or QUOTED_RISK
-			if text:find(risk) then
-				return nil, string.format("`$(%s)` produced text containing shell " ..
-					"punctuation, which cannot be spliced into a command line — " ..
-					"narrow it, or run the two commands separately", inner)
-			end
-			if quote == nil then
-				text = text:gsub("%s+", " "):match("^%s*(.-)%s*$") :: string
-			end
-			out[#out + 1] = text
-			i = after
-		elseif quote then
-			if c == quote then
-				quote = nil
-			end
-			out[#out + 1] = c
-			i += 1
-		elseif c == "'" or c == '"' then
-			quote = c
-			out[#out + 1] = c
-			i += 1
-		else
-			out[#out + 1] = c
-			i += 1
-		end
-	end
-	return table.concat(out), nil
-end
-
--- Run a `bash` line. Split out from dispatch so the tokenizer and the command
--- table can be tested without going through tool_use plumbing.
---
--- /sh and the bash tool are the same call. There used to be a `readOnly` flag
--- that only /sh passed, refusing every command that mutates — on the reasoning
--- that a write should arrive through Claude carrying an undo recording. The
--- second half was never true: withUndo lives in the handlers, so a write from
--- either caller was recorded identically, and what the flag actually bought was
--- that changes stayed in the transcript. That is not worth taking the Delete key
--- off the person who owns the place, and Studio hands them one anyway.
 function Shell.run(self: any, line: string?): string
-	local output = runLine(self, line, 0)
-	return output
+	return (Runtime.run(self, line, runtimeApi()))
 end
 
--- The body of Shell.run, plus the recursion depth `$(...)` needs, and the exit
--- status it needs to refuse splicing the text of a failure.
-function runLine(self: any, line: string?, depth: number): (string, boolean)
-	local commandLine, stdin, heredocErr = extractHeredoc(line or "")
-	if heredocErr then
-		return "bash: " .. heredocErr, false
-	end
-
-	-- There is no stderr here, errors come back as ordinary output, so the
-	-- redirections that aim at it are noise rather than instructions, and the
-	-- right thing to do with noise is drop it. Without this, `2>&1` was not
-	-- merely inert: the tokenizer splits `&` into its own token, which the
-	-- metacharacter check then rejected as an attempt to background a command.
-	-- A trailing `2>&1` is one of the most reflexive things there is to type,
-	-- and it failed the whole line.
-	--
-	-- Runs after the heredoc has been lifted out, so a body containing `2>&1`
-	-- as ordinary source text is never touched.
-	commandLine = commandLine
-		:gsub("&>>", ">>")          -- both streams appended -> there is one stream
-		:gsub("&>", ">")
-		:gsub("%d?>&%-", " ")       -- 2>&-  close stderr
-		:gsub("%d?>&%d", " ")       -- 2>&1, 1>&2, >&2
-
-	local expanded, subErr = expandSubstitutions(self, commandLine, depth)
-	if not expanded then
-		return "bash: " .. tostring(subErr), false
-	end
-
-	local argv, tokenErr, quoted = tokenize(expanded)
-	if not argv then
-		return "bash: " .. tostring(tokenErr), false
-	end
-	for index, arg in ipairs(argv) do
-		if METACHARACTERS[arg] and not quoted[index] then
-			return string.format("bash: %s is not supported — nothing here runs in the " ..
-				"background, and there is no job table to put it in. `|` pipes, " ..
-				"`;` `&&` `||` chain, `>` writes and `<` reads.", arg), false
-		end
-	end
-
-	-- Carried on the array rather than as a parameter, so it survives runTokens
-	-- and runStatements without either of them having to know about it, and so a
-	-- loop body rebuilt by expandVar simply arrives without one. parseStatements
-	-- reads it off here and copies it per stage.
-	;(argv :: any).quoted = quoted
-	return runTokens(self, argv, stdin, true)
-end
 
 -- Self-test
 -- Fails loudly if the tokenizer loses track of a quote, a flag form stops
 -- parsing, a glob stops anchoring, or a handler throws on a bare invocation.
 -- The API-dump half of this now lives in Props.selfTest.
 function Shell.selfTest(probe: any): (boolean, string?)
+	local todoOk, todoErr = pcall(function()
+		return require(script.Parent:WaitForChild("ShellTests")).run(getmetatable(probe), Shell)
+	end)
+	if not todoOk then return false, "shell language/filesystem regressions: " .. tostring(todoErr) end
+	-- A self-test never changes the user's shell variables or functions. Detached
+	-- fixtures are their own test roots: find -exec receives the absolute paths
+	-- emitted for them and must resolve those paths back into the same fixture.
+	probe = setmetatable(table.clone(probe), getmetatable(probe))
+	probe.shellState = nil
+	local resolve = probe.resolve
+	probe.resolve = function(self, path)
+		if path and path:sub(1, 1) == "/" and path ~= "/" and self.cwd ~= game and not self.cwd:IsDescendantOf(game) then
+			local root = self.cwd
+			while root.Parent do root = root.Parent end
+			local localTarget = Fs.resolve(root, path:sub(2))
+			if localTarget then return localTarget end
+		end
+		return resolve(self, path)
+	end
 	-- Tokenizer: `want` is nil where the line must be rejected.
 	local cases: { { line: string, want: { string }? } } = {
 		{ line = "ls /Workspace", want = { "ls", "/Workspace" } },
@@ -7287,20 +6519,20 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		{ line = "wc -w Sample.luau", want = "5", why = "wc -w returns a number" },
 		-- The headline complaint: this used to report `no child named "3"`,
 		-- blaming the argument for the flag's absence.
-		{ line = "grep -A 1 beta Sample.luau", want = "/Sample\n  2: beta\n  3- gamma",
+		{ line = "grep -A 1 beta Sample.luau", want = "beta\ngamma",
 		  why = "grep -A trailing context" },
-		{ line = "grep -B1 delta Sample.luau", want = "/Sample\n  3- gamma\n  4: delta",
+		{ line = "grep -B1 delta Sample.luau", want = "gamma\ndelta",
 		  why = "grep -B, count glued to the flag" },
 		-- Bundled with a bool flag ahead of it. This used to be REFUSED outright
 		-- "give -A/-B/-C their own argument", because the old partition returned a
 		-- flag set with nowhere to put the 3, so `-nA3` was indistinguishable from
 		-- the three flags -n -A -3. A value letter ending its bundle fixes the
 		-- whole class, which is what the rest of the flag coverage rests on.
-		{ line = "grep -nA1 beta Sample.luau", want = "/Sample\n  2: beta\n  3- gamma",
+		{ line = "grep -nA1 beta Sample.luau", want = "2: beta\n3- gamma",
 		  why = "grep -A bundled behind another flag" },
 		{ line = "grep -C 1 gamma Sample.luau",
-		  want = "/Sample\n  2- beta\n  3: gamma\n  4- delta", why = "grep -C both sides" },
-		{ line = "grep Humanoid Cased.luau", want = "/Cased\n  1: Humanoid",
+		  want = "beta\ngamma\ndelta", why = "grep -C both sides" },
+		{ line = "grep Humanoid Cased.luau", want = "Humanoid",
 		  why = "grep is case-sensitive" },
 		{ line = "grep -ci Humanoid Cased.luau", want = "2", why = "grep -i" },
 		{ line = "grep -cE '[a-z]+' Sample.luau", want = "5", why = "-E is a real character class" },
@@ -7348,7 +6580,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		-- luaPattern has to refuse. -w/-x wrap, -o extracts, -m caps, -q is silent.
 		{ line = "grep -c -e alpha -e beta Sample.luau", want = "2",
 		  why = "repeated -e is a union" },
-		{ line = "grep -o -e mano Cased.luau", want = "/Cased\n  1: mano\n  2: mano",
+		{ line = "grep -o -e mano Cased.luau", want = "mano\nmano",
 		  why = "grep -o emits the match, not the line" },
 		{ line = "grep -cw Humanoid Cased.luau", want = "1", why = "grep -w is a whole word" },
 		{ line = "grep -cx humanoid Cased.luau", want = "1", why = "grep -x is the whole line" },
@@ -7356,7 +6588,11 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		{ line = "grep -c a Sample.luau", want = "4", why = "grep -c counts every match" },
 		{ line = "grep -c -m 1 a Sample.luau", want = "1", why = "grep -m caps matches per file" },
 		{ line = "grep -q alpha Sample.luau", want = "", why = "grep -q prints nothing" },
-		{ line = "grep -h alpha Sample.luau", want = "1: alpha", why = "grep -h drops the path" },
+		{ line = "grep -h alpha Sample.luau", want = "alpha", why = "grep -h drops the path" },
+		{ line = "grep -H alpha Sample.luau", want = "/Sample\n  alpha",
+		  why = "-H forces the path back on, and is not -n" },
+		{ line = "grep -n alpha Sample.luau", want = "1: alpha",
+		  why = "one file numbers its lines only under -n" },
 
 		-- Several statements concatenate, exactly as bash does, with nothing
 		-- announcing which produced what. The quoted `|` still reaches grep as one
@@ -7508,10 +6744,10 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		  why = "grep -c's zero is the answer, not a note about it" },
 		-- An empty listing is prose for the same reason a miss is. `ls empty | wc -l`
 		-- has to answer 0, not 1 for the sentence saying it is empty.
-		{ line = "ls Sample.luau | wc -l", want = "0",
-		  why = "an empty listing feeds the next stage nothing" },
-		{ line = "ls Sample.luau", want = "(empty) /Sample [ModuleScript]",
-		  why = "...and still names what it resolved when nothing is downstream" },
+		{ line = "ls Sample.luau | wc -l", want = "1",
+		  why = "an explicit file operand lists the file itself" },
+		{ line = "ls Sample.luau", want = "Sample.luau",
+		  why = "an explicit file is listed even without children" },
 
 		-- A quoted `>` is a one-character pattern. Read as a redirect it took the
 		-- path with it, so this searched for nothing and TRUNCATED the file it was
@@ -7612,8 +6848,8 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		  why = "the word list is globbed and the loop can feed a pipeline" },
 		-- `$ff` is a different variable, not `$f` with an `f` after it, which is
 		-- the one substitution mistake that silently mangles a path.
-		{ line = "for f in X; do echo ${f}.luau $ff; done", want = "X.luau $ff",
-		  why = "${f} substitutes and $ff is left alone" },
+		{ line = "for f in X; do echo ${f}.luau $ff; done", want = "X.luau",
+		  why = "${f} substitutes and the distinct, unset $ff expands empty" },
 		{ line = "for a in 1 2; do for b in x y; do echo $a$b; done; done",
 		  want = "1x\n1y\n2x\n2y", why = "loops nest, and the inner done is the inner loop's" },
 		-- A loop is a pipeline STAGE now, so it composes like any other command:
@@ -7703,7 +6939,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			-- argument has to say so rather than compare against nothing.
 			{ line = "find / -size zz", want = "%-size takes a number" },
 			-- Several sources need a real container, or all but the last are lost.
-			{ line = "mv Sample.luau Cased.luau Nope", want = "not an existing container" },
+			{ line = "mv Sample.luau Cased.luau Nope", want = "not an existing directory" },
 			-- An invalid pattern must be REFUSED at compile, before any line runs.
 			-- The old layer refused valid regex instead, which is the inverse.
 			{ line = 'grep -E "(ab" Sample.luau', want = "unmatched" },
@@ -7741,9 +6977,9 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			-- ones that take a single path say so rather than silently answering
 			-- for whichever match sorted first.
 			{ line = "stat -c %n Sample.luau", want = "Sample" },
-			{ line = "grep Humanoid *.luau", want = "matches %d+ paths" },
-			{ line = "cd -", want = "nothing to go back" },
-			{ line = "cd", want = "requires a path" },
+			{ line = "grep Humanoid *.luau", want = "Humanoid" },
+			{ line = "cd -", want = "OLDPWD not set" },
+			{ line = "HOME=; unset HOME; cd", want = "HOME is not set" },
 			-- A malformed test is an ERROR, not a "no". Otherwise `[ -f ]` with a
 			-- forgotten argument silently takes the else branch forever.
 			{ line = "[ -f Cased.luau", want = "closing" },
@@ -7767,23 +7003,23 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			-- the word rather than at the missing `done`.
 			{ line = "for f in a; do echo $f", want = "missing `done`" },
 			{ line = "for f in a done", want = "expected `do`" },
-			{ line = "while true; do echo hi; done", want = "zero times or forever" },
-			-- A `$(...)` whose command failed must not be spliced. Its output is an
-			-- error message, and splicing it is how `for f in $(grep ...)` comes to
-			-- iterate over the words of a refusal.
-			{ line = "echo $(cat /nope)", want = "failed" },
+			{ line = "while true; do :; done", want = "execution budget exceeded" },
+			-- A `$(...)` substitutes its STDOUT. The diagnostic is not spliced — that
+			-- is how `for f in $(grep ...)` would come to iterate over the words of a
+			-- refusal — but it is not fatal either: it goes to stderr and the line
+			-- carries on, which is what bash does and what makes `X=$(cmd)` safe for
+			-- a command that might warn.
+			{ line = "echo $(cat /nope)", want = "no child named" },
 			{ line = "echo $(echo a", want = "unclosed" },
-			-- `$(...)` is spliced before any loop runs, so a substitution reading the
-			-- loop variable would search for the literal text `$f` and answer about
-			-- that — a wrong answer shaped like a finding.
+			-- Substitutions in a body see each iteration's variable value.
 			{ line = "for f in a b; do echo $(grep -c $f Sample.luau); done",
-			  want = "has not bound it yet" },
+			  want = "^4\n1$" },
 			{ line = "grep zzz Cased.luau", want = "no matches" },
 			-- ...and a `$(...)` that found nothing must NOT be refused. bash
 			-- iterates zero times there; refusing turns every empty search into a
 			-- dead line, which is what reading the STATUS instead of the error
 			-- would have done once a miss started reporting one.
-			{ line = "echo $(grep zzz Cased.luau)", want = "^no matches" },
+			{ line = "echo $(grep zzz Cased.luau)", want = "^$" },
 			-- The case-sensitivity change has exactly one regression shape: a
 			-- search that used to work now finds nothing. It has to say so.
 			{ line = "grep HUMANOID Cased.luau", want = "grep %-i" },

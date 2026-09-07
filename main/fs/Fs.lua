@@ -431,28 +431,82 @@ Fs.instancePath = instancePath
 -- `.luau` form that `ls` prints. Shared with the slash fallback in resolve so
 -- both spellings work there too — two copies would be two lists to keep in
 -- sync, and the slash path would be the one that silently disagreed.
-local function findChild(parent: Instance, name: string): Instance?
-	local child = parent:FindFirstChild(name)
-	if child then
-		return child
+-- A DataModel lets siblings share a name; a filesystem does not, and every path
+-- in this shell is written as though it could not. `FindFirstChild` returned
+-- whichever duplicate came first, so a path was not a handle to one instance —
+-- it was a handle to whichever one the engine listed first, and two different
+-- commands could disagree about which.
+--
+-- That is data loss, not an inconvenience. With a ModuleScript and a Folder both
+-- literally named `target.luau`:
+--     find . -type d -name target.luau     matched the FOLDER
+--     find . -type d -name target.luau -exec rm -r {} \;
+--                                          destroyed the MODULESCRIPT
+-- and the transcript looked entirely correct. `rm -r target.luau` typed by hand
+-- did the same thing, so this was never an `-exec` defect — every command that
+-- takes a path had it, which is why the guard belongs here and not in any of
+-- them. cp/mv already refuse an ambiguous destination; this is the same rule at
+-- the other end.
+--
+-- ponytail: GetChildren allocates a table of N to check uniqueness, where
+-- FindFirstChild allocated nothing. Ceiling: one such table per resolved path
+-- segment, so a path INTO a 10k-child container costs a 10k-entry table per
+-- command. Only paid once a lookup has already succeeded, and `ls -R` no longer
+-- re-resolves at all. Upgrade path is an engine-side unique-name lookup, which
+-- does not exist today.
+local function findChild(parent: Instance, name: string): (Instance?, string?)
+	if not parent:FindFirstChild(name) then
+		-- Every suffix a Roblox developer might write is accepted, not just
+		-- `.luau`: `.lua`, and the `.server`/`.client` forms that name the script
+		-- class. All of them resolve to the same instance, because in the
+		-- DataModel the class is a property, not part of the name.
+		--
+		-- Only reached when no child carries the written name exactly, so an
+		-- instance literally called `foo.luau` still wins over a script `foo`.
+		local bare = Fs.stripScriptSuffix(name)
+		if not bare then
+			return nil
+		end
+		local script, scripts = nil, 0
+		for _, child in ipairs(parent:GetChildren()) do
+			if child.Name == bare and isScript(child) then
+				scripts += 1
+				script = script or child
+			end
+		end
+		if scripts > 1 then
+			return script, string.format("%q names %d scripts in %s",
+				name, scripts, instancePath(parent), bare)
+		end
+		return script
 	end
-	-- Every suffix a Roblox developer might write is accepted, not just `.luau`:
-	-- `.lua`, and the `.server`/`.client` forms that name the script class. All
-	-- of them resolve to the same instance, because in the DataModel the class
-	-- is a property, not part of the name.
-	local bare = Fs.stripScriptSuffix(name)
-	local stripped = bare and parent:FindFirstChild(bare)
-	if stripped and isScript(stripped) then
-		return stripped
+	local exact, count = nil, 0
+	for _, child in ipairs(parent:GetChildren()) do
+		if child.Name == name then
+			count += 1
+			exact = exact or child
+		end
 	end
-	return nil
+	if count > 1 then
+		return exact, string.format("%q names %d siblings in %s",
+			name, count, instancePath(parent))
+	end
+	return exact
 end
 
 -- Resolve `path` relative to `base`. Absolute paths ignore `base` entirely.
-function Fs.resolve(base: Instance, path: string?): (Instance?, string?)
+-- Third return: the path resolved, but a component of it named more than one
+-- instance and this is the first such component. A DataModel allows duplicate
+-- sibling names where a filesystem does not, so a path is not always a unique
+-- handle. Reading follows the first match, exactly as before; MUTATING callers
+-- refuse on this note, because that is where picking the wrong one destroys
+-- something. Refusing on every lookup instead made ~25% of a stock place
+-- unreachable for reading, which bought nothing -- a read cannot corrupt.
+function Fs.resolve(base: Instance, path: string?): (Instance?, string?, string?)
 	if not path or path == "" or path == "." then
 		return base, nil
 	end
+	local duplicate: string? = nil
 
 	local start: Instance
 	local segments: { string }
@@ -485,7 +539,8 @@ function Fs.resolve(base: Instance, path: string?): (Instance?, string?)
 			-- files, then feeds those names straight back to cat/cd/head/grep.
 			-- Fixing this in resolve rather than in cat covers every command at
 			-- once. Exact name wins: an instance may genuinely be named "foo.luau".
-			local child = findChild(current, seg)
+			local child, ambiguous = findChild(current, seg)
+			duplicate = duplicate or ambiguous
 			-- `workspace` is a real Luau global for game.Workspace, so a model
 			-- writes it lowercase and is not wrong to, the engine accepts it
 			-- everywhere else. Services generally: their names are fixed and
@@ -529,8 +584,9 @@ function Fs.resolve(base: Instance, path: string?): (Instance?, string?)
 			-- place ever manages to be that ambiguous.
 			if not child then
 				for j = #segments, i + 1, -1 do
-					local joined = findChild(current, table.concat(segments, "/", i, j))
+					local joined, joinedAmbiguous = findChild(current, table.concat(segments, "/", i, j))
 					if joined then
+						duplicate = duplicate or joinedAmbiguous
 						child = joined
 						i = j
 						break
@@ -545,7 +601,7 @@ function Fs.resolve(base: Instance, path: string?): (Instance?, string?)
 		i += 1
 	end
 
-	return current, nil
+	return current, nil, duplicate
 end
 
 -- Rojo's suffix convention, longest first so `.server.luau` is not mistaken for
@@ -599,14 +655,14 @@ end
 -- nothing here is ever named `Main.luau`, so a dot that survived into a Name
 -- came from a file that was not a script in the first place.
 function Fs.carriesExtension(name: string): boolean
-	return name:find("%.[%w]+$") ~= nil and stripSuffix(name) == nil
+	return name:find("%.[^./]+$") ~= nil and not name:match("%.luau?$")
 end
 
 -- What `ls` shows for an instance. Scripts get a `.luau` so a model reads them
 -- as files; everything else is its own name, and so is a script that arrived
 -- carrying one — `README.md.luau` would be a name nothing can open.
 function Fs.displayName(inst: Instance): string
-	if isScript(inst) and not Fs.carriesExtension(inst.Name) then
+	if isScript(inst) and not Fs.carriesExtension(inst.Name) and not inst.Name:match("%.luau?$") then
 		return inst.Name .. ".luau"
 	end
 	return inst.Name
@@ -952,9 +1008,10 @@ end
 -- the user's Ctrl+Z does nothing and a bad edit is unrecoverable, that is data
 -- loss, not a rough edge, so it is not optional.
 function Fs.withUndo<T>(label: string, action: () -> T): (T?, string?)
-	-- TryBeginRecording returns nil if a recording is already open (another
-	-- plugin, or a nested call). Proceed anyway: losing undo granularity beats
-	-- refusing the edit, and Studio still has the outer recording.
+	-- One recording per PLUGIN, not per Studio: another plugin's recording does
+	-- not block ours, so a nil here means a nested call of our own. Proceed
+	-- anyway -- losing undo granularity beats refusing the edit, and the outer
+	-- recording still captures the change.
 	local recording = ChangeHistoryService:TryBeginRecording(label, label)
 	local ok, result = pcall(action)
 	if recording then

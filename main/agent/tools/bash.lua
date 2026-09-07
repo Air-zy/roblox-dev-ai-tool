@@ -12,8 +12,8 @@
 -- exactly what Rojo does. "In-memory" does. A model that wants to know what the
 -- objects are gets it from `ls /`, pulled, not pushed.
 --
--- "with network" is there to undo what that same clause costs. "Real bash shell"
--- implies no sandbox; "in-memory vfs" implies one, and that reading takes curl,
+-- "with network" is there to undo what that same clause costs. "In-memory vfs"
+-- can suggest an isolated sandbox, and that reading takes curl,
 -- wget and git off the table before any of them is tried. The failure is silent —
 -- a model that has concluded there is no network never calls one and never sees
 -- a refusal — so it is the one capability worth stating rather than leaving to

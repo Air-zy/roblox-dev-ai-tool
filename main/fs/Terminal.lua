@@ -62,8 +62,20 @@ function Terminal.new(startInstance: Instance?)
 end
 
 -- The cwd is the only per-terminal state; path resolution itself is stateless.
-function Terminal:resolve(path: string?): (Instance?, string?)
+function Terminal:resolve(path: string?): (Instance?, string?, string?)
 	return Fs.resolve(self.cwd, path)
+end
+
+-- The destructive boundary. Every method that changes the DataModel routes its
+-- path through here, so an ambiguous name is refused once rather than in each
+-- of them -- and reading is left alone.
+local function unique(self: any, path: string?, verb: string): (Instance?, string?, boolean)
+	local inst, err, duplicate = self:resolve(path)
+	if inst and duplicate then
+		return nil, string.format("refusing to %s an ambiguous path: %s. `ls -i` and " ..
+			"`find -inum` tell duplicates apart", verb, duplicate), true
+	end
+	return inst, err, false
 end
 
 function Terminal:current(): Instance
@@ -79,10 +91,6 @@ function Terminal:cd(path: string?): (boolean, string?)
 	if not target then
 		return false, err or "resolve failed"
 	end
-	-- Where `cd -` goes back to. Tracked HERE rather than in the handler so every
-	-- route into a directory change agrees on what "previous" means — and only on
-	-- a cd that succeeded, since a failed one never moved.
-	self.previous = self.cwd
 	self.cwd = target
 	return true, nil
 end
@@ -103,6 +111,8 @@ local MAX_RESULTS = 100
 -- Claude Code caps reads for the same reason. Paging is reachable now that
 -- pipes exist: `head -n 1200 f | tail -n 200` gets an arbitrary window.
 local MAX_CAT_LINES = 1000
+-- Higher than MAX_LIST: a tree is structural, and the shape is most of its value.
+local MAX_TREE = 1000
 
 -- Commands
 
@@ -356,14 +366,22 @@ export type GrepMatch = { path: string, line: number, text: string, match: boole
 -- same scripts, via Fs.matchesName.
 export type GrepScope = { include: ((string) -> boolean)?, exclude: ((string) -> boolean)? }
 
-function Terminal:grep(programs: { any }?, path: string?, opts: Fs.GrepOpts?,
+function Terminal:grep(programs: { any }?, path: (string | { string })?, opts: Fs.GrepOpts?,
 	scopeFilter: GrepScope?): ({ GrepMatch }?, string?)
 	if not programs or #programs == 0 then
 		return nil, "grep requires a pattern"
 	end
-	local target, err = self:resolve(path)
-	if not target then
-		return nil, err
+	local roots = {}
+	if type(path) == "table" then
+		for _, name in ipairs(path) do
+			local target, err = self:resolve(name)
+			if not target then return nil, err end
+			roots[#roots + 1] = target
+		end
+	else
+		local target, err = self:resolve(path)
+		if not target then return nil, err end
+		roots[1] = target
 	end
 	local o: Fs.GrepOpts = opts or {}
 
@@ -379,8 +397,14 @@ function Terminal:grep(programs: { any }?, path: string?, opts: Fs.GrepOpts?,
 	-- Include the target: `grep foo Main.luau` means search Main, and walking
 	-- only descendants made that silently return "no matches". GetDescendants
 	-- hands back a fresh table, so prepending to it is safe.
-	local scope = target:GetDescendants()
-	table.insert(scope, 1, target)
+	local scope, seen, searched = {}, {}, {}
+	for _, target in ipairs(roots) do
+		local branch = target:GetDescendants()
+		table.insert(branch, 1, target)
+		for _, inst in ipairs(branch) do
+			if not seen[inst] then scope[#scope + 1] = inst; seen[inst] = true end
+		end
+	end
 	-- One pcall around the whole walk rather than one per line. The only thing
 	-- that throws in here is the engine's step budget, and when a pattern is too
 	-- expensive it is too expensive for every line, so the walk is abandoned and
@@ -399,6 +423,7 @@ function Terminal:grep(programs: { any }?, path: string?, opts: Fs.GrepOpts?,
 				source = nil
 			end
 			if source then
+				searched[#searched + 1] = instancePath(inst)
 				-- The cap counts MATCHES, not emitted lines, and is applied before
 				-- the context window opens, otherwise `-C 5` would quietly return
 				-- six times the budget and evict the context that made the search
@@ -446,6 +471,7 @@ function Terminal:grep(programs: { any }?, path: string?, opts: Fs.GrepOpts?,
 		tagged.skipped = skipped
 	end
 	tagged.counts = counts
+	tagged.searched = searched
 	return results, nil
 end
 
@@ -463,7 +489,12 @@ function Terminal:tree(path: string?, depth: number?, opts: TreeOpts?): (string?
 	if not target then
 		return nil, err
 	end
-	local maxDepth = depth or 2
+	-- GNU tree is unlimited by default. Stopping at two levels with no marker
+	-- rendered a populated directory as empty -- the one cap in this shell that
+	-- did not name what it dropped (see BASH_FIDELITY section 5). Unlimited now,
+	-- with a row cap that announces itself instead of a depth cap that did not.
+	local maxDepth = depth or math.huge
+	local skipped = 0
 	local o = opts or {}
 	-- -P filters what is PRINTED, not what is descended into: a matching entry
 	-- three levels down is unreachable if the branches above it are pruned.
@@ -506,6 +537,10 @@ function Terminal:tree(path: string?, depth: number?, opts: TreeOpts?): (string?
 					and (Fs.modeBit(child, "x") and "*" or "")
 					or "/"
 			end
+			if #lines >= MAX_TREE then
+				skipped += 1
+				continue
+			end
 			table.insert(lines, prefix .. branch .. label .. "  [" .. child.ClassName .. "]")
 			local nextPrefix = prefix .. (last and "    " or "│   ")
 			walk(child, nextPrefix, d + 1)
@@ -514,7 +549,12 @@ function Terminal:tree(path: string?, depth: number?, opts: TreeOpts?): (string?
 
 	table.insert(lines, instancePath(target))
 	walk(target, "", 1)
-	return table.concat(lines, "\n"), nil
+	local text = table.concat(lines, "\n")
+	if skipped > 0 then
+		return text, nil, string.format(
+			"… %d more entries (narrow it with `tree -L <depth>` or a subdirectory)", skipped)
+	end
+	return text, nil
 end
 
 -- Write commands
@@ -527,7 +567,7 @@ function Terminal:create(className: string, name: string?, parentPath: string?):
 	if not name or name == "" then
 		return nil, "create requires a name"
 	end
-	local parent, err = self:resolve(parentPath)
+	local parent, err = unique(self, parentPath, "create in")
 	if not parent then return nil, err end
 
 	local existing = parent:FindFirstChild(name)
@@ -614,9 +654,9 @@ function Terminal:write(path: string?, content: string?): (string?, string?)
 	if content == nil then
 		return nil, "write requires content"
 	end
-	local target, err = self:resolve(path)
+	local target, err, refused = unique(self, path, "write")
 	local created = false
-	if not target and path and path ~= "" then
+	if not target and not refused and path and path ~= "" then
 		target, err = self:ensureScript(path)
 		created = target ~= nil
 	end
@@ -662,7 +702,7 @@ function Terminal:multiedit(path: string?, edits: { any }?): (string?, string?)
 	if type(edits) ~= "table" or #edits == 0 then
 		return nil, "edits must be a non-empty array of { old_string, new_string }"
 	end
-	local target, err = self:resolve(path)
+	local target, err = unique(self, path, "edit")
 	if not target then return nil, err end
 
 	local source = getSource(target)
@@ -720,111 +760,229 @@ function Terminal:edit(path: string?, old: string?, new: string?): (string?, str
 	return self:multiedit(path, { { old_string = old, new_string = new } })
 end
 
--- Resolve a cp/mv destination.
---
--- `cp a b` in a shell means "copy a TO b", b is a new name unless it is an
--- existing directory. This used to resolve the destination as a parent and
--- nothing else, so the single most common form of both commands failed with
--- "no child named b", and there was no way to copy-and-rename in one step at
--- all. Now: an existing container is still a container, and anything else is
--- read as parent + new name.
-local function resolveDestination(self: any, destination: string, name: string?): (Instance?, string?, string?)
-	local existing = self:resolve(destination)
-	if existing then
-		return existing, name, nil
+-- Resolve the final entry before changing anything. Scripts are files even
+-- though Roblox permits children beneath them; -T names an entry directly.
+local function copyChild(parent: Instance, source: Instance): (Instance?, string?)
+	local found = nil
+	for _, child in ipairs(parent:GetChildren()) do
+		if child.Name == source.Name or displayName(child) == displayName(source) then
+			if found then return nil, "ambiguous destination, duplicate siblings named " .. source.Name end
+			found = child
+		end
 	end
-	local parentPath, leaf = splitPath(destination)
-	local parent, parentErr = self:resolve(parentPath)
-	if not parent then
-		return nil, nil, parentErr
-	end
-	-- `cp Main.luau Backup.luau` means an instance called Backup, not one called
-	-- "Backup.luau". The suffix is how `ls` renders a script class, not part of
-	-- any name, so carrying it into a new instance would create something that
-	-- prints as `Backup.luau.luau` the next time it is listed.
-	return parent, name or Fs.stripScriptSuffix(leaf) or leaf, nil
+	return found, nil
 end
 
--- rm: destroy an instance.
-function Terminal:remove(path: string?): (string?, string?)
-	if not path or path == "" then
-		return nil, "rm requires a path"
+local function destinationEntry(self: any, source: Instance, destination: string,
+	opts: any): (Instance?, string?, Instance?, string?)
+	local existing = self:resolve(destination)
+	if existing and not isScript(existing) and not opts.noTargetDirectory then
+		local child, err = copyChild(existing, source)
+		return existing, source.Name, child, err
 	end
-	local target, err = self:resolve(path)
-	if not target then return nil, err end
+	if destination:sub(-1) == "/" and (not existing or isScript(existing)) then
+		return nil, nil, nil, "destination is not a directory: " .. destination
+	end
+	if existing then
+		return existing.Parent, existing.Name, existing, nil
+	end
+	local parentPath, leaf = splitPath(destination)
+	if leaf == "" or leaf == "." or leaf == ".." then
+		return nil, nil, nil, "invalid destination: " .. destination
+	end
+	local parent, err = self:resolve(parentPath)
+	return parent, Fs.stripScriptSuffix(leaf) or leaf, nil, err
+end
 
+-- rm destroys the entry itself, irrespective of whether it also has children.
+function Terminal:remove(path: string?): (string?, string?)
+	if not path or path == "" then return nil, "rm requires a path" end
+	local target, err = unique(self, path, "remove")
+	if not target then return nil, err end
 	local protected = guardProtected(target)
 	if protected then return nil, protected end
-
-	local fullPath = instancePath(target)
-	local descendants = #target:GetDescendants()
+	if self.cwd == target or self.cwd:IsDescendantOf(target) then
+		return nil, "cd out of " .. instancePath(target) .. " first, rm destroys it"
+	end
+	-- Unparented rather than Destroy()d: Destroy locks the Parent property, and
+	-- undo history is a stream of property changes, so the record could not be
+	-- reapplied -- Studio warned "the Parent property is locked" and restored
+	-- nothing, then the NEXT undo reverted something older instead. The subtree
+	-- stays alive on the history entry, which is what makes the delete
+	-- reversible; it is collected when the entry falls off the stack.
+	local fullPath, descendants = instancePath(target), #target:GetDescendants()
 	local _, removeErr = withUndo("agent: rm " .. target.Name, function()
-		target:Destroy()
+		target.Parent = nil
 	end)
 	if removeErr then return nil, removeErr end
 	return string.format("removed %s (%d descendants)", fullPath, descendants), nil
 end
 
--- mv: reparent, and optionally rename.
-function Terminal:move(path: string?, destination: string?, name: string?): (string?, string?)
+-- Copy plans are validated as a whole before the undo recording starts. Merging
+-- directories must never create duplicate siblings or remove unrelated entries.
+local function transfer(self: any, moving: boolean, path: string?, destination: string?,
+	opts: any): (string?, string?)
+	local cmd = moving and "mv" or "cp"
 	if not path or path == "" or not destination or destination == "" then
-		return nil, "mv requires a source path and a destination path"
+		return nil, cmd .. " requires a source path and a destination path"
 	end
-	local target, err = self:resolve(path)
-	if not target then return nil, err end
-	local parent, parentErr
-	parent, name, parentErr = resolveDestination(self, destination, name)
-	if not parent then return nil, parentErr end
-
-	local protected = guardProtected(target)
-	if protected then return nil, protected end
-	if parent == target or parent:IsDescendantOf(target) then
-		return nil, "refusing to move an instance into itself"
+	local source, err = unique(self, path, cmd)
+	if not source then return nil, err end
+	if source == game then return nil, "refusing to " .. cmd .. " /" end
+	if moving then
+		local protected = guardProtected(source)
+		if protected then return nil, protected end
+	elseif not isScript(source) and not opts.recursive then
+		return nil, instancePath(source) .. " is a directory — use cp -r"
+	end
+	local parent, name, existing, destErr = destinationEntry(self, source, destination, opts)
+	if destErr then return nil, destErr end
+	if not parent then return nil, "refusing to replace /" end
+	if parent == game then return nil, "cannot create or replace a service at /" end
+	if parent == source or parent:IsDescendantOf(source) then
+		return nil, "refusing to " .. cmd .. " an instance into itself"
 	end
 
-	local _, moveErr = withUndo("agent: mv " .. target.Name, function()
-		target.Parent = parent
-		if name and name ~= "" then
-			target.Name = name
+	local operations, claims = {}, {}
+	local function plan(from: Instance, into: Instance, leaf: string, old: Instance?): string?
+		-- Duplicate names may already exist in a place. Refuse an ambiguous write
+		-- instead of choosing whichever FindFirstChild happens to return.
+		local matches = 0
+		for _, child in ipairs(into:GetChildren()) do
+			if child.Name == leaf or displayName(child) == displayName(from) and child == old then
+				matches += 1
+			end
+		end
+		if matches > 1 then return "ambiguous destination, duplicate siblings named " .. leaf end
+		claims[into] = claims[into] or {}
+		if claims[into][leaf] then return "ambiguous source, duplicate siblings named " .. leaf end
+		claims[into][leaf] = true
+		if old then
+			if old == from then return "source and destination are the same file: " .. instancePath(from) end
+			if isScript(old) ~= isScript(from) then
+				return "cannot overwrite a " .. (isScript(old) and "file with a directory" or "directory with a file")
+			end
+			if opts.noClobber and (isScript(old) or moving) then return nil end
+			local protected = guardProtected(old)
+			if protected then return protected end
+			if old == self.cwd or self.cwd:IsDescendantOf(old) then
+				return "cd out of " .. instancePath(old) .. " first, " .. cmd .. " would replace it"
+			end
+			if from:IsDescendantOf(old) then return "refusing to overwrite an ancestor of the source" end
+			if not moving then
+				if isScript(from) then
+					-- Overwriting a file changes its contents, not its class, identity,
+					-- or unrelated children. In particular, copying a Script onto a
+					-- ModuleScript must not turn the destination into a running Script.
+					operations[#operations + 1] = { from = from, into = into, name = leaf, old = old,
+						text = getSource(from), previous = getSource(old) }
+				end
+				for _, child in ipairs(from:GetChildren()) do
+					local previous, lookupErr = copyChild(old, child)
+					if lookupErr then return lookupErr end
+					local childErr = plan(child, old, child.Name, previous)
+					if childErr then return childErr end
+				end
+				return nil
+			end
+			if moving and not isScript(old) and #old:GetChildren() > 0 then
+				return "destination directory is not empty: " .. instancePath(old)
+			end
+		end
+		if not moving then
+			-- Clone skips non-Archivable descendants, which would silently produce
+			-- an incomplete package. Check the entire branch, not only its root.
+			local branch = { from }
+			for _, child in ipairs(from:GetDescendants()) do branch[#branch + 1] = child end
+			for _, item in ipairs(branch) do
+				if not item.Archivable then return instancePath(item) .. " is not Archivable and cannot be cloned" end
+				local names, rawNames = {}, {}
+				for _, child in ipairs(item:GetChildren()) do
+					local key = displayName(child)
+					if names[key] or rawNames[child.Name] then return "ambiguous source, duplicate children named " .. key end
+					names[key], rawNames[child.Name] = true, true
+				end
+			end
+		end
+		operations[#operations + 1] = { from = from, into = into, name = leaf, old = old }
+		return nil
+	end
+	local planErr = plan(source, parent, name :: string, existing)
+	if planErr then return nil, planErr end
+	if #operations == 0 then return "", nil end
+
+	-- Carry editor buffers for every copied script. Child names were validated
+	-- above, so lookup is unambiguous and does not assume Clone preserves order.
+	local function carryBuffers(from: Instance, clone: Instance)
+		local sourceText = getSource(from)
+		if sourceText and getSource(clone) ~= sourceText then
+			local writeErr = Fs.writeSource(clone, sourceText)
+			if writeErr then error(writeErr, 0) end
+		end
+		for _, child in ipairs(from:GetChildren()) do
+			local peer = clone:FindFirstChild(child.Name)
+			if not peer then error("Clone omitted " .. child.Name, 0) end
+			carryBuffers(child, peer)
+		end
+	end
+	local _, transferErr = withUndo("agent: " .. cmd .. " " .. source.Name, function()
+		-- Prepare every clone before replacing an existing entry. On a failed
+		-- source write, originals still exist and the temporary copies are removed.
+		local prepared = {}
+		local preparedOk, prepareErr = pcall(function()
+			if not moving then
+				for _, op in ipairs(operations) do
+					if op.text ~= nil then continue end
+					local clone = op.from:Clone()
+					if not clone then error("Clone returned no instance", 0) end
+					prepared[#prepared + 1] = clone
+					op.clone = clone
+					clone.Name = op.name
+					clone.Parent = op.into
+					carryBuffers(op.from, clone)
+				end
+				for _, op in ipairs(operations) do
+					if op.text ~= nil then
+						op.written = true
+						local writeErr = Fs.writeSource(op.old, op.text)
+						if writeErr then error(writeErr, 0) end
+						Fs.touch(op.old)
+					end
+				end
+			end
+		end)
+		if not preparedOk then
+			for _, op in ipairs(operations) do
+				if op.written then
+					local restoreErr = Fs.writeSource(op.old, op.previous)
+					if restoreErr then prepareErr = tostring(prepareErr) .. "; restoring " .. op.name .. ": " .. restoreErr end
+				end
+			end
+			for _, clone in ipairs(prepared) do clone:Destroy() end
+			error(prepareErr, 0)
+		end
+		for _, op in ipairs(operations) do
+			if moving then
+				op.from.Name = op.name
+				op.from.Parent = op.into
+			end
+			-- Unparented, not destroyed, for the same reason rm is: overwriting a
+			-- destination has to be reversible too.
+			if op.old and op.text == nil then op.old.Parent = nil end
 		end
 	end)
-	if moveErr then return nil, moveErr end
-	return string.format("moved to %s", instancePath(target)), nil
+	if transferErr then return nil, transferErr end
+	local last = operations[#operations]
+	local result = moving and source or last.clone or last.old
+	return (moving and "moved to " or "copied to ") .. instancePath(result), nil
 end
 
--- cp: clone an instance (with its descendants) under a new parent.
-function Terminal:copy(path: string?, destination: string?, name: string?): (string?, string?)
-	if not path or path == "" or not destination or destination == "" then
-		return nil, "cp requires a source path and a destination path"
-	end
-	local target, err = self:resolve(path)
-	if not target then return nil, err end
-	local parent, parentErr
-	parent, name, parentErr = resolveDestination(self, destination, name)
-	if not parent then return nil, parentErr end
+function Terminal:move(path: string?, destination: string?, opts: any?): (string?, string?)
+	return transfer(self, true, path, destination, opts or {})
+end
 
-	if target == game then
-		return nil, "refusing to clone /"
-	end
-	if parent == target or parent:IsDescendantOf(target) then
-		return nil, "refusing to copy an instance into itself"
-	end
-	-- Clone() returns nil rather than throwing when Archivable is false, so
-	-- without this the failure surfaces as a null-index three lines later.
-	if not target.Archivable then
-		return nil, string.format("%s is not Archivable and cannot be cloned", instancePath(target))
-	end
-
-	local copied, copyErr = withUndo("agent: cp " .. target.Name, function()
-		local clone = target:Clone()
-		if name and name ~= "" then
-			clone.Name = name
-		end
-		clone.Parent = parent
-		return clone
-	end)
-	if copyErr then return nil, copyErr end
-	return string.format("copied to %s", instancePath(copied :: Instance)), nil
+function Terminal:copy(path: string?, destination: string?, opts: any?): (string?, string?)
+	return transfer(self, false, path, destination, opts or {})
 end
 
 -- reload: swap a module for a fresh clone of itself.
