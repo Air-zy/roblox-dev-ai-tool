@@ -5,24 +5,28 @@ the live DataModel.
 
 ## Why I made this
 
-- don't want to boil the oceans for nothing, so the toolset has to use as few tokens as possible.
 - power of a VS Code agent + Rojo without the Rojo setup.
 - whole thing to live in a Studio plugin, without an external editor or bridge.
+- don't want to boil the oceans for nothing, so the toolset has to use as few tokens as possible.
+- general tool for ease of use
 
 ## Methodology
 
-Most Roblox AI workflows put Studio after an agent, editor, server, and bridge.
-This plugin makes the DataModel the coding environment: `/Workspace` is the live
-Workspace and writes enter Studio's undo history immediately.
+Unlike bridge-heavy workflows, this plugin treats the live DataModel as the
+coding environment: `/Workspace` is Workspace, and writes support Studio undo.
 
-The entire agent and its seven tools run in one plugin. The narrow interface is
-deliberate: [SWE-agent](https://arxiv.org/abs/2405.15793) resolved 18.0% of its
-benchmark with a focused 100-line view, versus 12.7% when showing whole files.
-Models already know how to compose terminal commands.
+One plugin holds the agent and seven tools. [SWE-agent](https://arxiv.org/abs/2405.15793)
+scored 18.0% with focused 100-line views versus 12.7% with whole files, supporting
+a small, composable interface.
+
+### Why Bash
+
+One Bash tool replaces a custom tool for every operation. Models already know
+Linux shell commands, keeping the schema small and complex workflows composable.
 
 ## The blunt comparison
 
-| Workflow | Why it wins | Why people bounce |
+| Workflow | Pros | Cons |
 | --- | --- | --- |
 | **This project** | One plugin, the live DataModel, and direct Claude/ChatGPT subscription login: plan limits, no API-token or wrapper bill. | It cannot see the viewport or simulate a player. Correct code can still produce a bad experience. |
 | [**VS Code agent + Rojo**](https://rojo.space/docs/v7/) | Real Git, LSPs, packages, tests, and CI. | Studio caught up. Some developers now say [start without Rojo](https://www.reddit.com/r/robloxgamedev/comments/1ut6q8l/completely_new_to_roblox_game_dev/); existing places and Studio-built models reveal the painful [file-first bargain](https://www.reddit.com/r/robloxgamedev/comments/1uvxlj0/rojo_with_roblox_studio/). |
@@ -39,17 +43,18 @@ project puts the Claude/ChatGPT subscription-backed agent inside Studio itself.
 Rojo wins when the repository owns the game. Studio MCP and Forge win when the
 agent must see or play it. This project wins when you want to stay in Studio.
 
-## Build with Rojo
+## Install
 
-Requires [Rojo 7.5 or newer](https://rojo.space/docs/v7/getting-started/installation/):
+Get the ready-to-install plugin from [Releases](https://github.com/Air-zy/robloxStudioAIHarness/releases/latest),
+or build it from source with [Rojo 7.5 or newer](https://rojo.space/docs/v7/getting-started/installation/):
 
 ```sh
 rojo build default.project.json --output ClaudeCodeForRoblox.rbxmx
 ```
 
-Copy the result into **Plugins > Plugins Folder**, restart Studio, and enable
-**Game Settings > Security > Allow HTTP Requests**. Open the plugin and run
-`/login`; use `/provider` to switch providers and `/help` for commands.
+Move the `.rbxmx` to **Plugins > Plugins Folder**, restart Studio, and enable
+**Allow HTTP Requests**. Open it and run `/login`; `/provider` switches providers
+and `/help` lists commands.
 
 ## Documentation
 

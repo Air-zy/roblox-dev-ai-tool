@@ -1,6 +1,3 @@
-### Why linux bash vs windows powershell
-- TODO answer this
-
 ### SWE-agent shows that tool/interface design alone can materially change coding-agent quality:
 
 *Note: these results use old models, so exact effect sizes may differ on current models...*
