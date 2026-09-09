@@ -35,6 +35,7 @@ local type = type
 local typeof = typeof
 local pcall = pcall
 local Instance = Instance
+local coroutine = coroutine
 
 local Fs    = require(script.Parent:WaitForChild("Fs"))
 local Props = require(script.Parent.Parent:WaitForChild("studio"):WaitForChild("Props"))
@@ -649,6 +650,98 @@ local function withSyntax(message: string, source: string, name: string?): strin
 	return bad and (message .. "\nsyntax error:\n" .. bad) or message
 end
 
+
+-- Source capture
+-- What one tool call changed, for the console to draw a diff from. Records are
+-- collected only while a scope is open, and `Tools.dispatch` opens exactly one
+-- around each tool.
+--
+-- Keyed by coroutine, which is load-bearing rather than tidy. ONE Terminal is
+-- shared by the agent and the input row, and shell mode is deliberately exempt
+-- from the busy gate — see the Enter handler in main.lua — so a `sed -i` typed
+-- while the agent is working runs on this same object. A single flag or a plain
+-- field would charge that line to whichever tool happened to be in flight.
+-- Fs.writeSource yields on an open document, and a yield suspends a coroutine
+-- without changing its identity, so the key still matches when the write
+-- resumes.
+export type SourceChange = {
+	inst: Instance,
+	path: string,
+	name: string,
+	before: string,
+	after: string,
+	kind: string,   -- "created" | "modified" | "deleted"
+}
+
+local captures: { [thread]: { SourceChange } } = {}
+
+function Terminal:beginCapture()
+	captures[coroutine.running()] = {}
+end
+
+-- The records, and the scope closed. Closing is unconditional: a scope left open
+-- by a tool that threw would collect the NEXT call's writes into this one.
+function Terminal:endCapture(): { SourceChange }
+	local running = coroutine.running()
+	local found = captures[running] or {}
+	captures[running] = nil
+	return found
+end
+
+-- Whether this coroutine is inside a scope.
+--
+-- Worth asking before collecting anything: working out what a delete or a move
+-- is about to destroy means reading every script in the subtree, and each read
+-- can be an editor round-trip. Outside a tool call nothing will ever look at the
+-- result, and `/sh rm -r` on a large folder should not pay for a diff nobody
+-- asked for.
+local function capturing(): boolean
+	return captures[coroutine.running()] ~= nil
+end
+
+-- One applied source change, when this coroutine is inside a scope. A write that
+-- changed nothing is not recorded: an empty diff is not worth drawing, and the
+-- write's own result already says what it did.
+-- One applied source change, when this coroutine is inside a scope.
+--
+-- `path` and `name` are passed rather than read off `inst`, because a deletion
+-- has to be recorded AFTER it succeeds — by which point the instance is
+-- unparented and `instancePath` no longer describes where it was.
+--
+-- A write that changed nothing is not recorded: an empty diff is not worth
+-- drawing, and the write's own result already says what it did. Creation and
+-- deletion are recorded whatever the text, since an empty new script is still a
+-- new script.
+local function captureAt(inst: Instance, path: string, name: string,
+	before: string, after: string, kind: string)
+	local found = captures[coroutine.running()]
+	if not found or (before == after and kind == "modified") then
+		return
+	end
+	for _, entry in ipairs(found) do
+		if entry.inst == inst then
+			-- First before, latest after. Several edits to one script inside one
+			-- call are one diff of that call, not a replay of its intermediate
+			-- states.
+			entry.after = after
+			-- A script created and then edited in the same call is still a
+			-- creation; one created and then removed is a deletion. Anything
+			-- else keeps the kind it was first seen as.
+			if kind == "deleted" then
+				entry.kind = kind
+			end
+			return
+		end
+	end
+	found[#found + 1] = {
+		inst = inst, path = path, name = name,
+		before = before, after = after, kind = kind,
+	}
+end
+
+local function capture(inst: Instance, before: string, after: string, kind: string)
+	captureAt(inst, instancePath(inst), displayName(inst), before, after, kind)
+end
 -- write: replace a script's entire source, creating the script if it is missing.
 function Terminal:write(path: string?, content: string?): (string?, string?)
 	if content == nil then
@@ -665,6 +758,10 @@ function Terminal:write(path: string?, content: string?): (string?, string?)
 		return nil, "not a script: " .. instancePath(target)
 	end
 
+	-- Read before the write, not after: this is the only copy of the old text
+	-- once UpdateSourceAsync lands.
+	local before = getSource(target) or ""
+
 	-- withUndo stays wrapped around the editor path even though the editor keeps
 	-- its own undo stack. It fails SAFE either way: if UpdateSourceAsync already
 	-- registers a waypoint, TryBeginRecording returns nil for the nested call and
@@ -678,6 +775,8 @@ function Terminal:write(path: string?, content: string?): (string?, string?)
 		end
 	end)
 	if writeErr then return nil, writeErr end
+	capture(target, before, getSource(target) or Fs.normaliseNewlines(content :: string),
+		created and "created" or "modified")
 	-- Changing the source moves nothing, so DescendantAdded never fires for it
 	-- and the observed-mtime journal would miss the most common edit there is.
 	Fs.touch(target)
@@ -749,6 +848,7 @@ function Terminal:multiedit(path: string?, edits: { any }?): (string?, string?)
 		end
 	end)
 	if writeErr then return nil, writeErr end
+	capture(target, source, getSource(target) or updated, "modified")
 	Fs.touch(target)
 
 	return withSyntax(string.format("edited %s (%d changes, -%d/+%d lines)",
@@ -811,10 +911,34 @@ function Terminal:remove(path: string?): (string?, string?)
 	-- stays alive on the history entry, which is what makes the delete
 	-- reversible; it is collected when the entry falls off the stack.
 	local fullPath, descendants = instancePath(target), #target:GetDescendants()
+	-- Every script about to go, read while it is still in the tree and still has
+	-- a path. A ModuleScript with children is ordinary here (Rojo's init
+	-- convention), so this walks the subtree rather than looking at the root
+	-- alone — a deleted package should show every module it took with it.
+	local doomed: { { inst: Instance, path: string, name: string, source: string } } = {}
+	local function collect(inst: Instance)
+		if isScript(inst) then
+			doomed[#doomed + 1] = {
+				inst = inst, path = instancePath(inst), name = displayName(inst),
+				source = getSource(inst) or "",
+			}
+		end
+		for _, child in ipairs(inst:GetChildren()) do
+			collect(child)
+		end
+	end
+	if capturing() then
+		collect(target)
+	end
 	local _, removeErr = withUndo("agent: rm " .. target.Name, function()
 		target.Parent = nil
 	end)
 	if removeErr then return nil, removeErr end
+	-- Recorded only once the removal actually happened, so a refused rm leaves no
+	-- trace of a deletion that never occurred.
+	for _, gone in ipairs(doomed) do
+		captureAt(gone.inst, gone.path, gone.name, gone.source, "", "deleted")
+	end
 	return string.format("removed %s (%d descendants)", fullPath, descendants), nil
 end
 
@@ -925,6 +1049,20 @@ local function transfer(self: any, moving: boolean, path: string?, destination: 
 			carryBuffers(child, peer)
 		end
 	end
+	-- Every script a destination is about to lose, read while it is still in the
+	-- tree: once unparented its path no longer says where it was. Only `mv`
+	-- reaches this — `cp` either rewrites the destination in place or clones
+	-- where nothing was — but the guard is on the operation, not on the verb.
+	local displaced: { [Instance]: { path: string, name: string, source: string } } = {}
+	if capturing() then
+		for _, op in ipairs(operations) do
+			local old = op.old
+			if old and op.text == nil and isScript(old) then
+				displaced[old] = { path = instancePath(old), name = displayName(old),
+					source = getSource(old) or "" }
+			end
+		end
+	end
 	local _, transferErr = withUndo("agent: " .. cmd .. " " .. source.Name, function()
 		-- Prepare every clone before replacing an existing entry. On a failed
 		-- source write, originals still exist and the temporary copies are removed.
@@ -972,6 +1110,40 @@ local function transfer(self: any, moving: boolean, path: string?, destination: 
 		end
 	end)
 	if transferErr then return nil, transferErr end
+	-- What actually landed, read AFTER the transfer settled, so a rolled-back
+	-- attempt records nothing and a partial one records only what survived.
+	-- Guarded like the snapshot above: reading a cloned subtree back is one
+	-- editor round-trip per script, and outside a tool call nothing reads it.
+	if capturing() then
+		for _, op in ipairs(operations) do
+			local lost = op.old and displaced[op.old] or nil
+			if moving then
+				-- The moved Instance keeps its identity AND its text, so it is not a
+				-- change and reporting it as a delete plus a create would invent two
+				-- edits out of none. What it displaced is a real loss though: `mv a b`
+				-- over an existing b unparents b, and nothing else records that.
+				if lost then
+					captureAt(op.old, lost.path, lost.name, lost.source, "", "deleted")
+				end
+			elseif op.text ~= nil and op.written then
+				-- cp onto an existing script: same Instance, new source.
+				capture(op.old, op.previous, op.text, "modified")
+			elseif op.clone then
+				-- A fresh subtree, and always a fresh one: `plan` only reaches a clone
+				-- where nothing was, since overwriting a script becomes the text op
+				-- above and overwriting a folder recurses into its children instead.
+				local function landed(clone: Instance)
+					if isScript(clone) then
+						capture(clone, "", getSource(clone) or "", "created")
+					end
+					for _, child in ipairs(clone:GetChildren()) do
+						landed(child)
+					end
+				end
+				landed(op.clone)
+			end
+		end
+	end
 	local last = operations[#operations]
 	local result = moving and source or last.clone or last.old
 	return (moving and "moved to " or "copied to ") .. instancePath(result), nil

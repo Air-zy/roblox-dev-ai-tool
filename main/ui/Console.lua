@@ -15,6 +15,7 @@ local RunService = game:GetService("RunService")
 
 local Theme = require(script.Parent:WaitForChild("Theme"))
 local Markdown = require(script.Parent:WaitForChild("Markdown"))
+local SourceDiff = require(script.Parent:WaitForChild("SourceDiff"))
 
 local make = Theme.make
 
@@ -1159,6 +1160,16 @@ local MAX_ARG_CHARS = 60
 -- nobody reads, and every character is a TextBox the DataModel has to lay out.
 local MAX_DETAIL_CHARS = 4000
 
+-- Lines of patch drawn before `Review all` appears. A one-line edit is five
+-- lines with its hunk header and context, so twelve shows a small edit whole
+-- while keeping a large rewrite from owning the panel.
+local PREVIEW_LINES = 12
+
+-- And the ceiling once it is expanded. Every row is an Instance, so a rewrite of
+-- a thousand-line module has to stop somewhere; this says how much it withheld
+-- rather than pretending the patch ended.
+local MAX_REVIEW_ROWS = 400
+
 local function summarise(value: any): string
 	local text = tostring(value)
 	local firstLine = text:match("^[^\n]*") or text
@@ -1245,8 +1256,12 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 
 	local detailBox, setDetail = readOnlyBox(container, Theme.MONO, Theme.SMALL_SIZE, Theme.TEXT_MED)
 	detailBox.Visible = false
-	detailBox.LayoutOrder = 2
+	detailBox.LayoutOrder = 4
 	make("UIPadding", { Parent = detailBox, PaddingLeft = UDim.new(0, 12) })
+	-- The patch box, and the counts the header carries beside the tool name.
+	-- Both stay nil/empty for a call that changed no source, which is most.
+	local diffHolder: Frame? = nil
+	local changeLabel = ""
 
 	-- The raw argument JSON as it streams, before there is anything parsed to
 	-- show. Kept separately from `detail` because it is replaced wholesale the
@@ -1302,7 +1317,7 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 		local size = if streamedLen > 0
 			then string.format(" %.1fk", streamedLen / 1000)
 			else ""
-		header.Text = (expanded and "▼ " or "▶ ") .. label .. size
+		header.Text = (expanded and "▼ " or "▶ ") .. label .. changeLabel .. size
 			.. (pending and (" " .. frame) or "")
 	end
 	local stopSpin: (() -> ())? = nil
@@ -1375,6 +1390,92 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 			pending = false
 			if stopSpin then stopSpin() end
 			renderHeader()
+		end,
+		-- The source this call changed, handed over by Tools.dispatch. Absent
+		-- The source this call changed, handed over by Tools.dispatch. Absent
+		-- means it changed no script, and the block stays an ordinary tool row —
+		-- which is most calls, and why the patch is built here rather than with
+		-- every header.
+		--
+		-- Drawn without a click. A source change is the one tool result worth
+		-- seeing before being asked for, and the raw arguments stay behind the
+		-- chevron where they already were.
+		setChanges = function(changes: { any }?)
+			if type(changes) ~= "table" or #changes == 0 or diffHolder then return end
+			local files = SourceDiff.files(changes)
+			changeLabel = "  " .. SourceDiff.summary(files)
+			renderHeader()
+
+			-- One box per row, because a TextBox has exactly one TextColor3 and a
+			-- patch needs three. RichText would colour a single box, but it is off
+			-- for code here on purpose — an unescaped `<` in someone's source would
+			-- eat the line, and with RichText on, a selection copies the tags too.
+			-- So: one Instance per line, selection within a row and not across it,
+			-- which is the trade the plan already named.
+			local holder = make("Frame", {
+				Parent = container,
+				BackgroundTransparency = 1,
+				Size = UDim2.new(1, 0, 0, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				LayoutOrder = 2,
+			})
+			make("UIListLayout", { Parent = holder, SortOrder = Enum.SortOrder.LayoutOrder })
+			make("UIPadding", { Parent = holder, PaddingLeft = UDim.new(0, 12) })
+			diffHolder = holder
+
+			local review: TextButton? = nil
+			local function draw(limit: number?)
+				for _, child in ipairs(holder:GetChildren()) do
+					if child:IsA("GuiObject") then
+						child:Destroy()
+					end
+				end
+				local rows, hidden = SourceDiff.rows(files, limit)
+				for index, row in ipairs(rows) do
+					local kind = SourceDiff.kindOf(row)
+					local colour = if kind == "added" then Theme.ADD_CLR
+						elseif kind == "removed" then Theme.DEL_CLR
+						elseif kind == "meta" then Theme.TEXT_LO
+						else Theme.TEXT_MED
+					local line, setLine = readOnlyBox(holder, Theme.MONO, Theme.SMALL_SIZE, colour)
+					line.LayoutOrder = index
+					setLine(row)
+				end
+				if hidden == 0 then
+					if review then
+						review:Destroy()
+						review = nil
+					end
+					return
+				end
+				if not review then
+					local button = make("TextButton", {
+						Parent = container,
+						BackgroundTransparency = 1,
+						Size = UDim2.new(1, 0, 0, 18),
+						FontFace = Theme.MONO,
+						TextSize = Theme.SMALL_SIZE,
+						TextColor3 = Theme.ACCENT,
+						TextXAlignment = Enum.TextXAlignment.Left,
+						AutoButtonColor = false,
+						LayoutOrder = 3,
+						Text = "",
+					})
+					make("UIPadding", { Parent = button, PaddingLeft = UDim.new(0, 12) })
+					-- The whole patch, in place. Bounded rather than paged: the
+					-- console already scrolls, but every row is an Instance now, so
+					-- a huge rewrite still has to stop somewhere and say so.
+					button.MouseButton1Click:Connect(function()
+						draw(MAX_REVIEW_ROWS)
+						Console.scrollToBottom()
+					end)
+					review = button
+				end
+				;(review :: TextButton).Text = string.format("Review all %d lines",
+					(limit or 0) + hidden)
+			end
+			draw(PREVIEW_LINES)
+			Console.scrollToBottom()
 		end,
 	}
 end

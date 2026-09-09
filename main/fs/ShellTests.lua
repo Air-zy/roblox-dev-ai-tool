@@ -20,6 +20,181 @@ function Regression.run(Terminal, Shell)
 			assert(actual:find(pattern, 1, true), line .. " expected " .. pattern .. ", got " .. actual)
 			count += 1
 		end
+
+		-- Source capture and the review renderer, in their own fixture so the
+		-- scripts these create cannot turn up in another test's `ls`. First in the
+		-- file deliberately: this is the path the console's diff is built from, and
+		-- a failure anywhere later must not stop it being checked.
+		local captureRoot = Instance.new("Folder")
+		captureRoot.Name, captureRoot.Parent = "capture", fixture
+		local cterm = Terminal.new(captureRoot)
+		-- Source capture: what one tool call changed, for the console's diff.
+		-- The rules worth pinning are that a scope collects only the writes made
+		-- inside it, that several edits to one script within one call are ONE
+		-- record rather than a replay of intermediate states, and that a write
+		-- changing nothing records nothing.
+		assert(#cterm:endCapture() == 0, "endCapture invented records with no scope open")
+		cterm:write("cap.luau", "return 1\n")
+		assert(#cterm:endCapture() == 0, "a write outside any capture scope was recorded")
+		cterm:beginCapture()
+		assert(cterm:write("made.luau", "return 1\n"), "capture fixture write failed")
+		cterm:write("made.luau", "return 2\n")
+		cterm:edit("made.luau", "return 2", "return 3")
+		cterm:write("cap.luau", "return 1\n")
+		local records = cterm:endCapture()
+		assert(#records == 1, string.format("expected one merged record, got %d", #records))
+		assert(records[1].kind == "created", "a script the call created was not marked as created")
+		assert(records[1].before == "" and records[1].after == "return 3\n",
+			string.format("merge kept %q -> %q", records[1].before, records[1].after))
+		assert(#cterm:endCapture() == 0, "a closed scope kept collecting")
+
+		-- A shell write is captured by the same hook, with nothing added for it:
+		-- redirection, `sed -i`, curl-to-script and git materialization all route
+		-- through Terminal:write. This is the check that says so.
+		cterm:beginCapture()
+		cterm:shell("echo one > redirected.luau")
+		cterm:shell("sed -i 's/one/two/' redirected.luau")
+		local shellRecords = cterm:endCapture()
+		assert(#shellRecords == 1, string.format("shell writes: expected one record, got %d", #shellRecords))
+		assert(shellRecords[1].kind == "created" and shellRecords[1].after == "two\n",
+			string.format("shell write recorded %q, kind=%s",
+				shellRecords[1].after, shellRecords[1].kind))
+
+		-- The review renderer. Pure text, so what the console will draw is
+		-- checked here rather than by looking at the widget.
+		local SourceDiff = require(script.Parent.Parent:WaitForChild("ui"):WaitForChild("SourceDiff"))
+		cterm:beginCapture()
+		cterm:write("review.luau", "local a = 1\nlocal b = 2\nlocal c = 3\n")
+		local made = SourceDiff.files(cterm:endCapture())
+		assert(#made == 1 and made[1].kind == "created", "a created script did not reach the renderer as created")
+		assert(SourceDiff.summary(made):find("(new)", 1, true), "a created script is not marked in the summary")
+		assert(made[1].added == 3 and made[1].removed == 0,
+			string.format("created script counted +%d -%d", made[1].added, made[1].removed))
+
+		cterm:beginCapture()
+		cterm:edit("review.luau", "local b = 2", "local b = 22")
+		local edited = SourceDiff.files(cterm:endCapture())
+		assert(edited[1].added == 1 and edited[1].removed == 1,
+			string.format("a one-line edit counted +%d -%d", edited[1].added, edited[1].removed))
+		local patch = SourceDiff.body(edited)
+		assert(patch:find("@@", 1, true), "the patch carries no hunk header")
+		assert(patch:find("\n-local b = 2\n", 1, true) and patch:find("\n+local b = 22", 1, true),
+			"the patch does not show the replaced line both ways:\n" .. patch)
+		assert(patch:find("\n local a = 1\n", 1, true), "the patch dropped its context lines")
+
+		-- The cap says what it withheld rather than truncating in silence.
+		local short, hidden = SourceDiff.body(edited, 2)
+		assert(hidden == 4 and select(2, short:gsub("\n", "")) == 1,
+			string.format("cap withheld %d lines and kept %q", hidden, short))
+
+		cterm:beginCapture()
+		cterm:write("m1.luau", "return 1\n")
+		cterm:write("m2.luau", "return 2\n")
+		local several = SourceDiff.files(cterm:endCapture())
+		assert(#several == 2, "two changed scripts did not produce two files")
+		assert(SourceDiff.summary(several):find("2 scripts changed", 1, true),
+			"a multi-script call does not say so: " .. SourceDiff.summary(several))
+		assert(SourceDiff.body(several):find("m2", 1, true),
+			"a multi-script patch does not name each script")
+
+		-- rm records what it took, read while the scripts were still in the tree
+		-- and still had a path. A ModuleScript with children is ordinary here, so
+		-- a deleted package reports every module in it, not only its root.
+		cterm:shell("mkdir -p pkg")
+		cterm:write("pkg/init.luau", "return 1\n")
+		cterm:write("pkg/helper.luau", "return 2\n")
+		cterm:beginCapture()
+		cterm:remove("pkg")
+		local removed = cterm:endCapture()
+		assert(#removed == 2, string.format("rm of a package recorded %d scripts", #removed))
+		for _, entry in ipairs(removed) do
+			assert(entry.kind == "deleted" and entry.after == "" and entry.before ~= "",
+				"rm did not record the source it removed")
+			assert(entry.path:find("pkg", 1, true),
+				"rm recorded a path from after the detach: " .. entry.path)
+		end
+
+		-- mv moves one Instance, so its source did not change. Reporting a delete
+		-- plus a create there would invent two edits out of none.
+		cterm:write("mover.luau", "return 1\n")
+		cterm:beginCapture()
+		cterm:move("mover.luau", "moved.luau")
+		assert(#cterm:endCapture() == 0, "mv reported a source change")
+
+		-- reload swaps in a fresh clone carrying the same text: same reasoning.
+		cterm:beginCapture()
+		cterm:reload({ "moved.luau" })
+		assert(#cterm:endCapture() == 0, "reload reported a source change")
+
+		-- mv ONTO an existing script is a real loss: the destination is
+		-- unparented and its text is gone with nothing else recording it. The
+		-- moved script itself is still not a change.
+		cterm:write("keep.luau", "return 'kept'\n")
+		cterm:write("victim.luau", "return 'doomed'\n")
+		cterm:beginCapture()
+		cterm:move("keep.luau", "victim.luau")
+		local clobbered = cterm:endCapture()
+		assert(#clobbered == 1, string.format("mv over a script recorded %d changes", #clobbered))
+		assert(clobbered[1].kind == "deleted" and clobbered[1].before == "return 'doomed'\n",
+			"mv did not record the script it replaced")
+		assert(clobbered[1].path:find("victim", 1, true),
+			"mv recorded a path from after the detach: " .. clobbered[1].path)
+
+		-- cp records what landed. An overwrite is paired with what it replaced,
+		-- so it reads as an edit rather than as a file appearing from nowhere.
+		cterm:write("origin.luau", "return 'a'\n")
+		cterm:beginCapture()
+		cterm:copy("origin.luau", "fresh.luau")
+		local copied = cterm:endCapture()
+		assert(#copied == 1 and copied[1].kind == "created" and copied[1].after == "return 'a'\n",
+			"cp did not record the script it created")
+		cterm:write("target.luau", "return 'old'\n")
+		cterm:beginCapture()
+		cterm:copy("origin.luau", "target.luau")
+		local over = cterm:endCapture()
+		assert(#over == 1 and over[1].kind == "modified"
+			and over[1].before == "return 'old'\n" and over[1].after == "return 'a'\n",
+			"cp over an existing script did not pair with what it replaced")
+
+		-- cp -r of a package records every module the clone landed, not just its
+		-- root: a copied package that reported one file would be lying about the
+		-- rest by omission.
+		cterm:shell("mkdir -p tree")
+		cterm:write("tree/one.luau", "return 1\n")
+		cterm:write("tree/two.luau", "return 2\n")
+		cterm:beginCapture()
+		cterm:copy("tree", "treecopy", { recursive = true })
+		local cloned = cterm:endCapture()
+		assert(#cloned == 2, string.format("cp -r of a package recorded %d scripts", #cloned))
+		for _, entry in ipairs(cloned) do
+			assert(entry.kind == "created" and entry.path:find("treecopy", 1, true),
+				"cp -r recorded the source rather than the copy: " .. entry.path)
+		end
+
+		-- The whole path the console draws from: dispatch opens the scope, the
+		-- tool writes, dispatch hands the changes back BESIDE the model's result.
+		--
+		-- Tested here because a stale or unwired Tools.lua fails silently — no
+		-- scope, so no changes, so no diff and no error — which looks exactly
+		-- like the feature being switched off.
+		local Tools = require(script.Parent.Parent:WaitForChild("agent"):WaitForChild("Tools"))
+		cterm:write("dispatched.luau", "local a = 1\nprint(a)\nreturn a\n")
+		local dispatched, dispatchedChanges = Tools.dispatch(term, "edit", {
+			path = cterm:pwd() .. "/dispatched.luau",
+			old_string = "print(a)",
+			new_string = "print(a + 1)",
+		})
+		assert(dispatched:find("edited", 1, true),
+			"dispatch did not run the edit tool: " .. tostring(dispatched))
+		assert(dispatchedChanges and #dispatchedChanges == 1,
+			"dispatch returned no source changes for an edit that changed source")
+		assert(dispatchedChanges[1].after:find("print(a + 1)", 1, true),
+			"dispatch returned a change that does not carry the new source")
+		-- And a read-only call returns nothing, or every tool row would grow a diff.
+		local _, readOnlyChanges = Tools.dispatch(term, "bash", { command = "ls" })
+		assert(readOnlyChanges == nil, "a read-only call reported source changes")
+		captureRoot:Destroy()
+
 		check("true; echo $?; false; echo $?", "0\n1")
 		check("false || true; echo $?", "0")
 		check("printf '%s:%04d\\n' answer 7", "answer:0007")
@@ -304,6 +479,7 @@ function Regression.run(Terminal, Shell)
 			local message = assert(term:write(name, "local ="))
 			assert(message:find("syntax error", 1, true), name .. " lost Luau diagnostics")
 		end
+
 		return count
 	end)
 	fixture:Destroy()

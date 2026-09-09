@@ -1252,6 +1252,8 @@ local function runTurn(turn: number)
 					break
 				end
 				local toolResult: string
+				-- Set beside toolResult by dispatch; nil unless the call wrote source.
+				local sourceChanges: { any }? = nil
 				-- Whether the input never parsed, as opposed to a tool that ran and
 				-- returned an error string. Only the first is a protocol-level
 				-- failure, and only it sets is_error on the result below.
@@ -1277,7 +1279,7 @@ local function runTurn(turn: number)
 					-- call is still running, and cleared after so a later Stop does
 					-- not write a result over a block that already has one.
 					runningCall = call
-					toolResult = Tools.dispatch(term, block.name, block.inputParsed)
+					toolResult, sourceChanges = Tools.dispatch(term, block.name, block.inputParsed)
 					runningCall = nil
 					-- A tool_result whose content is "" is rejected outright, and on
 					-- turn > 1 it cannot be rolled back: the tool_use is already in
@@ -1290,6 +1292,10 @@ local function runTurn(turn: number)
 					-- for /sh; it is only invalid on the wire.
 					if toolResult == "" then toolResult = "(no output)" end
 					call.setResult(toolResult)
+					-- The scripts this call changed, if any. Console-only: it is
+					-- not in toolResult, so nothing here reaches the provider or
+					-- costs a token.
+					call.setChanges(sourceChanges)
 				else
 					inputFailed = true
 					-- Naming the stop reason is what makes this recoverable: on

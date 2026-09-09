@@ -303,11 +303,11 @@ dropped and how to see it.
 
 | Cap | Value | Where | On overflow |
 |---|---|---|---|
-| `MAX_CAT_LINES` | 1000 lines | `Terminal.lua:101` | `… TRUNCATED: 1000 of 3182 lines shown. Page the rest with `sed -n '1001,2000p' /Path`` — the exact next command, pre-computed |
-| `MAX_RESULTS` | 100 hits | `Terminal.lua:95` | `… N more matches (narrow the path or the pattern)` — **the walk continues past the cap** so N is a real number, not a shrug |
-| `MAX_LIST` | 100 rows | `Shell.lua:65` | `… N more from "Workspace" on (narrow it: `ls /A*`, or `ls \| grep <name>`)` — names the *first casualty*, so "Workspace is missing" is visible rather than "the boring tail" |
-| `MAX_SEQ` | 1000 values | `Shell.lua:1006` | refuses outright |
-| `MAX_TREE` | 1000 rows | `Terminal.lua:103` | `… N more entries (narrow it with `tree -L <depth>` or a subdirectory)`. Depth is unlimited by default, as GNU has it; this replaced a silent depth-2 cut that rendered populated directories as empty |
+| `MAX_CAT_LINES` | 1000 lines | `Terminal.lua:114` | `… TRUNCATED: 1000 of 3182 lines shown. Page the rest with `sed -n '1001,2000p' /Path`` — the exact next command, pre-computed |
+| `MAX_RESULTS` | 100 hits | `Terminal.lua:108` | `… N more matches (narrow the path or the pattern)` — **the walk continues past the cap** so N is a real number, not a shrug |
+| `MAX_LIST` | 100 rows | `Shell.lua:68` | `… N more from "Workspace" on (narrow it: `ls /A*`, or `ls \| grep <name>`)` — names the *first casualty*, so "Workspace is missing" is visible rather than "the boring tail" |
+| `MAX_SEQ` | 1000 values | `Shell.lua:1023` | refuses outright |
+| `MAX_TREE` | 1000 rows | `Terminal.lua:116` | `… N more entries (narrow it with `tree -L <depth>` or a subdirectory)`. Depth is unlimited by default, as GNU has it; this replaced a silent depth-2 cut that rendered populated directories as empty |
 
 Then two more on the wire, in `agent/Agent.lua`:
 

@@ -24,6 +24,9 @@ local Props = require(script.Parent.Parent:WaitForChild("studio"):WaitForChild("
 -- The pattern engine. grep, sed and find all speak real BRE/ERE now rather than
 -- Lua patterns in a costume, and this is where that lives.
 local Regex = require(script.Parent.Parent:WaitForChild("text"):WaitForChild("Regex"))
+-- Line alignment and hunk grouping. The shell keeps its own -w/-b/-i key and
+-- its own @@ formatting; what is shared is the alignment itself.
+local Diff = require(script.Parent.Parent:WaitForChild("text"):WaitForChild("Diff"))
 -- The sed engine. Its handler stays here; what sed means lives in text/Sed.
 local Sed = require(script.Parent.Parent:WaitForChild("text"):WaitForChild("Sed"))
 local parseSedCommand = Sed.parseSedCommand
@@ -3888,21 +3891,6 @@ HANDLERS.sed = function(self, argv, stdin)
 end
 
 -- diff
--- A real longest-common-subsequence diff. This used to walk both files by index
--- and call every position where they disagreed a change, so inserting ONE line
--- at the top of a 400-line module reported all 400 as different, a result that
--- is not merely noisy but wrong about which lines changed. None of -u, -b or -w
--- can be built honestly on top of that, because none of them mean anything
--- until the aligner knows which lines correspond to which.
---
--- ponytail: classic O(n*m) dynamic-programming table over the differing middle
--- only. The common prefix and suffix are trimmed first, so the quadratic part
--- sees the edit rather than the file, which is what keeps it cheap for the case
--- that actually happens. Ceiling: MAX_DIFF_LINES of genuinely differing text,
--- past which it reports the size instead of allocating; Myers' algorithm is the
--- upgrade path if that is ever hit in practice.
-local MAX_DIFF_LINES = 1200
-
 -- What counts as "the same line". -w ignores whitespace entirely, -b collapses
 -- runs of it, -i folds case. Comparison only, the ORIGINAL line is what gets
 -- printed, so a whitespace-only change is invisible under -w rather than
@@ -3920,124 +3908,17 @@ local function diffKey(line: string, flags: { [string]: boolean }): string
 	return key
 end
 
-type DiffOp = { op: string, a: number?, b: number? }
-
-local function diffLines(a: { string }, b: { string },
-	key: (string) -> string): ({ DiffOp }?, string?)
-	local script: { DiffOp } = {}
-
-	-- Trim the common prefix, then the common suffix. For the usual shape of an
-	-- edit: a few lines changed in a large file, this leaves almost nothing
-	-- for the quadratic part below.
-	local head = 0
-	while head < #a and head < #b and key(a[head + 1]) == key(b[head + 1]) do
-		head += 1
-		script[#script + 1] = { op = " ", a = head, b = head }
-	end
-	local tail = 0
-	while #a - tail > head and #b - tail > head
-		and key(a[#a - tail]) == key(b[#b - tail]) do
-		tail += 1
-	end
-
-	local n, m = #a - tail - head, #b - tail - head
-	if n * m > MAX_DIFF_LINES * MAX_DIFF_LINES then
-		return nil, string.format("%d and %d lines differ — too much to align. " ..
-			"Diff a narrower range, or grep for what changed.", n, m)
-	end
-
-	-- lengths[i][j] is the LCS length of a[i..n] against b[j..m], built from the
-	-- far end so the backtrack below can walk forwards and emit in file order.
-	local lengths: { { number } } = {}
-	for i = n + 1, 1, -1 do
-		local row: { number } = {}
-		lengths[i] = row
-		for j = m + 1, 1, -1 do
-			if i > n or j > m then
-				row[j] = 0
-			elseif key(a[head + i]) == key(b[head + j]) then
-				row[j] = lengths[i + 1][j + 1] + 1
-			else
-				row[j] = math.max(lengths[i + 1][j], row[j + 1])
-			end
-		end
-	end
-
-	local i, j = 1, 1
-	while i <= n and j <= m do
-		if key(a[head + i]) == key(b[head + j]) then
-			script[#script + 1] = { op = " ", a = head + i, b = head + j }
-			i += 1
-			j += 1
-		elseif lengths[i + 1][j] >= lengths[i][j + 1] then
-			script[#script + 1] = { op = "-", a = head + i }
-			i += 1
-		else
-			script[#script + 1] = { op = "+", b = head + j }
-			j += 1
-		end
-	end
-	while i <= n do
-		script[#script + 1] = { op = "-", a = head + i }
-		i += 1
-	end
-	while j <= m do
-		script[#script + 1] = { op = "+", b = head + j }
-		j += 1
-	end
-	for k = 1, tail do
-		script[#script + 1] = { op = " ", a = #a - tail + k, b = #b - tail + k }
-	end
-	return script, nil
-end
-
 -- Unified format: only the changed regions, each with `context` lines around it,
 -- under an @@ header naming where it sits in both files. The default output,
 -- because it is the one that says WHERE a change is without reprinting the file.
-local function unified(script: { DiffOp }, a: { string }, b: { string },
+local function unified(script: { Diff.Op }, a: { string }, b: { string },
 	pathA: string, pathB: string, context: number): string
-	-- Group changes that are close enough that their context windows touch.
-	local hunks: { { first: number, last: number } } = {}
-	for index, op in ipairs(script) do
-		if op.op ~= " " then
-			local last = hunks[#hunks]
-			if last and index - last.last <= context * 2 + 1 then
-				last.last = index
-			else
-				hunks[#hunks + 1] = { first = index, last = index }
-			end
-		end
-	end
+	local hunks = Diff.hunkText(script, a, b, context)
 	if #hunks == 0 then
 		return ""
 	end
-
 	local out: { string } = { "--- " .. pathA, "+++ " .. pathB }
-	for _, hunk in ipairs(hunks) do
-		local from = math.max(1, hunk.first - context)
-		local to = math.min(#script, hunk.last + context)
-		local startA, startB, countA, countB = nil, nil, 0, 0
-		local body: { string } = {}
-		for index = from, to do
-			local op = script[index]
-			if op.a then
-				startA = startA or op.a
-				if op.op ~= "+" then
-					countA += 1
-				end
-			end
-			if op.b then
-				startB = startB or op.b
-				if op.op ~= "-" then
-					countB += 1
-				end
-			end
-			body[#body + 1] = op.op .. (op.op == "+" and b[op.b :: number] or a[op.a :: number])
-		end
-		out[#out + 1] = string.format("@@ -%d,%d +%d,%d @@",
-			startA or 0, countA, startB or 0, countB)
-		table.move(body, 1, #body, #out + 1, out)
-	end
+	table.move(hunks, 1, #hunks, #out + 1, out)
 	return table.concat(out, "\n")
 end
 
@@ -4052,7 +3933,7 @@ local function diffOne(self: any, a: Instance, b: Instance,
 	end
 
 	local linesA, linesB = splitLines(srcA), splitLines(srcB)
-	local script, err = diffLines(linesA, linesB, function(line)
+	local script, err = Diff.align(linesA, linesB, function(line)
 		return diffKey(line, flags)
 	end)
 	if not script then
@@ -5866,7 +5747,7 @@ HANDLERS.git = function(self, argv)
 			local mine = working[path]
 			local before = remote[path] and splitLines(text) or {}
 			local after = mine and splitLines(mine.source) or {}
-			local script, diffErr = diffLines(before, after, function(line)
+			local script, diffErr = Diff.align(before, after, function(line)
 				return diffKey(line, flags)
 			end)
 			if not script then

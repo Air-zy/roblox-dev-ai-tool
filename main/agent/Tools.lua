@@ -112,7 +112,10 @@ function Tools.setEnabledGuard(guard: (string) -> boolean)
 	enabledGuard = guard
 end
 
-function Tools.dispatch(term: any, name: string, input: { [string]: any }): string
+-- The second return is the source changes this call applied, or nil when it
+-- changed no script. It is for the console only: it never reaches the provider,
+-- costs no tokens, and the model's result is the first return, unchanged.
+function Tools.dispatch(term: any, name: string, input: { [string]: any }): (string, { any }?)
 	local tool = byName[name]
 	if not tool then
 		return "error: unknown tool '" .. tostring(name) .. "'"
@@ -124,11 +127,17 @@ function Tools.dispatch(term: any, name: string, input: { [string]: any }): stri
 	if enabledGuard and not enabledGuard(name) then
 		return string.format("error: %s is switched off in settings", name)
 	end
+	-- One capture scope per call. Closed on BOTH paths below: a tool that threw
+	-- part way through may still have landed writes, and those are exactly the
+	-- ones worth showing rather than dropping.
+	term:beginCapture()
 	local ok, result = pcall(tool.run, term, input)
+	local changes = term:endCapture()
+	local review = #changes > 0 and changes or nil
 	if not ok then
-		return string.format("%s: threw: %s", name, tostring(result))
+		return string.format("%s: threw: %s", name, tostring(result)), review
 	end
-	return result
+	return result, review
 end
 
 return Tools

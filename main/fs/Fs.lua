@@ -481,10 +481,24 @@ local function findChild(parent: Instance, name: string): (Instance?, string?)
 		return script
 	end
 	local exact, count = nil, 0
+	-- Which duplicate a READ gets has to be the same answer twice. GetChildren
+	-- has no defined order -- this file sorts for `diff -r` and Tools sorts its
+	-- modules for exactly that reason -- so "the first match" was really "whichever
+	-- the engine happened to hand back", and `cat twin.luau` could return a
+	-- different instance between sessions.
+	--
+	-- A written script suffix says which kind was meant, so a script wins over a
+	-- Folder of the same name. That is the rule the suffix branch above already
+	-- follows; this makes the exact-name branch agree with it. Mutating callers
+	-- still refuse on the note below, so this only decides what a read sees.
+	local wantsScript = Fs.stripScriptSuffix(name) ~= nil
 	for _, child in ipairs(parent:GetChildren()) do
 		if child.Name == name then
 			count += 1
-			exact = exact or child
+			if exact == nil
+				or (wantsScript and isScript(child) and not isScript(exact)) then
+				exact = child
+			end
 		end
 	end
 	if count > 1 then
@@ -498,10 +512,18 @@ end
 -- Third return: the path resolved, but a component of it named more than one
 -- instance and this is the first such component. A DataModel allows duplicate
 -- sibling names where a filesystem does not, so a path is not always a unique
--- handle. Reading follows the first match, exactly as before; MUTATING callers
+-- handle. Reading resolves to ONE of them and never refuses; MUTATING callers
 -- refuse on this note, because that is where picking the wrong one destroys
--- something. Refusing on every lookup instead made ~25% of a stock place
--- unreachable for reading, which bought nothing -- a read cannot corrupt.
+-- something.
+--
+-- Which one a read gets is decided in findChild, not left to GetChildren: a
+-- written script suffix picks the script. It used to be whichever the engine
+-- returned first, so the same `cat` could answer differently between sessions —
+-- and the twin test that shipped alongside this split has always asserted the
+-- script wins, which only held because insertion order made it so.
+--
+-- Refusing on every lookup instead made ~25% of a stock place unreachable for
+-- reading, which bought nothing -- a read cannot corrupt.
 function Fs.resolve(base: Instance, path: string?): (Instance?, string?, string?)
 	if not path or path == "" or path == "." then
 		return base, nil

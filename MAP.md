@@ -32,6 +32,7 @@ main.lua                        window, toolbar, popups, usage panel
           providers/GeminiAuth      a pasted AI Studio key, and nothing else
         agent/Tools             registry; tools/ is one file per tool
     ui/Console -> ui/Markdown -> ui/Theme
+      ui/SourceDiff             a tool call's source changes, as text
     ui/Find                     search the open conversation
     ui/Settings
     fs/Terminal                 commands as DataModel operations
@@ -41,6 +42,7 @@ main.lua                        window, toolbar, popups, usage panel
       studio/Exec               executes Luau      (run tool only, required on first use)
       studio/Catalog            free models        (catalog tool only, required on first use)
       text/Regex                BRE/ERE engine
+      text/Diff                 line alignment, hunk grouping
       text/Sed                  sed engine
       git/Git                   object ids, path mapping, working-tree walk
       vendor/LuauParser         Luau grammar; the syntax check on write
@@ -67,7 +69,7 @@ main.lua                        window, toolbar, popups, usage panel
 | Stop | `Agent.lua:~628` `stopCurrent`, reached through `Agent.stop`. The queued continuation re-checks `cancelRequested` after its wait (`continueTurn:618`), and `committed:592` is what keeps Stop from rolling back a turn already in the history |
 | a turn's result is handled | `Agent.lua:782` `onComplete` -> assemble -> dispatch tools -> `continueTurn:618` |
 | the user hits enter | `main.lua:839` `submit` -> `Commands.handle:236` -> `Agent.send:1134` |
-| a tool runs | `Tools.lua:106` `dispatch` — never throws |
+| a tool runs | `Tools.lua:118` `dispatch` — never throws; returns the model result, and the source changes the call applied as a second value the console draws a diff from |
 | tool definitions on the wire | `Tools.lua:78` `definitions` + `Agent.lua:218` `buildTools` |
 | model / thinking / effort / search per model | `providers/Anthropic.lua:80` `MODEL_CAPS`; UI list at `:125`. OpenRouter has neither: no caps table, and its list is fetched |
 | beta headers | `providers/Anthropic.lua:53` — read the comment before adding one |
@@ -85,7 +87,7 @@ main.lua                        window, toolbar, popups, usage panel
 | `$(...)` | `Shell.lua:4700` `expandSubstitutions`, `:4644` `takeSubstitution` — on the raw line, before `tokenize` |
 | the `$ cmd` echo of a multi-command line | `Shell.lua:4416` `label`, quoting via `requote:4404` |
 | heredocs / redirection | `Shell.lua:407` `extractHeredoc`, `:467` `takeRedirect`, `:538` `applyRedirect` |
-| diff | `Shell.lua:3306` `diffOne`, handler at `:3366` |
+| diff | alignment and hunk grouping in `text/Diff.lua` (`Diff.align`, `Diff.hunks`); the flags, the `@@` formatting and the handler stay in `Shell.lua:3951` `diffOne` and `:4011` `HANDLERS.diff` |
 | a path becomes an instance | `Fs.lua:304` `Fs.resolve` — also `.luau` suffixes and root case-folding |
 | an instance becomes a path | `Fs.lua:265` `instancePath` |
 | a script is read / written | `Fs.lua:69` `getSource`, `:116` `Fs.writeSource` |
@@ -115,6 +117,7 @@ main.lua                        window, toolbar, popups, usage panel
 | an icon renders as a tofu box | the name has no ligature in `BuilderIcons-Regular.ttf`. The font has NO single-character ligatures, which is what made a plain `x` a square for as long as the settings panel has had a close button. See the note at `Theme.lua:39` |
 | a session is written to disk | the busy -> idle edge in `main.lua:819`, plus `onCheckpoint:241` — fired by `Agent.send` as the message goes in, and by `continueTurn(true):590` after each batch of tool results |
 | text on screen | `Console.lua:256` `appendLine`, `:624` `createBubble`, `:931` `appendToolCall` |
+| a tool call shows what it changed | captured on the Terminal, keyed by coroutine (`beginCapture`/`endCapture`, scope opened by `Tools.dispatch`). Hooks: `:write`/`:multiedit` (which every shell write routes through), `:remove` (read before the detach), and `transfer` (after it settles, so a rollback records nothing). `mv` and `reload` record nothing — same Instance, same text — except what an `mv` displaced. Handed back as `Tools.dispatch`'s second return, drawn by `Console.appendToolCall`'s `setChanges` through `ui/SourceDiff`. NOT stored: the patch lives in the block and dies with it, and catalog inserts and `run` are outside capture |
 
 ## Per file
 
@@ -147,7 +150,9 @@ main.lua                        window, toolbar, popups, usage panel
 | `agent/providers/Pkce.lua` | 70 | verifier / challenge / state. |
 | `studio/Catalog.lua` | 401 | Free model search / insert. Tool-only. |
 | `ui/Find.lua` | 423 | Conversation search + the find panel. |
+| `ui/SourceDiff.lua` | 141 | A tool call's source changes as text: counts, the header line, the capped patch body. Pure — no GUI, so the CLI regressions cover it. |
 | `ui/Markdown.lua` | 346 | Markdown to labels. |
+| `text/Diff.lua` | 157 | Line alignment (LCS over the differing middle) and hunk grouping. Pure text; requires nothing. |
 | `text/Sed.lua` | 329 | sed engine. Pure text. |
 | `main/Commands.lua` | 279 | Slash commands, and `runShell`, shared by `/sh` and shell mode. |
 | `studio/Props.lua` | 200 | API dump. The only network I/O in fs. |
@@ -198,7 +203,7 @@ Refactor steps not yet done.
 |---|---|
 | 2 | move `onComplete` block assembly + `clearOldToolResults` from Agent into the provider. Still open, and now clearly worth it: `Agent.lua:~820` still walks Anthropic block types by name, which is why OpenRouter has to speak that shape |
 | 3 | neutral tool schema in `Tools.lua`; provider maps to `input_schema`. Half-done by accident — OpenRouter and OpenAI already map it, so `Tools.definitions` is the only thing still emitting Anthropic's spelling |
-| 6 | extract `Diff` and `Argv` from Shell into `text/` |
+| 6 | extract `Argv` from Shell into `text/`. `Diff` is DONE: `text/Diff.lua` owns the aligner and hunk grouping; Shell keeps -w/-b/-i and the unified formatting, which are `diff` options rather than properties of an alignment |
 | 8 | rename `Terminal:run` -> `Terminal:exec` (`Shell.run` already means a command line) |
 
 Done since this list was written: **4** (`Settings` no longer reaches into

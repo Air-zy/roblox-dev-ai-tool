@@ -23,6 +23,12 @@ Theme.ERR_CLR     = Color3.fromRGB(229, 120, 110) -- #E5786E lighter red
 Theme.BAR_CLR     = Color3.fromRGB(140, 178, 214) -- #8CB2D6 creamy blue, usage bars
 Theme.TOOL_CLR    = Color3.fromRGB(160, 172, 218) -- #A0ACDA periwinkle, tool calls
 
+-- Diff rows. Desaturated on purpose: a patch is mostly context, so the changed
+-- lines have to read as changed without the panel turning into a traffic light.
+-- The + and - markers carry the same signal for anyone who cannot separate them.
+Theme.ADD_CLR     = Color3.fromRGB(150, 199, 149) -- #96C795 light green, added lines
+Theme.DEL_CLR     = Color3.fromRGB(224, 137, 132) -- #E08984 light red, removed lines
+
 -- Fonts
 -- Enum.Font.Code (Source Code Pro) everywhere made prose hard to read at 13px.
 -- Prose now uses BuilderSans. Roblox's current UI family, which has real
