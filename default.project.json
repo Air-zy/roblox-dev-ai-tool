@@ -1,0 +1,39 @@
+{
+  "name": "Claude Code for Roblox",
+  "syncRules": [
+    {
+      "pattern": "main.lua",
+      "use": "pluginScript"
+    }
+  ],
+  "tree": {
+    "$path": "main.lua",
+    "Commands": {
+      "$path": "main/Commands.lua"
+    },
+    "agent": {
+      "$path": "main/agent"
+    },
+    "fs": {
+      "$path": "main/fs"
+    },
+    "git": {
+      "$path": "main/git"
+    },
+    "studio": {
+      "$path": "main/studio"
+    },
+    "text": {
+      "$path": "main/text"
+    },
+    "ui": {
+      "$path": "main/ui"
+    },
+    "util": {
+      "$path": "main/util"
+    },
+    "vendor": {
+      "$path": "main/vendor"
+    }
+  }
+}
