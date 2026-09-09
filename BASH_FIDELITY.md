@@ -223,6 +223,9 @@ Correct calls, listed so they are not mistaken for the section above.
 - **`ls /` collapses empty services** with a count and a way to see them
   (`ls -a /`). Studio instantiates 100+ services whether the place uses them or
   not.
+- **`ls -R` traverses script children.** A Script, LocalScript or ModuleScript
+  can own a subtree, so recursive listing descends into it. Plain `ls script`
+  still lists the script itself, as does `ls -dR script`.
 - **A mutation announces what it did, on stderr.** `touch`, `rm`, `mkdir`,
   `rmdir`, `cp`, `mv`, `sed -i` and `find -delete` are silent on success in
   POSIX; here they say what changed, because a transcript that does not is

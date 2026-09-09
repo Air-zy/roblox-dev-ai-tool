@@ -184,6 +184,26 @@ function Regression.run(Terminal, Shell)
 		file("clash", "return 1", rightDeep)
 		contains("diff -r left right", "is a directory while file")
 
+		-- Scripts can own Instances too: -R must reach nested modules both when
+		-- the script is the operand and when the walk enters it from a folder.
+		for _, className in ipairs({ "ModuleScript", "Script", "LocalScript" }) do
+			local parent = Instance.new(className)
+			parent.Name, parent.Parent = className .. "Package", fixture
+			local child = file("Child", "return {}", parent)
+			file("Grandchild", "return {}", child)
+			local expected = "Child.luau\n\n" .. root .. "/" .. parent.Name .. "/Child:\nGrandchild.luau"
+			check("ls -R " .. parent.Name, expected)
+			check("ls --recursive " .. parent.Name .. ".luau", expected)
+			check("ls -R " .. root .. "/" .. parent.Name .. " | head -20", expected)
+			contains("ls -R .", root .. "/" .. parent.Name .. ":\n" .. expected)
+			assert(Terminal.new(parent):shell("ls -R") == expected,
+				"ls -R from a script cwd missed its descendants")
+			check("ls " .. parent.Name, parent.Name)
+			check("ls -dR " .. parent.Name, parent.Name)
+			check("ls -R " .. parent.Name .. "/Child/Grandchild", parent.Name .. "/Child/Grandchild")
+			parent:Destroy()
+		end
+
 		-- A DataModel allows siblings to share a name, so a path is not always a
 		-- unique handle: `find` could match one and `rm` destroy the other, which is
 		-- data loss under a correct-looking transcript. MUTATION refuses; reading
@@ -191,6 +211,7 @@ function Regression.run(Terminal, Shell)
 		-- refusing there made a quarter of a real place unreachable.
 		local twinScript = Instance.new("ModuleScript")
 		twinScript.Name, twinScript.Source, twinScript.Parent = "twin.luau", "return 1", fixture
+		file("scriptHeld", "return 3", twinScript)
 		local twinFolder = Instance.new("Folder")
 		twinFolder.Name, twinFolder.Parent = "twin.luau", fixture
 		file("held", "return 2", twinFolder)
@@ -200,6 +221,7 @@ function Regression.run(Terminal, Shell)
 		check("cat twin.luau", "return 1")
 		check("ls twin.luau", "twin.luau")
 		contains("ls -R .", "held")
+		contains("ls -R .", "scriptHeld")
 		assert(twinScript.Parent == fixture and twinFolder.Parent == fixture,
 			"an ambiguous path destroyed an instance")
 		assert(twinFolder:FindFirstChild("held"), "an ambiguous path destroyed a child")

@@ -1284,12 +1284,16 @@ HANDLERS.ls = function(self, argv)
 			inst, resolveErr = self:resolve(path)
 		end
 		if not inst then return resolveErr end
+		local children = inst:GetChildren()
+		-- Scripts are files for plain ls, but can also own a subtree. -R lists
+		-- that subtree; a leaf script and an explicit -d still list the entry.
 		local entryOnly = flags["-d"] or path ~= nil and isScript(inst)
+			and (not flags["-R"] or #children == 0)
 		local rows, err
 		if entryOnly then rows = { { inst = inst, name = path or displayName(inst) } }
 		else
 			rows = {}
-			for _, child in ipairs(inst:GetChildren()) do
+			for _, child in ipairs(children) do
 				rows[#rows + 1] = { inst = child, name = displayName(child) }
 			end
 		end
@@ -1322,7 +1326,7 @@ HANDLERS.ls = function(self, argv)
 		-- -R descends after listing, which is the order bash prints them in.
 		if flags["-R"] and not entryOnly then
 			for _, row in ipairs(rows) do
-				if not isScript(row.inst) and #row.inst:GetChildren() > 0 then
+				if #row.inst:GetChildren() > 0 then
 					local err2 = listOne(instancePath(row.inst), true, row.inst)
 					if err2 then
 						return err2
