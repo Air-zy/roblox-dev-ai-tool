@@ -419,6 +419,15 @@ function Regression.run(Terminal, Shell)
 		check("if diff -r same1 same2; then echo identical; fi", "identical")
 		file("odd", "return 1", same1)
 		check("diff -r same1 same2 > /dev/null; echo $?", "1")
+
+		-- find's status reports ERRORS, not the match count: GNU exits 0 when
+		-- nothing matched, so `set -e` must not abort a correct search that found
+		-- nothing. grep is the opposite and still exits 1. The sentence explaining
+		-- the emptiness must still not reach a pipe as if it were a row.
+		check("find . -name definitelyNotHere >/dev/null; echo $?", "0")
+		check("if find . -name definitelyNotHere >/dev/null; then echo ran; fi", "ran")
+		check("find . -name definitelyNotHere | wc -l", "0")
+		check("find /Nope -name x 2>/dev/null; echo $?", "2")
 		file("odd", "return 2", same2)
 		check("diff same1/odd same2/odd > /dev/null; echo $?", "1")
 		check("diff same1/odd same1/odd; echo $?", "0")

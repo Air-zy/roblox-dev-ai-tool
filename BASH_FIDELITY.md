@@ -201,8 +201,10 @@ Correct calls, listed so they are not mistaken for the section above.
 - **`&` and job control do not exist.** No process table, no `wait`, and a tool
   call returns one string. The parser names it rather than ignoring it.
 - **A miss prints prose.** `grep zzz f` says `no matches` and exits 1 where bash
-  prints nothing; `find` and `ls` on an empty result do the same. A false status
-  is invisible to whoever is reading the transcript. The prose is dropped for a
+  prints nothing. `find` and `ls` print the same kind of sentence on an empty
+  result but exit 0, as GNU does — their status reports errors, not the match
+  count, so `set -e` does not abort a correct search that found nothing. The
+  prose is the divergence here; the status is not. The prose is dropped for a
   downstream stage and by a `||` that handles it, so `grep X f | wc -l` is 0 and
   `grep X f || echo absent` prints exactly `absent`.
 - **`UNSUPPORTED` table** — `awk chown sudo ps kill man quit compgen unzip tar

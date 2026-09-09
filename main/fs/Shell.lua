@@ -2360,7 +2360,12 @@ HANDLERS.find = function(self, argv)
 		end
 	end
 	if #found == 0 then
-		return miss("no matches")
+		-- prose, not miss: GNU find exits 0 when nothing matched. Its status
+		-- reports errors, not the match count, so `set -e` must not abort on a
+		-- correct search that found nothing. grep is the opposite and keeps miss.
+		-- The sentence still must not reach `wc -l` as a row, which is the half
+		-- prose() keeps.
+		return prose("no matches")
 	end
 
 	if deleting and exec then
@@ -6838,9 +6843,15 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			-- `||` has to fire after a grep that found nothing, and `&&` must not.
 			-- One flag doing both jobs meant `||` never fired at all.
 			{ line = "grep zzz Cased.luau || echo fellback", want = "fellback" },
-			-- Scoped to the fixture, not `/`: this one actually walks, and a
-			-- startup test has no business crawling somebody's whole place.
-			{ line = "find . -name zzzznope || echo fellback", want = "fellback" },
+			-- find is NOT grep here: GNU find reports errors in its status, not the
+			-- match count, so finding nothing is exit 0 and `&&` must still run. This
+			-- line used to assert the opposite by analogy with the grep case above;
+			-- TODOS listed it as a real divergence, since it aborts `set -e` scripts
+			-- on a correct search. Scoped to the fixture, not `/`: this one actually
+			-- walks, and a startup test has no business crawling somebody's place.
+			{ line = "find . -name zzzznope && echo ran", want = "ran" },
+			-- ...and a real error still fails, which is the half that must not move.
+			{ line = "find /Nope -name x 2>/dev/null || echo fellback", want = "fellback" },
 			{ line = "[ -f nosuchscript.luau ] || echo fellback", want = "fellback" },
 			-- ...and a real match still succeeds, or `&&` is broken for everyone.
 			{ line = "grep -q Humanoid Cased.luau && echo ran", want = "ran" },
