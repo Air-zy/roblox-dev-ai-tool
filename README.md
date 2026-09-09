@@ -49,7 +49,7 @@ Get the ready-to-install plugin from [Releases](https://github.com/Air-zy/roblox
 or build it from source with [Rojo 7.5 or newer](https://rojo.space/docs/v7/getting-started/installation/):
 
 ```sh
-rojo build default.project.json --output ClaudeCodeForRoblox.rbxmx
+rojo build default.project.json --output RobloxCodeAgent.rbxmx
 ```
 
 Move the `.rbxmx` to **Plugins > Plugins Folder**, restart Studio, and enable

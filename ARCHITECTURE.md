@@ -52,7 +52,7 @@ silently corrupted.
 
 `main.lua` is the plugin Script and `main/` becomes its children, every
 subfolder a Folder and every `.lua` a ModuleScript. With Rojo 7.5 or newer, run
-`rojo build default.project.json --output ClaudeCodeForRoblox.rbxmx`, copy the
+`rojo build default.project.json --output RobloxCodeAgent.rbxmx`, copy the
 result into the Studio plugins folder, and restart Studio. You also need **Game
 Settings > Security > Allow HTTP Requests** in the place you want to edit.
 

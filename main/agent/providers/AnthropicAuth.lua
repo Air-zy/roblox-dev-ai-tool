@@ -236,11 +236,7 @@ local function completeLogin(pastedCode: string): (boolean, string?)
 
 	local response = httpPostJson(TOKEN_URL, body)
 	if not response.Success then
-		return false, string.format(
-			"Token exchange failed (HTTP %s): %s",
-			tostring(response.StatusCode),
-			tostring(response.Body)
-		)
+		return false, string.format("Token exchange failed (HTTP %s).", tostring(response.StatusCode))
 	end
 
 	local parsed
@@ -256,10 +252,10 @@ local function completeLogin(pastedCode: string): (boolean, string?)
 	local expiresIn = (parsed :: any).expires_in or 3600
 
 	if type(accessToken) ~= "string" or accessToken == "" then
-		return false, "Token response missing access_token. Body: " .. tostring(response.Body)
+		return false, "Token response missing access_token."
 	end
 	if type(refreshToken) ~= "string" or refreshToken == "" then
-		return false, "Token response missing refresh_token. Body: " .. tostring(response.Body)
+		return false, "Token response missing refresh_token."
 	end
 
 	saveTokens(accessToken, refreshToken, tonumber(expiresIn) :: number)
@@ -285,16 +281,11 @@ local function refresh(): (boolean, string?)
 		-- Only clear tokens on 4xx (revoked/expired refresh token).
 		-- On transport errors (status 0) or 5xx, keep tokens so the user can retry.
 		local code = tonumber(response.StatusCode) or 0
-		warn(string.format("[Claude Code] refresh failed: HTTP %s, body: %s",
-			tostring(response.StatusCode), tostring(response.Body)))
+		warn(string.format("[Roblox Code Agent] refresh failed: HTTP %s", tostring(response.StatusCode)))
 		if code >= 400 and code < 500 then
 			clearTokens()
 		end
-		return false, string.format(
-			"Refresh failed (HTTP %s): %s",
-			tostring(response.StatusCode),
-			tostring(response.Body)
-		)
+		return false, string.format("Refresh failed (HTTP %s).", tostring(response.StatusCode))
 	end
 
 	local parsed
@@ -302,7 +293,7 @@ local function refresh(): (boolean, string?)
 		parsed = HttpService:JSONDecode(response.Body :: string)
 	end)
 	if not ok or type(parsed) ~= "table" then
-		warn("[Claude Code] refresh: response was not valid JSON: " .. tostring(err))
+		warn("[Roblox Code Agent] refresh: response was not valid JSON: " .. tostring(err))
 		return false, "Refresh response was not valid JSON: " .. tostring(err)
 	end
 
@@ -311,7 +302,7 @@ local function refresh(): (boolean, string?)
 	local expiresIn = (parsed :: any).expires_in or 3600
 
 	if type(accessToken) ~= "string" or accessToken == "" then
-		warn("[Claude Code] refresh: response missing access_token. Body: " .. tostring(response.Body))
+		warn("[Roblox Code Agent] refresh: response missing access_token.")
 		return false, "Refresh response missing access_token."
 	end
 
@@ -342,7 +333,7 @@ local function getAccessToken(): (string?, string?)
 	end
 	if not at or at == "" then
 		-- Access token missing but refresh token present, try refresh.
-		warn("[Claude Code] getAccessToken: at missing, refreshing…")
+		warn("[Roblox Code Agent] getAccessToken: at missing, refreshing…")
 		local ok, err = refresh()
 		if not ok then
 			return nil, err or "Refresh failed."
@@ -353,7 +344,7 @@ local function getAccessToken(): (string?, string?)
 
 	-- Refresh if expired or within 60s of expiry (clock skew safety margin).
 	if exp and (os.time() + 60 >= exp) then
-		warn("[Claude Code] getAccessToken: token expired/near-expiry, refreshing…")
+		warn("[Roblox Code Agent] getAccessToken: token expired/near-expiry, refreshing…")
 		local ok, err = refresh()
 		if not ok then
 			return nil, err or "Refresh failed."

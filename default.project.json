@@ -1,5 +1,5 @@
 {
-  "name": "Claude Code for Roblox",
+  "name": "Roblox Code Agent",
   "syncRules": [
     {
       "pattern": "main.lua",

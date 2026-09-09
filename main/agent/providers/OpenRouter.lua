@@ -61,7 +61,7 @@ local MODELS_URL = "https://openrouter.ai/api/v1/models"
 -- HTTP-Referer for its rankings; it is left off because Roblox reserves a
 -- handful of request headers and a rejected one fails the whole call, which is
 -- a poor trade for a leaderboard entry.
-local APP_TITLE = "Claude Code for Roblox"
+local APP_TITLE = "Roblox Code Agent"
 
 local KEY_MODEL_CACHE = "openrouter_models"
 local KEY_MODEL_CACHE_AT = "openrouter_models_at"

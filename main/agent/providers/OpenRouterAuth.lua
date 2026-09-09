@@ -40,7 +40,7 @@ local KEYS_URL = "https://openrouter.ai/api/v1/auth/keys"
 local KEY_URL = "https://openrouter.ai/api/v1/key"
 -- What the key is called on the user's dashboard. Required when callback_url is
 -- omitted, which is the headless mode this uses.
-local KEY_LABEL = "Claude Code for Roblox"
+local KEY_LABEL = "Roblox Code Agent"
 
 -- Setting keys (no dots, no backslashes: Plugin:SetSetting silently fails otherwise)
 local KEY_API_KEY = "openrouter_api_key"
