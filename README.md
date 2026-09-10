@@ -8,7 +8,6 @@ the live DataModel.
 - power of a VS Code agent + Rojo without the Rojo setup.
 - whole thing to live in a Studio plugin, without an external editor or bridge.
 - don't want to boil the oceans for nothing, so the toolset has to use as few tokens as possible.
-- general tool for ease of use
 
 ## Methodology
 
@@ -39,9 +38,6 @@ Linux shell commands, keeping the schema small and complex workflows composable.
 agent; [BloxBot](https://github.com/paralov/app-bloxbot-ai) bundles that agent
 into a desktop app. Their billing follows the external client or provider. This
 project puts the Claude/ChatGPT subscription-backed agent inside Studio itself.
-
-Rojo wins when the repository owns the game. Studio MCP and Forge win when the
-agent must see or play it. This project wins when you want to stay in Studio.
 
 ## Install
 
