@@ -463,6 +463,11 @@ instantiates whether the place uses them or not (`ls -a /` still lists them),
 and tool descriptions stay near empty because a model already knows what ls
 does, it just cannot know this is a DataModel.
 
+Those caps are about the context window and nothing else, so `> file` lifts
+them: `cat big.luau > copy.luau` is a whole copy and `ls > listing.luau` a whole
+listing, since neither is something the model reads. A capped redirect was
+writing short files with exit 0 and its warning on stderr, which no file carries.
+
 Walks breathe. Luau is single-threaded and this plugin shares that thread with
 the editor, so find, grep, tree and `ls -R` yield a frame whenever they have
 held it for one. A big place makes those commands slow; it no longer makes

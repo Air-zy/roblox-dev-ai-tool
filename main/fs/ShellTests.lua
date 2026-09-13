@@ -489,6 +489,22 @@ function Regression.run(Terminal, Shell)
 			assert(message:find("syntax error", 1, true), name .. " lost Luau diagnostics")
 		end
 
+
+		-- A redirect takes the output caps off. They exist to stop one command
+		-- evicting the context window, and a file is not the context window: `cat
+		-- big.txt > copy.txt` used to write a copy 1000 lines long, with exit 0 and
+		-- the truncation note landing on a stderr that no file ever sees. The cap
+		-- itself is still pinned above; what is pinned here is that a redirect --
+		-- including one at the END of a pipeline, which is where the whole
+		-- pipeline's data is headed -- turns it off, and that a plain read keeps it.
+		local wide = {}
+		for i = 1, 1200 do wide[i] = "l" .. i end
+		file("big.txt", table.concat(wide, "\n") .. "\n")
+		contains("cat big.txt", "TRUNCATED")
+		check("cat big.txt 2>/dev/null | wc -l", "1000")
+		check("cat big.txt > copy.txt; wc -l < copy.txt", "1200")
+		contains("cat big.txt | wc -l > n.txt; cat n.txt", "1200")
+		term:shell("rm big.txt copy.txt n.txt")
 		return count
 	end)
 	fixture:Destroy()

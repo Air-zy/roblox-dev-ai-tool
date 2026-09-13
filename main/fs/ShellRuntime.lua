@@ -98,6 +98,21 @@ local function readLine(input: any, raw: boolean): (string, boolean, { [number]:
 	return table.concat(out), false, escaped
 end
 
+-- Does this node's STDOUT end up in a file? The output caps here exist to keep a
+-- command from evicting the context window, and a file is not the context
+-- window: see runList. `2>` is the wrong stream, `<` and `<<` are the wrong
+-- direction, and `>&1` duplicates a descriptor rather than opening anything.
+local function writesFile(node: any): boolean
+	for _, redir in ipairs(node.redirects) do
+		local op = redir.op
+		if op:sub(1, 1) ~= "2" and op:find(">", 1, true) and not op:find("<", 1, true)
+			and not op:find(">&", 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
 local function execute(ast: any, terminal: any, api: any, budget: any, input: any, depth: number): any
 	if depth > 32 then return errorResult("shell call depth exceeds 32") end
 	local state = terminal.shellState
@@ -457,6 +472,20 @@ local function execute(ast: any, terminal: any, api: any, budget: any, input: an
 			if statement.joiner == "&&" and last.code ~= 0 or statement.joiner == "||" and last.code == 0 then continue end
 			if statement.joiner == "||" then lastProse = nil end
 			if lastProse then emit(parts, 1, lastProse .. "\n", budget); lastProse = nil end
+			-- The output caps are a context-window measure, so they come off when the
+			-- data is going into a FILE instead: `cat big.luau > copy.luau` was
+			-- writing a copy 1000 lines long, with exit 0 and the truncation note on
+			-- a stderr that no file ever sees. Decided per STATEMENT, from the last
+			-- stage, because that is the stage holding the redirect and a pipeline
+			-- feeding it has to pass the whole file through: `cat big.luau | grep x >
+			-- hits.luau` means all of big.luau, not its first 1000 lines.
+			--
+			-- On the terminal because fork() clones it, so every stage, loop body and
+			-- called function inherits it, and Runtime.run clears it, so an error
+			-- thrown past this restore cannot leave the caps off for the session.
+			local outerToFile = terminal.toFile
+			local tail = statement.stages[#statement.stages]
+			terminal.toFile = terminal.toFile or (tail ~= nil and writesFile(tail))
 			local inputStream = stream
 			for index, stage in ipairs(statement.stages) do
 				if #statement.stages > 1 then
@@ -472,6 +501,7 @@ local function execute(ast: any, terminal: any, api: any, budget: any, input: an
 				end
 				inputStream = { text = text(last, 1), at = 1, connected = true, preserveNewline = last.preserveNewline }
 			end
+			terminal.toFile = outerToFile
 			if statement.negate then last.code = last.code == 0 and 1 or 0 end
 			state.status = last.code
 			absorb(parts, last, budget)
@@ -486,6 +516,10 @@ end
 
 function Runtime.run(terminal: any, line: string?, api: any): (string, number)
 	terminal.shellState = terminal.shellState or initialState(terminal)
+	-- Cleared per line, not per statement: the restore in runList is on the happy
+	-- path, and a Terminal outlives the line it ran, so a throw between the two
+	-- would leave every cap off for the rest of the session.
+	terminal.toFile = nil
 	local ok, ast = pcall(Syntax.parse, line or "")
 	if not ok then terminal.shellState.status = 2; return "bash: " .. tostring(ast), 2 end
 	local ran, answer = pcall(execute, ast, terminal, api, { steps = 10000, bytes = 0 },

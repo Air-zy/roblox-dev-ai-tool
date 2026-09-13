@@ -159,7 +159,9 @@ function Terminal:cat(path: string?): (string?, string?, string?)
 	local source = getSource(target)
 	if source then
 		local lines = splitLines(source)
-		if #lines <= MAX_CAT_LINES then
+		-- `self.toFile` is stdout going to a file rather than to the model, and
+		-- this cap is only about what the model has to read: see ShellRuntime.runList.
+		if self.toFile or #lines <= MAX_CAT_LINES then
 			return source, nil
 		end
 		-- The range form rather than `head | tail`, which needed a subtraction on
@@ -309,7 +311,7 @@ function Terminal:find(path: string?, test: (Instance) -> boolean, opts: FindOpt
 	local results: { Instance } = {}
 	local skipped = 0
 	local function keep(inst: Instance)
-		if #results >= MAX_RESULTS then
+		if #results >= MAX_RESULTS and not self.toFile then
 			skipped += 1
 		else
 			results[#results + 1] = inst
@@ -388,7 +390,7 @@ function Terminal:grep(programs: { any }?, path: (string | { string })?, opts: F
 
 	local filter = scopeFilter or {}
 	local results: { GrepMatch } = {}
-	local budget = MAX_RESULTS
+	local budget = self.toFile and math.huge or MAX_RESULTS
 	local skipped = 0
 	-- What -c has to answer, which the hit list cannot: MAX_RESULTS caps what is
 	-- EMITTED, not what is scanned, so counting hits reports how many fit rather
@@ -538,7 +540,7 @@ function Terminal:tree(path: string?, depth: number?, opts: TreeOpts?): (string?
 					and (Fs.modeBit(child, "x") and "*" or "")
 					or "/"
 			end
-			if #lines >= MAX_TREE then
+			if #lines >= MAX_TREE and not self.toFile then
 				skipped += 1
 				continue
 			end

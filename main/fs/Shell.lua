@@ -1253,7 +1253,7 @@ HANDLERS.ls = function(self, argv)
 	-- only rows with no subtree behind them, and says how many.
 	local out: { string } = {}
 	local atRoot = self:resolve(target) == game
-	local budget = atRoot and math.huge or MAX_LIST
+	local budget = (atRoot or self.toFile) and math.huge or MAX_LIST
 	local skipped = 0
 	local firstDropped: string? = nil
 	local emptyLabel: string? = nil
@@ -2351,7 +2351,7 @@ HANDLERS.find = function(self, argv)
 				seen[inst] = true
 				-- Capped across the whole command, not per root: N roots must not
 				-- buy N times the ceiling every other search is held to.
-				if #found >= MAX_LIST then
+				if #found >= MAX_LIST and not self.toFile then
 					skipped += 1
 				else
 					found[#found + 1] = inst

@@ -327,6 +327,22 @@ The flaw this section used to end on — trailers riding on stdout, so a cap
 warning was itself data — is closed: they are stderr, and a pipe does not carry
 them.
 
+Every one of those caps answers a single question — what the *model* has to read
+— so when the output is not going to the model they come off. `> file` is that
+case: `cat big.luau > copy.luau` writes all 3182 lines, `ls > listing.luau` all
+105 rows, and the truncation note has nothing left to report. The decision is
+per statement, taken from the last stage (`ShellRuntime.runList`), so a pipeline
+ending in a file passes the whole file through it — `cat big.luau | grep x >
+hits.luau` searches 3182 lines, not 1000 — and it is inherited, so a loop body
+redirected as a whole is uncapped too. `Runtime.run` clears it per line, because
+a Terminal outlives the line and a cap that stayed off would be invisible.
+
+This is bash's own behaviour, and the version that capped a redirect was the
+deviation: `cat big.luau > copy.luau` wrote a copy silently 1000 lines long,
+exit 0, its only warning on a stderr that no file ever sees. The remaining
+ceiling is the `.Source` setter's own 200 000 character refusal, which is loud
+and refuses the whole write.
+
 ---
 
 ## 6. Performance — 10k nested instances
