@@ -86,8 +86,17 @@ local CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for 
 -- under GET /v1/models, which reports max_tokens AND max_input_tokens per model
 -- and is the upgrade path if this is ever wrong again. Three models and a 400
 -- that says so is not yet worth a fetch and a cache.
+--
+-- `bound` marks models whose thinking blocks are tied to the exact prefix they
+-- were produced under ("preserved thinking"). Microcompact rewrites old
+-- tool_result content in place, and a system prompt or tool toggle mid-session
+-- is an edit too; on accounts created from 2026-08-31 a replayed block after any
+-- of those is a 400. drop_block makes the server drop the stale blocks instead.
+-- https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
 local MODEL_CAPS: { [string]: { thinking: string, effort: boolean, maxOutput: number,
-	context: number } } = {
+	context: number, bound: boolean? } } = {
+	["claude-opus-5-5"]           = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000, bound = true },
+	["claude-fable-5-1"]          = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000, bound = true },
 	["claude-opus-5"]             = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
 	["claude-sonnet-5"]           = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
 	["claude-haiku-4-5"]          = { thinking = "budget",   effort = false, maxOutput = 64000,  context = 200000 },
@@ -95,7 +104,7 @@ local MODEL_CAPS: { [string]: { thinking: string, effort: boolean, maxOutput: nu
 local DEFAULT_CAPS = { thinking = "adaptive", effort = true, maxOutput = 64000, context = 200000 }
 
 local function capsFor(model: string): { thinking: string, effort: boolean, maxOutput: number,
-	context: number }
+	context: number, bound: boolean? }
 	return MODEL_CAPS[model] or DEFAULT_CAPS
 end
 
@@ -141,11 +150,12 @@ end
 -- naming a vendor in a file that is not allowed to. Composing here is free;
 -- parsing it back cost a heuristic that guessed wrong on a two-word vendor.
 local MODELS = {
-	{ id = "claude-sonnet-5",  label = "Claude Sonnet 5 (recommended)", name = "Sonnet 5",  hint = "recommended" },
-	{ id = "claude-opus-5",    label = "Claude Opus 5 (Max only)",      name = "Opus 5",    hint = "Max only" },
+	{ id = "claude-opus-5-5",  label = "Claude Opus 5.5 (recommended)", name = "Opus 5.5",  hint = "recommended" },
+	{ id = "claude-fable-5-1", label = "Claude Fable 5.1 (most capable)", name = "Fable 5.1", hint = "most capable" },
+	{ id = "claude-sonnet-5",  label = "Claude Sonnet 5 (balanced)",    name = "Sonnet 5",  hint = "balanced" },
 	{ id = "claude-haiku-4-5", label = "Claude Haiku 4.5 (fastest)",    name = "Haiku 4.5", hint = "fastest" },
 }
-local DEFAULT_MODEL = "claude-sonnet-5"
+local DEFAULT_MODEL = "claude-opus-5-5"
 
 -- Whether `/model <arg>` should accept an id the list above has never heard of,
 -- so a model released after this build can still be reached by name. The check
@@ -192,6 +202,9 @@ local function applyReasoning(bodyTable: { [string]: any }, model: string, effor
 		-- API reference contradicts it. The real cause was never found. If empty
 		-- thinking blocks come back, this line is not what fixed it.
 		bodyTable.thinking = { type = "adaptive", display = "summarized" }
+		if caps.bound then
+			bodyTable.thinking.block_binding = { prefix_mismatch_behavior = "drop_block" }
+		end
 	elseif caps.thinking == "budget" then
 		-- Thinking tokens come out of max_tokens, and the API requires the budget
 		-- to be strictly under it. There is nothing to tune: a budget is a
@@ -654,7 +667,9 @@ local function streamMessage(args: {
 				headers = {
 					["Authorization"] = "Bearer " .. (accessToken :: string),
 					["anthropic-version"] = ANTHROPIC_VERSION,
-					["anthropic-beta"] = ANTHROPIC_BETA,
+					["anthropic-beta"] = if capsFor(model).bound
+						then ANTHROPIC_BETA .. ",thinking-binding-controls-2026-08-01"
+						else ANTHROPIC_BETA,
 					["x-app"] = "cli",
 					["content-type"] = "application/json",
 					["accept"] = "text/event-stream",
@@ -783,6 +798,16 @@ local function selfTest(): (boolean, string?)
 	end
 	if not adaptive.output_config or adaptive.output_config.effort ~= "xhigh" then
 		return false, "effort did not reach output_config on a model that supports it"
+	end
+
+	if adaptive.thinking.block_binding ~= nil then
+		return false, "block_binding was sent to a model without preserved thinking"
+	end
+	local bound: { [string]: any } = { max_tokens = 128000 }
+	applyReasoning(bound, "claude-opus-5-5", "high")
+	if not bound.thinking.block_binding
+		or bound.thinking.block_binding.prefix_mismatch_behavior ~= "drop_block" then
+		return false, "a preserved-thinking model will 400 after microcompact edits its history"
 	end
 
 	local budget: { [string]: any } = { max_tokens = 64000 }

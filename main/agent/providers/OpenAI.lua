@@ -33,11 +33,12 @@ local RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 -- not whether an id supports Responses, function calling, reasoning, or web
 -- search, so turning it directly into a picker would offer unusable audio,
 -- image and embedding models. `/model <id>` still allows another compatible id.
+-- Context is this endpoint's ceiling, max_context_window in Codex's own
+-- codex-rs/models-manager/models.json, not the Platform API's 1.05M.
 OpenAI.MODELS = {
-	{ id = "gpt-6-astra", label = "GPT-6 Astra", name = "GPT-6 Astra", hint = "most capable · 1.05M", context = 1050000 },
-	{ id = "gpt-5.6-sol", label = "GPT-5.6 Sol", name = "GPT-5.6 Sol", hint = "flagship · 1.05M", context = 1050000 },
-	{ id = "gpt-5.6-terra", label = "GPT-5.6 Terra", name = "GPT-5.6 Terra", hint = "balanced · 1.05M", context = 1050000 },
-	{ id = "gpt-5.6-luna", label = "GPT-5.6 Luna", name = "GPT-5.6 Luna", hint = "cost-sensitive · 1.05M", context = 1050000 },
+	{ id = "gpt-6-astra", label = "GPT-6 Astra", name = "GPT-6 Astra", hint = "most capable · 872K", context = 872000 },
+	{ id = "gpt-6-sol", label = "GPT-6 Sol", name = "GPT-6 Sol", hint = "workhorse · 872K", context = 872000 },
+	{ id = "gpt-6-luna", label = "GPT-6 Luna", name = "GPT-6 Luna", hint = "fast, affordable · 872K", context = 872000 },
 }
 OpenAI.DEFAULT_MODEL = "gpt-6-astra"
 
