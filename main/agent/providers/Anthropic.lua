@@ -84,7 +84,7 @@ local CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for 
 -- here were copied from Claude Code's own table and were already wrong for two
 -- of these three. Claude Code keeps the same table but treats it as a fallback
 -- under GET /v1/models, which reports max_tokens AND max_input_tokens per model
--- and is the upgrade path if this is ever wrong again. Three models and a 400
+-- and is the upgrade path if this is ever wrong again. Five models and a 400
 -- that says so is not yet worth a fetch and a cache.
 --
 -- `bound` marks models whose thinking blocks are tied to the exact prefix they

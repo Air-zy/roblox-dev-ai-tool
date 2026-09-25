@@ -148,6 +148,8 @@ handlers["/code"] = function(_, raw)
 end
 
 handlers["/logout"] = function()
+	-- Resets the conversation a running turn is still appending to.
+	if Sessions.blockedByTurn() then return end
 	Provider.auth.logout()
 	Agent.reset()
 	Console.appendLine("Logged out.", "info")
@@ -214,6 +216,9 @@ handlers["/provider"] = function(arg)
 		Console.appendLine("Already on " .. Provider.label(arg) .. ".", "info")
 		return
 	end
+	-- Before Provider.use, not after it: Sessions.new refuses mid-turn too, but by
+	-- then the wire has already changed under the turn that is still running.
+	if Sessions.blockedByTurn() then return end
 	if not Provider.use(arg) then
 		Console.appendLine("Unknown provider: " .. arg, "error")
 		return
@@ -290,6 +295,9 @@ local SELF_TESTS: { { name: string, run: () -> (boolean, string?) } } = {
 }
 
 handlers["/selftest"] = function()
+	-- The agent check points Provider.wire at a fake and the console check clears
+	-- the screen, both of which a running turn would walk straight into.
+	if Sessions.blockedByTurn() then return end
 	local failures: { string } = {}
 	local passed = 0
 	for _, entry in ipairs(SELF_TESTS) do

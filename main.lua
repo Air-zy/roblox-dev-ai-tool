@@ -1039,7 +1039,10 @@ local function drawPopup()
 		for i, entry in ipairs(Provider.list()) do
 			popupRow(i + 2, entry.label, entry.id == Provider.id and "check-small" or nil,
 				entry.hint, false, function()
-					if entry.id ~= Provider.id then
+					-- Refused mid-turn BEFORE the switch: Sessions.new would refuse too,
+					-- but only after Provider.use had already swapped the wire under a
+					-- turn still running on the old one's conversation.
+					if entry.id ~= Provider.id and not Sessions.blockedByTurn() then
 						Provider.use(entry.id)
 						Settings.reloadModel()
 						-- The conversation is shaped by whoever produced it, so it
@@ -1359,7 +1362,7 @@ inputBox.FocusLost:Connect(function(enterPressed: boolean, cause: InputObject?)
 		inputBox:CaptureFocus()
 		-- After CaptureFocus, not before: focusing moves the caret itself.
 		task.defer(function() inputBox.CursorPosition = index + 1 end)
-	elseif Agent.isBusy() and not shellMode then
+	elseif Agent.isBusy() and not shellMode and not inputBox.Text:match("^%s*/") then
 		-- The draft stays put and nothing is sent; typing carries on.
 		--
 		-- Shell mode is exempt: the line goes to the terminal and never near the
@@ -1367,6 +1370,12 @@ inputBox.FocusLost:Connect(function(enterPressed: boolean, cause: InputObject?)
 		-- the reason to be in the shell at all. Nothing reaches Claude from here
 		-- either way — submit routes every non-slash line to the terminal while
 		-- the mode is on, and a slash line was never Claude's to begin with.
+		--
+		-- Slash lines are exempt for the same reason, which also makes `/sh` a way
+		-- INTO the shell mid-turn. The few that would pull something out from
+		-- under the turn (/clear, /logout, a /provider switch, /selftest) refuse
+		-- on their own through Sessions.blockedByTurn, which is where that check
+		-- belongs: /help and /find have nothing to wait for.
 		inputBox:CaptureFocus()
 	else
 		-- Same space, at the end this time.

@@ -421,8 +421,17 @@ function Console.discard(holder: Frame)
 end
 
 function Console.onScreen(fn: () -> ())
+	Console.into(output, fn)
+end
+
+-- Draws whatever fn appends into `target` instead of wherever the sink points:
+-- the visible frame for onScreen, or a subagent's own console inside its row.
+-- Safe with several subagents drawing at once only because nothing here yields:
+-- the sink is read when a block is CREATED, and creating one never waits, so no
+-- other thread can append while the sink points somewhere else.
+function Console.into(target: Instance, fn: () -> ())
 	local previous = sink
-	sink = output
+	sink = target
 	local ok, err = pcall(fn)
 	sink = previous
 	if not ok then error(err, 0) end
@@ -1262,6 +1271,9 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 	-- Both stay nil/empty for a call that changed no source, which is most.
 	local diffHolder: Frame? = nil
 	local changeLabel = ""
+	-- A console of the row's own, made by nest() for a subagent to draw into.
+	-- Declared up here with the other state the click handler closes over.
+	local nested: Frame? = nil
 
 	-- The raw argument JSON as it streams, before there is anything parsed to
 	-- show. Kept separately from `detail` because it is replaced wholesale the
@@ -1331,6 +1343,7 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 	header.MouseButton1Click:Connect(function()
 		expanded = not expanded
 		detailBox.Visible = expanded
+		if nested then nested.Visible = expanded end
 		-- Re-rendered on open because appendInput skips the render while the block
 		-- is closed. Without this, expanding a call mid-stream showed whatever was
 		-- there when it was last open, which for a `write` is nothing at all.
@@ -1390,6 +1403,36 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 			pending = false
 			if stopSpin then stopSpin() end
 			renderHeader()
+		end,
+		-- A console inside this row, for a subagent to draw its work into with
+		-- Console.into. Below the prompt and result, and open exactly when the
+		-- row is: collapsed, a subagent costs one line of the main console.
+		-- Made on first use and the same frame every call after.
+		nest = function(): Frame
+			if nested then return nested end
+			local frame = make("Frame", {
+				Name = "Nested",
+				Parent = container,
+				BackgroundColor3 = Theme.BG_SURFACE,
+				BorderSizePixel = 0,
+				Size = UDim2.new(1, 0, 0, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				LayoutOrder = 5,
+				Visible = expanded,
+			})
+			make("UIListLayout", {
+				Parent = frame,
+				Padding = UDim.new(0, 3),
+				SortOrder = Enum.SortOrder.LayoutOrder,
+			})
+			make("UIPadding", {
+				Parent = frame,
+				PaddingLeft = UDim.new(0, 12),
+				PaddingTop = UDim.new(0, 4),
+				PaddingBottom = UDim.new(0, 4),
+			})
+			nested = frame
+			return frame
 		end,
 		-- The source this call changed, handed over by Tools.dispatch. Absent
 		-- The source this call changed, handed over by Tools.dispatch. Absent
@@ -1610,6 +1653,21 @@ function Console.selfTest(): (boolean, string?)
 		if peeked.Parent ~= nil then return false, "reattach kept the peeked session on screen" end
 		if Console.appendLine("selftest", "info").Parent ~= output then
 			return false, "reattach did not put the sink back"
+		end
+
+		-- A subagent's own console: what it draws lands inside its row, hidden
+		-- until the row is opened, and the next ordinary append is back in the
+		-- conversation.
+		local row = Console.appendToolCall("selftest", {})
+		local box = row.nest()
+		if row.nest() ~= box then return false, "nest() made a second console for the same row" end
+		if box.Visible then return false, "a nested console was open before its row was" end
+		local inside: TextBox = nil :: any
+		Console.into(box, function() inside = Console.appendLine("selftest", "info") end)
+		row.finish()
+		if inside.Parent ~= box then return false, "Console.into did not draw into its target" end
+		if Console.appendLine("selftest", "info").Parent ~= output then
+			return false, "Console.into did not put the sink back"
 		end
 
 		-- Anchors. A jump asks for a message index and has to land on the block

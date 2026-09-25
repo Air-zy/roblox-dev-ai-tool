@@ -181,6 +181,27 @@ that, but it gates on ownership and the setting that lifts the gate is off
 limits to plugins. Every load reports how many scripts came with it, so look
 before you run.
 
+agent hands a task to a subagent. That is the same tool loop over a fresh
+history holding only the prompt, with the parent's model, system prompt and tool
+list, and it returns only its final message. Its searching and reading never
+enter the conversation that asked for it, which is the point.
+
+- **Parallel.** Several agent calls in one reply run side by side. Every other
+  tool still runs one at a time, in order.
+- **Own shell.** Each child gets its own Terminal, so its `cd` never moves yours.
+- **Its own console.** Opening the agent row shows the child working inside it:
+  its text as it streams, its thinking, and its tool calls with their diffs.
+  Nothing a child does lands in the main console. It is live only: only the
+  child's final message is stored, so a reopened session shows the agent call and
+  its result and nothing inside it.
+- **No nesting.** A child cannot start agents of its own. The tool stays in its
+  list and is refused when called, because the tool block is the front of the
+  cached prefix and removing it would lose the cache.
+- **Stop** cancels every child. A tool a child is already running finishes first,
+  like any other tool.
+- **Undo.** Writes from parallel children that overlap in time fold into one
+  Ctrl+Z step, since a plugin gets one recording at a time.
+
 curl fetches a URL and writes the body to stdout, so it composes with everything
 else: `curl URL | grep -n thing`, `| sed -n '1,80p'`, or `> /ServerStorage/tmp/doc.luau`
 to keep it. -X -H -d --json --data-urlencode -G and the header shorthands -e -b -r

@@ -429,8 +429,11 @@ Do not call these fidelity bugs:
 - A localhost OAuth callback or external helper process.
 - `store=true` and server-stored response continuation.
 - Codex telemetry, analytics, feedback, experiments, or update channels.
-- MCP servers, subagents, cloud tasks, shell sandboxing, approval policies, and
-  Git worktrees belonging to the full Codex runtime.
+- MCP servers, cloud tasks, shell sandboxing, approval policies, and Git
+  worktrees belonging to the full Codex runtime. The same goes for Codex's
+  `spawn_agent`/`wait_agent`/`close_agent` family: subagents here are Claude
+  Code's blocking `agent` tool (see `CLAUDE_FIDELITY.md` §2), and they work on
+  this provider like any other tool.
 - Bedrock/Azure/custom OpenAI-compatible providers.
 - Showing private chain-of-thought. The supported UI is a reasoning summary.
 - Sending unsupported public Responses fields to the private Codex route merely

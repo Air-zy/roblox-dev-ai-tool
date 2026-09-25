@@ -297,6 +297,20 @@ local sessionStartedAt = os.clock()
 -- searches hit it most, being the slowest turns and the likeliest to be paused.
 local pendingCalls: { [string]: any } = {}
 
+-- The one tool the loop itself has to know by name: consecutive calls to it run
+-- side by side, and a subagent refuses it. See Agent.runChild.
+local AGENT_TOOL = "agent"
+
+-- The cancel function of every subagent running now. Stop calls them all; each
+-- child removes its own when it returns.
+local children: { [() -> ()]: boolean } = {}
+
+-- The console row of each agent call being dispatched, keyed by the coroutine
+-- dispatching it, so the child it starts can draw into that row. Keyed the way
+-- Terminal keys its capture scopes, and for the same reason: Tools.dispatch hands
+-- a tool only (term, input), and dispatch runs the tool on the caller's thread.
+local agentRows: { [thread]: any } = {}
+
 -- os.time() of the last request. nil means none has gone out, so there is no
 -- cached prefix to protect, a restored session starts here too, since its
 -- prefix was last written by whichever session saved it.
@@ -828,6 +842,434 @@ local function budgetContinuation(): string?
 		math.floor(budgetSpent / target * 100 + 0.5), withCommas(budgetSpent), withCommas(target))
 end
 
+-- Shared by a turn and a subagent
+-- A reply's usage into the session totals, returning the prompt it measured.
+-- `totals.prompt` is deliberately not set here: it is the size of the MAIN
+-- conversation's window, and a subagent's request says nothing about that.
+local function spend(usage: any): number
+	local prompt = (usage.input_tokens or 0)
+		+ (usage.cache_read_input_tokens or 0)
+		+ (usage.cache_creation_input_tokens or 0)
+	totals.input += prompt
+	totals.cached += usage.cache_read_input_tokens or 0
+	-- Kept apart from `cached` rather than summed with it: a read is
+	-- charged at a tenth and a write at one and a quarter, so one number
+	-- for both is the one thing a cache figure must not be.
+	totals.cacheWrite += usage.cache_creation_input_tokens or 0
+	totals.output += usage.output_tokens or 0
+	totals.requests += 1
+	return prompt
+end
+
+-- A finished reply as the assistant message to store, and the tool calls in it.
+-- The content is nil when the reply is to be left out of the history entirely.
+local function assemble(result: any): (any?, { any })
+	-- One assistant message holding ALL content blocks. Splitting text and
+	-- tool_use into separate messages breaks the tool_use/tool_result
+	-- pairing Anthropic validates.
+	local assistantContent: { any } = {}
+	local toolUses: { any } = {}
+	for _, block in ipairs(result.contentBlocks or {}) do
+		if block.type == "thinking" and block.signature then
+			-- REQUIRED inside a tool-use turn, not an optimisation: the model
+			-- pauses mid-response to call the tool and resumes the same
+			-- response when the result comes back, so the reasoning that
+			-- chose the call has to still be there. Anthropic's rule is that
+			-- the run of thinking blocks in the latest assistant message must
+			-- match what it generated, they cannot be reordered, edited, or
+			-- partly dropped. Replayed verbatim: under display "summarized"
+			-- the text is a summary, and the signature is what the server
+			-- decrypts to recover the real thinking.
+			table.insert(assistantContent, {
+				type = "thinking",
+				thinking = block.thinking,
+				signature = block.signature,
+			})
+		elseif block.type == "redacted_thinking" and block.raw then
+			-- Safety-redacted reasoning: no deltas and no readable text, so
+			-- the whole block lands at content_block_start and the raw copy IS
+			-- the block. Matching only on "thinking" would drop these silently
+			-- and break the same pairing.
+			table.insert(assistantContent, block.raw)
+		elseif block.type == "text" and block.text ~= "" then
+			table.insert(assistantContent, {
+				type = "text",
+				text = block.text,
+				citations = block.citations,
+			})
+		elseif block.type == "tool_use" then
+			table.insert(assistantContent, {
+				type = "tool_use",
+				id = block.id,
+				name = block.name,
+				input = toolInput(block),
+				-- Opaque and optional. OpenAI uses this to retain the exact
+				-- Responses function_call item on function-only turns; every
+				-- other provider leaves it nil and keeps the old history shape.
+				providerState = block.providerState,
+			})
+			table.insert(toolUses, block)
+		elseif block.type == "server_tool_use" then
+			-- Anthropic ran this one. We replay it but never dispatch it,
+			-- so it is deliberately NOT added to toolUses.
+			table.insert(assistantContent, {
+				type = "server_tool_use",
+				id = block.id,
+				name = block.name,
+				input = toolInput(block),
+			})
+		elseif isServerResult(block.type) and block.raw then
+			-- Server tool results arrive complete and are replayed verbatim.
+			-- Dropping one while keeping its server_tool_use would leave an
+			-- unanswered call in the history. Matched by an explicit list,
+			-- not "has a raw field": thinking blocks have one too, and their
+			-- raw copy is the empty shell from content_block_start, before
+			-- any delta filled it in.
+			table.insert(assistantContent, block.raw)
+		end
+	end
+
+	local storedContent = if #assistantContent > 0 then assistantContent else result.text
+	-- Codex can send an empty response as a continuation bridge. Its
+	-- native loop records no invented message in that case, and inserting
+	-- "(empty)" changes the next prompt as well as polluting restored
+	-- sessions. Only OpenAI opts into omission; the other providers retain
+	-- the previous non-empty fallback exactly.
+	if not result.omitEmpty or (storedContent ~= nil and storedContent ~= "") then
+		return (storedContent ~= nil and storedContent or "(empty)"), toolUses
+	end
+	return nil, toolUses
+end
+
+-- Runs one tool_use and returns its tool_result. Every tool_use needs a
+-- matching tool_result, including ones whose input failed to parse, an
+-- unanswered tool_use is a protocol error, so failures go back as error text.
+-- `call` is the console row the result is written into.
+local function runToolUse(shell: any, block: any, call: any, stopReason: string?): any
+	local toolResult: string
+	-- Set beside toolResult by dispatch; nil unless the call wrote source.
+	local sourceChanges: { any }? = nil
+	-- Whether the input never parsed, as opposed to a tool that ran and
+	-- returned an error string. Only the first is a protocol-level
+	-- failure, and only it sets is_error on the result below.
+	local inputFailed = false
+	if block.inputParsed then
+		-- The arguments only exist now; the header has been up since the
+		-- model started writing the call.
+		call.setInput(block.inputParsed)
+		toolResult, sourceChanges = Tools.dispatch(shell, block.name, block.inputParsed)
+		-- A tool_result whose content is "" is rejected outright, and on
+		-- turn > 1 it cannot be rolled back: the tool_use is already in
+		-- the history above, so every retry resends the same poisoned
+		-- pair and fails identically, a dead session from one command
+		-- that happened to print nothing. Reached by `cat` of an empty
+		-- script, `diff` of two identical ones, bare `echo`, sort/uniq/tr
+		-- with no stdin, and anything redirected to /dev/null. Guarded
+		-- here rather than in each handler because "" is a correct result
+		-- for /sh; it is only invalid on the wire.
+		if toolResult == "" then toolResult = "(no output)" end
+		call.setResult(toolResult)
+		-- The scripts this call changed, if any. Console-only: it is
+		-- not in toolResult, so nothing here reaches the provider or
+		-- costs a token.
+		call.setChanges(sourceChanges)
+	else
+		inputFailed = true
+		-- Naming the stop reason is what makes this recoverable: on
+		-- "max_tokens" the input was cut off mid-JSON, and the answer
+		-- is to send less rather than to send the same thing again.
+		toolResult = string.format(
+			"error: tool input was not valid JSON (stop_reason: %s) — if it was truncated, retry with a smaller input",
+			tostring(stopReason))
+		-- The raw fragment is the only thing that says WHERE the JSON
+		-- died, so it goes in the expandable body rather than being
+		-- summarised away. warn() as well: MAX_DETAIL_CHARS clips the
+		-- body, and a truncated multiedit is exactly the case that
+		-- overruns it, the Output window keeps the whole thing.
+		warn(string.format("[agent] %s: unparsed tool input (stop_reason: %s): %s",
+			tostring(block.name), tostring(stopReason), tostring(block.input)))
+		-- Same block, now red and carrying the fragment. It has been on
+		-- screen spinning since the model started the call, so appending a
+		-- second one would leave the first hanging.
+		call.setInput({ raw_input = tostring(block.input) })
+		call.setResult(toolResult, true)
+	end
+	return {
+		type = "tool_result",
+		tool_use_id = block.id,
+		content = toolResult,
+		-- `or nil` so the field is absent rather than false: this is the
+		-- documented signal for input that could not be parsed, and now
+		-- that eager_input_streaming is on it is a live path rather than
+		-- a max_tokens rarity. A tool that ran and failed is NOT this;
+		-- its error is an ordinary result the model reads and retries.
+		is_error = inputFailed or nil,
+	}
+end
+
+-- Runs jobs side by side and returns once every one has finished. A single job
+-- runs inline, which keeps an ordinary tool call on exactly the path it always
+-- took. Jobs must not throw: one that never gets to the counter leaves the
+-- caller asleep for good, which is why runTurn's jobs answer their own failures.
+local function runAll(jobs: { () -> () })
+	if #jobs == 1 then
+		jobs[1]()
+		return
+	end
+	local left = #jobs
+	local waiter: thread? = nil
+	for _, job in ipairs(jobs) do
+		task.spawn(function()
+			job()
+			left -= 1
+			if left == 0 and waiter then
+				task.defer(waiter)
+			end
+		end)
+	end
+	-- Nothing else runs between these two lines, so the last job cannot finish
+	-- in the gap and find no one to wake.
+	if left > 0 then
+		waiter = coroutine.running()
+		coroutine.yield()
+	end
+end
+
+-- Subagents
+-- A task handed to a second run of the tool loop, with its own history and its
+-- own shell, returning only its final message: the caller's context never holds
+-- the child's searching and reading. This is Claude Code's plain Agent tool, and
+-- the shape a Codex spawn_agent followed by wait_agent adds up to.
+--
+-- The request is the parent's byte for byte up to the messages: same model,
+-- system prompt and tool list, `agent` included. Caching is a prefix match and
+-- the tool block is the front of it, so taking `agent` out of the child's list
+-- would re-write that whole prefix on every child; keeping it and refusing the
+-- call reads the parent's cached tools and system prompt instead. Claude Code's
+-- fork path keeps its Agent tool in the child for the same reason.
+--
+-- ponytail: no concurrency cap, every agent call in a batch opens its stream at
+-- once; cap it if a provider's rate limit starts to bite.
+-- ponytail: a child's history is never trimmed; give it clearOldToolResults (on
+-- a clock of its own) once children run long enough to need it.
+-- ponytail: children are not saved or resumable, only their result reaches the
+-- parent's conversation.
+local CHILD_NOTE = "\n\nYou are running as a subagent: do the task with your tools "
+	.. "(the agent tool is not available to you), then reply with a concise report; "
+	.. "that final message is all the caller receives."
+local STOPPED = "stopped by the user"
+
+function Agent.runChild(parentTerm: any, input: { [string]: any }): string
+	-- Its own cwd and shell variables, starting where the caller is, so a child's
+	-- `cd` never moves the user's. `.new` is reached through the instance's
+	-- metatable, which spares Agent a require across folders.
+	local shell = parentTerm.new(parentTerm:current())
+	local messages: { any } = {
+		{ role = "user", content = tostring(input.prompt or "") .. CHILD_NOTE },
+	}
+
+	-- Its own console, inside the agent row that started it. Everything the child
+	-- shows is drawn there, so it never adds a line to the main console, and it is
+	-- on screen exactly when that row is opened. With no row (the self-test calls
+	-- this directly) it draws wherever the sink already points.
+	local row = agentRows[coroutine.running()]
+	local nest: Frame? = if row then row.nest() else nil
+	local function draw(fn: () -> ())
+		if nest then
+			Console.into(nest, fn)
+		else
+			fn()
+		end
+	end
+
+	-- What the current round has on screen: runTurn's rendering, cut down to what
+	-- a child needs. One bubble at a time, split under a tool row so text written
+	-- after a call lands below it, and the rows of calls that have started and have
+	-- not been answered yet, keyed by id.
+	local bubble: any = nil
+	local bubbleText = ""
+	local splitPending = false
+	local thinkingSeen = false
+	local pending: { [string]: any } = {}
+	local function currentBubble(): any
+		if bubble == nil or splitPending then
+			if bubble then bubble.finishThinking() end
+			draw(function()
+				bubble = Console.createBubble()
+			end)
+			bubbleText = ""
+			splitPending = false
+			thinkingSeen = false
+		end
+		return bubble
+	end
+	local function beginCall(name: string, id: string?, callInput: { [string]: any }): any
+		splitPending = true
+		local call: any = nil
+		draw(function()
+			call = Console.appendToolCall(name, callInput)
+		end)
+		-- No id means nothing can ever pair a result to it, so no spinner.
+		if id then pending[id] = call else call.finish() end
+		return call
+	end
+
+	local cancelled = false
+	local stream: any = nil
+	local outcome: any = nil
+	local waiter: thread? = nil
+	-- The provider's callbacks, turned into a blocking call. A provider can call
+	-- back before streamMessage has even returned (not logged in, say), so the
+	-- outcome is kept and the thread only sleeps if nothing has arrived yet; and it
+	-- is woken with task.defer, after whoever settled it has finished, never from
+	-- inside them.
+	local function settle(result: any)
+		if outcome then return end
+		outcome = result
+		local thread = waiter
+		if thread then
+			waiter = nil
+			task.defer(thread)
+		end
+	end
+	local function cancel()
+		cancelled = true
+		if stream then stream.cancel() end
+		settle({ ok = false, error = STOPPED })
+	end
+	children[cancel] = true
+
+	local lastText = ""
+	local reply = STOPPED
+	while not cancelled do
+		outcome = nil
+		stream = Provider.wire.streamMessage({
+			model = Settings.model(),
+			system = Settings.system(),
+			messages = messages,
+			effort = Settings.effort(),
+			tools = buildTools(),
+			webSearch = Settings.webSearchMaxUses(),
+		}, {
+			onThinking = function(delta: string)
+				-- As in runTurn: a short thought summarises to empty deltas, so a
+				-- drawer only goes up once one carries an actual character.
+				if not thinkingSeen then
+					if not delta:match("%S") then return end
+					thinkingSeen = true
+				end
+				currentBubble().thinking().append(delta)
+			end,
+			onText = function(delta: string)
+				local target = currentBubble()
+				bubbleText ..= delta
+				target.setText(bubbleText)
+			end,
+			onToolUseStart = function(id: string?, name: string)
+				beginCall(name, id, {})
+			end,
+			onToolInput = function(id: string?, fragment: string)
+				local call = id and pending[id] or nil
+				if call then call.appendInput(fragment) end
+			end,
+			onServerToolUse = function(name: string, id: string?, serverInput: any)
+				beginCall(name, id, if type(serverInput) == "table" then serverInput else {})
+			end,
+			onServerToolResult = function(_name: string, toolUseId: string?, content: any)
+				local call = if toolUseId then pending[toolUseId] else nil
+				if call then
+					pending[toolUseId :: string] = nil
+					call.setResult(formatServerResult(content))
+				end
+			end,
+			onComplete = settle,
+			onError = function(message: string)
+				settle({ ok = false, error = message })
+			end,
+		})
+		-- Stopped while the request was still being set up (a token refresh
+		-- yields): the handle only exists now, so close it here, as runTurn does.
+		if cancelled and stream then
+			stream.cancel()
+		end
+		if not outcome then
+			waiter = coroutine.running()
+			coroutine.yield()
+		end
+		local result = outcome
+		-- The round's reply is done streaming; the next one starts a bubble of its own.
+		if bubble then bubble.finishThinking() end
+		bubble = nil
+		if cancelled then break end
+		if not result.ok then
+			local failure = "error: agent request failed: " .. tostring(result.error)
+			draw(function()
+				Console.appendLine(failure, "error")
+			end)
+			reply = failure
+			if lastText ~= "" then
+				reply ..= "\n\nits last message before that:\n" .. lastText
+			end
+			break
+		end
+
+		if result.usage then spend(result.usage) end
+		local content, toolUses = assemble(result)
+		if content ~= nil then
+			table.insert(messages, { role = "assistant", content = content })
+		end
+		-- Claude Code's fallback: a reply that ends on no text returns the last
+		-- one that had some, rather than nothing.
+		if type(result.text) == "string" and result.text ~= "" then
+			lastText = result.text
+		end
+
+		if #toolUses == 0 then
+			-- Same continuation the parent makes: sample again, nothing to attach.
+			if result.stopReason ~= "pause_turn" and result.stopReason ~= "continue_turn" then
+				reply = if lastText ~= "" then lastText else "(the agent finished without a final message)"
+				break
+			end
+		else
+			-- One at a time inside a child, each into the row its stream put up.
+			local results: { any } = {}
+			for _, block in ipairs(toolUses) do
+				if cancelled then break end
+				local call = block.id and pending[block.id] or nil
+				if block.id then pending[block.id] = nil end
+				if block.name == AGENT_TOOL then
+					local refusal = "error: a subagent cannot start agents; do the task directly"
+					if call then call.setResult(refusal, true) end
+					table.insert(results, {
+						type = "tool_result",
+						tool_use_id = block.id,
+						content = refusal,
+						is_error = true,
+					})
+				else
+					-- A stream that produced no start event for it, as runTurn covers.
+					if not call then
+						draw(function()
+							call = Console.appendToolCall(block.name, block.inputParsed or {})
+						end)
+					end
+					table.insert(results, runToolUse(shell, block, call, result.stopReason))
+				end
+			end
+			if cancelled then break end
+			capTurn(results)
+			table.insert(messages, { role = "user", content = results })
+		end
+	end
+	-- Anything still spinning is never getting a result: a Stop, or a request that
+	-- failed part way through a call.
+	for _, call in pairs(pending) do
+		call.finish()
+	end
+	children[cancel] = nil
+	return reply
+end
+
 -- One turn
 -- Streams a response, renders it, runs any tools it asked for, and recurses if
 -- Claude wants another round. `turn` is the recursion depth.
@@ -901,10 +1343,11 @@ local function runTurn(turn: number)
 	-- nothing, or worse, referenced a local that had not been assigned yet.
 	local stream: any = nil
 	local cancelRequested = false
-	-- The tool-call block currently executing. It is claimed OUT of pendingCalls
-	-- before dispatch, so setBusy's sweep cannot reach it, without this handle
-	-- its spinner turns forever after a Stop.
-	local runningCall: any = nil
+	-- The tool-call blocks currently executing, to the tool each one is. They are
+	-- claimed OUT of pendingCalls before dispatch, so setBusy's sweep cannot reach
+	-- them, without these handles their spinners turn forever after a Stop. A set,
+	-- because a batch of agent calls runs side by side.
+	local running: { [any]: string } = {}
 	-- The tool_use blocks onComplete has already committed to the history and
 	-- that nothing has answered yet. Stop has to answer them: Anthropic rejects
 	-- a tool_use with no matching tool_result, so abandoning a turn here would
@@ -971,14 +1414,22 @@ local function runTurn(turn: number)
 		if stream then stream.cancel() end
 		bubble.finishThinking()
 
-		if runningCall then
-			-- Honest about what Stop can and cannot do: the turn is abandoned, but
-			-- a chunk already executing keeps going until it returns on its own.
-			runningCall.setResult(
-				"stopped — the turn was abandoned, but this call is still running " ..
-					"and cannot be interrupted", true)
-			runningCall = nil
+		-- Subagents first. Cancelling one ends its request, and its agent row then
+		-- takes the child's "stopped" as its result, so those rows are left alone
+		-- below. A copy, because each child removes itself as it returns.
+		for cancelChild in pairs(table.clone(children)) do
+			cancelChild()
 		end
+		for call, name in pairs(running) do
+			if name ~= AGENT_TOOL then
+				-- Honest about what Stop can and cannot do: the turn is abandoned, but
+				-- a chunk already executing keeps going until it returns on its own.
+				call.setResult(
+					"stopped — the turn was abandoned, but this call is still running " ..
+						"and cannot be interrupted", true)
+			end
+		end
+		table.clear(running)
 
 		-- Leave the history in a shape the next request can build on.
 		if unanswered then
@@ -1135,17 +1586,7 @@ local function runTurn(turn: number)
 			-- Counted here rather than in the final-turn block below: a tool-use
 			-- turn returns early, and its tokens are just as billed.
 			if result.usage then
-				local prompt = (result.usage.input_tokens or 0)
-					+ (result.usage.cache_read_input_tokens or 0)
-					+ (result.usage.cache_creation_input_tokens or 0)
-				totals.input += prompt
-				totals.cached += result.usage.cache_read_input_tokens or 0
-				-- Kept apart from `cached` rather than summed with it: a read is
-				-- charged at a tenth and a write at one and a quarter, so one number
-				-- for both is the one thing a cache figure must not be.
-				totals.cacheWrite += result.usage.cache_creation_input_tokens or 0
-				totals.output += result.usage.output_tokens or 0
-				totals.requests += 1
+				local prompt = spend(result.usage)
 				-- Same counter, different window: totals is the session, this is
 				-- since the reader's last message, which is what a budget is for.
 				budgetSpent += result.usage.output_tokens or 0
@@ -1158,182 +1599,73 @@ local function runTurn(turn: number)
 				totals.prompt = prompt
 			end
 
-			-- One assistant message holding ALL content blocks. Splitting text and
-			-- tool_use into separate messages breaks the tool_use/tool_result
-			-- pairing Anthropic validates.
-			local assistantContent: { any } = {}
-			local toolUses: { any } = {}
-			for _, block in ipairs(result.contentBlocks or {}) do
-				if block.type == "thinking" and block.signature then
-					-- REQUIRED inside a tool-use turn, not an optimisation: the model
-					-- pauses mid-response to call the tool and resumes the same
-					-- response when the result comes back, so the reasoning that
-					-- chose the call has to still be there. Anthropic's rule is that
-					-- the run of thinking blocks in the latest assistant message must
-					-- match what it generated, they cannot be reordered, edited, or
-					-- partly dropped. Replayed verbatim: under display "summarized"
-					-- the text is a summary, and the signature is what the server
-					-- decrypts to recover the real thinking.
-					table.insert(assistantContent, {
-						type = "thinking",
-						thinking = block.thinking,
-						signature = block.signature,
-					})
-				elseif block.type == "redacted_thinking" and block.raw then
-					-- Safety-redacted reasoning: no deltas and no readable text, so
-					-- the whole block lands at content_block_start and the raw copy IS
-					-- the block. Matching only on "thinking" would drop these silently
-					-- and break the same pairing.
-					table.insert(assistantContent, block.raw)
-				elseif block.type == "text" and block.text ~= "" then
-					table.insert(assistantContent, {
-						type = "text",
-						text = block.text,
-						citations = block.citations,
-					})
-				elseif block.type == "tool_use" then
-					table.insert(assistantContent, {
-						type = "tool_use",
-						id = block.id,
-						name = block.name,
-						input = toolInput(block),
-						-- Opaque and optional. OpenAI uses this to retain the exact
-						-- Responses function_call item on function-only turns; every
-						-- other provider leaves it nil and keeps the old history shape.
-						providerState = block.providerState,
-					})
-					table.insert(toolUses, block)
-				elseif block.type == "server_tool_use" then
-					-- Anthropic ran this one. We replay it but never dispatch it,
-					-- so it is deliberately NOT added to toolUses.
-					table.insert(assistantContent, {
-						type = "server_tool_use",
-						id = block.id,
-						name = block.name,
-						input = toolInput(block),
-					})
-				elseif isServerResult(block.type) and block.raw then
-					-- Server tool results arrive complete and are replayed verbatim.
-					-- Dropping one while keeping its server_tool_use would leave an
-					-- unanswered call in the history. Matched by an explicit list,
-					-- not "has a raw field": thinking blocks have one too, and their
-					-- raw copy is the empty shell from content_block_start, before
-					-- any delta filled it in.
-					table.insert(assistantContent, block.raw)
-				end
-			end
-
-			local storedContent = if #assistantContent > 0 then assistantContent else result.text
-			-- Codex can send an empty response as a continuation bridge. Its
-			-- native loop records no invented message in that case, and inserting
-			-- "(empty)" changes the next prompt as well as polluting restored
-			-- sessions. Only OpenAI opts into omission; the other providers retain
-			-- the previous non-empty fallback exactly.
-			if not result.omitEmpty or (storedContent ~= nil and storedContent ~= "") then
-				table.insert(conversation, {
-					role = "assistant",
-					content = storedContent ~= nil and storedContent or "(empty)",
-				})
+			local content, toolUses = assemble(result)
+			if content ~= nil then
+				table.insert(conversation, { role = "assistant", content = content })
 				committed = true
 			end
 
-			-- Run the tools. Every tool_use needs a matching tool_result, including
-			-- ones whose input failed to parse, an unanswered tool_use is a
-			-- protocol error, so failures go back as error text.
+			-- Run the tools, each through runToolUse, which answers every one.
 			--
 			-- Published before the loop so a Stop landing mid-dispatch knows which
 			-- tool_use blocks it has to answer on the way out.
 			unanswered = toolUses
+			-- By index, so results keep the order of their calls whichever finishes
+			-- first.
 			local toolResults: { any } = {}
-			for _, block in ipairs(toolUses) do
-				-- Checked per tool, not just once: a turn can ask for several, and a
-				-- Stop pressed during the first should not be followed by the rest.
-				if cancelRequested then
-					break
-				end
-				local toolResult: string
-				-- Set beside toolResult by dispatch; nil unless the call wrote source.
-				local sourceChanges: { any }? = nil
-				-- Whether the input never parsed, as opposed to a tool that ran and
-				-- returned an error string. Only the first is a protocol-level
-				-- failure, and only it sets is_error on the result below.
-				local inputFailed = false
+			local function runOne(index: number)
+				local block = toolUses[index]
 				-- The block onToolUseStart put up while the input was streaming.
 				-- Claimed here so the cleanup in setBusy cannot finish a block this
-				-- loop is about to write a result into.
+				-- loop is about to write a result into. The fallback covers a stream
+				-- that somehow produced no start event, dispatch blocks this
+				-- thread for as long as the tool takes, and catalog/run/web calls
+				-- take seconds, so a spinner has to be saying which call the wait
+				-- belongs to either way.
 				local call = block.id and pendingCalls[block.id] or nil
 				if block.id then pendingCalls[block.id] = nil end
-				if block.inputParsed then
-					-- The arguments only exist now; the header has been up since the
-					-- model started writing the call. The fallback covers a stream
-					-- that somehow produced no start event, dispatch blocks this
-					-- thread for as long as the tool takes, and catalog/run/web calls
-					-- take seconds, so a spinner has to be saying which call the wait
-					-- belongs to either way.
-					if call then
-						call.setInput(block.inputParsed)
-					else
-						call = Console.appendToolCall(block.name, block.inputParsed)
-					end
-					-- Published so Stop can finish this block's spinner while the
-					-- call is still running, and cleared after so a later Stop does
-					-- not write a result over a block that already has one.
-					runningCall = call
-					toolResult, sourceChanges = Tools.dispatch(term, block.name, block.inputParsed)
-					runningCall = nil
-					-- A tool_result whose content is "" is rejected outright, and on
-					-- turn > 1 it cannot be rolled back: the tool_use is already in
-					-- the history above, so every retry resends the same poisoned
-					-- pair and fails identically, a dead session from one command
-					-- that happened to print nothing. Reached by `cat` of an empty
-					-- script, `diff` of two identical ones, bare `echo`, sort/uniq/tr
-					-- with no stdin, and anything redirected to /dev/null. Guarded
-					-- here rather than in each handler because "" is a correct result
-					-- for /sh; it is only invalid on the wire.
-					if toolResult == "" then toolResult = "(no output)" end
-					call.setResult(toolResult)
-					-- The scripts this call changed, if any. Console-only: it is
-					-- not in toolResult, so nothing here reaches the provider or
-					-- costs a token.
-					call.setChanges(sourceChanges)
-				else
-					inputFailed = true
-					-- Naming the stop reason is what makes this recoverable: on
-					-- "max_tokens" the input was cut off mid-JSON, and the answer
-					-- is to send less rather than to send the same thing again.
-					toolResult = string.format(
-						"error: tool input was not valid JSON (stop_reason: %s) — if it was truncated, retry with a smaller input",
-						tostring(result.stopReason))
-					-- The raw fragment is the only thing that says WHERE the JSON
-					-- died, so it goes in the expandable body rather than being
-					-- summarised away. warn() as well: MAX_DETAIL_CHARS clips the
-					-- body, and a truncated multiedit is exactly the case that
-					-- overruns it, the Output window keeps the whole thing.
-					warn(string.format("[agent] %s: unparsed tool input (stop_reason: %s): %s",
-						tostring(block.name), tostring(result.stopReason), tostring(block.input)))
-					local raw = { raw_input = tostring(block.input) }
-					if call then
-						-- Same block, now red and carrying the fragment. It has been
-						-- on screen spinning since the model started the call, so
-						-- appending a second one would leave the first hanging.
-						call.setInput(raw)
-						call.setResult(toolResult, true)
-					else
-						Console.appendToolCall(
-							tostring(block.name) .. " parse error", raw, toolResult, true)
+				call = call or Console.appendToolCall(block.name, block.inputParsed or {})
+				-- Published so Stop can finish this block's spinner while the
+				-- call is still running, and cleared after so a later Stop does
+				-- not write a result over a block that already has one.
+				running[call] = block.name
+				local thread = coroutine.running()
+				if block.name == AGENT_TOOL then agentRows[thread] = call end
+				local ok, entry = pcall(runToolUse, term, block, call, result.stopReason)
+				agentRows[thread] = nil
+				running[call] = nil
+				if not ok then
+					-- Answered anyway: a hole here is an unanswered tool_use, which
+					-- poisons every later request, and in a batch it would also leave
+					-- runAll waiting on a job that never counted itself done.
+					local message = "error: " .. tostring(entry)
+					call.setResult(message, true)
+					entry = { type = "tool_result", tool_use_id = block.id, content = message, is_error = true }
+				end
+				toolResults[index] = entry
+			end
+			-- A run of consecutive agent calls goes out together; everything else
+			-- runs alone and in order, which is Claude Code's partitionToolCalls.
+			-- Only calls the model put side by side run side by side, so one that
+			-- depends on an earlier write still sees it.
+			local first = 1
+			-- Checked per batch, not just once: a turn can ask for several, and a
+			-- Stop pressed during the first should not be followed by the rest.
+			while first <= #toolUses and not cancelRequested do
+				local last = first
+				if toolUses[first].name == AGENT_TOOL then
+					while toolUses[last + 1] and toolUses[last + 1].name == AGENT_TOOL do
+						last += 1
 					end
 				end
-				table.insert(toolResults, {
-					type = "tool_result",
-					tool_use_id = block.id,
-					content = toolResult,
-					-- `or nil` so the field is absent rather than false: this is the
-					-- documented signal for input that could not be parsed, and now
-					-- that eager_input_streaming is on it is a live path rather than
-					-- a max_tokens rarity. A tool that ran and failed is NOT this;
-					-- its error is an ordinary result the model reads and retries.
-					is_error = inputFailed or nil,
-				})
+				local jobs: { () -> () } = {}
+				for index = first, last do
+					table.insert(jobs, function()
+						runOne(index)
+					end)
+				end
+				runAll(jobs)
+				first = last + 1
 			end
 			-- Capped HERE and not in Tools.dispatch: setResult() above has already
 			-- handed the Console the whole thing, so the panel keeps the full
@@ -1841,6 +2173,115 @@ function Agent.selfTest(): (boolean, string?)
 	if historyChars(mixed) ~= summed then
 		return false, "historyChars and historyBuckets disagree about the same history"
 	end
+
+	-- Subagents. The provider is a fake, so this spends nothing, and the shell is
+	-- one too: the only tool call the fake asks for is `agent`, which a child
+	-- refuses without ever reaching a shell. Restored OUTSIDE the pcall, because a
+	-- failed check must not leave every later request going to the fake.
+	local realWire = Provider.wire
+	local childOk, childErr = pcall(function(): string?
+		-- runAll: one job inline, and several all finished by the time it returns.
+		-- Same coroutine, not merely "it ran": task.spawn would run it at once too.
+		local outer = coroutine.running()
+		local inline = false
+		runAll({ function() inline = coroutine.running() == outer end })
+		if not inline then
+			return "runAll did not run a single job inline"
+		end
+		local done = 0
+		local function yieldingJob()
+			task.wait()
+			done += 1
+		end
+		runAll({ yieldingJob, yieldingJob })
+		if done ~= 2 then
+			return string.format("runAll returned with %d of 2 jobs finished", done)
+		end
+
+		local fakeShell = {
+			new = function() return {} end,
+			current = function() return game end,
+		}
+
+		-- A nested agent call is answered, as an error, and the final message comes
+		-- back. The first round calls back before streamMessage returns and the
+		-- second after it: the two ways a provider can settle a request.
+		local rounds, refused = 0, false
+		Provider.wire = {
+			streamMessage = function(request: any, callbacks: any)
+				rounds += 1
+				if rounds == 1 then
+					callbacks.onComplete({ ok = true, text = "", stopReason = "tool_use", contentBlocks = {
+						{ type = "tool_use", id = "c1", name = AGENT_TOOL, input = "{}",
+							inputParsed = { description = "x", prompt = "y" } },
+					} })
+				else
+					local last = request.messages[#request.messages]
+					local answer = type(last.content) == "table" and last.content[1] or nil
+					refused = answer ~= nil and answer.tool_use_id == "c1" and answer.is_error == true
+					task.defer(callbacks.onComplete, { ok = true, text = "report", stopReason = "end_turn",
+						contentBlocks = { { type = "text", text = "report" } } })
+				end
+				return { cancel = function() end }
+			end,
+		}
+		local got = Agent.runChild(fakeShell, { description = "t", prompt = "p" })
+		if got ~= "report" then
+			return "runChild returned " .. tostring(got) .. ", expected its final message"
+		end
+		if not refused then
+			return "a subagent's own agent call was not answered with an error"
+		end
+
+		-- A child started from an agent row draws into that row's own console. The
+		-- row is a fake whose console is a bare Frame; the reply streams one delta.
+		local box = Instance.new("Frame")
+		Provider.wire = {
+			streamMessage = function(_request: any, callbacks: any)
+				callbacks.onText("hi")
+				callbacks.onComplete({ ok = true, text = "hi", stopReason = "end_turn",
+					contentBlocks = { { type = "text", text = "hi" } } })
+				return { cancel = function() end }
+			end,
+		}
+		agentRows[coroutine.running()] = { nest = function() return box end }
+		local drew = Agent.runChild(fakeShell, { description = "t", prompt = "p" })
+		agentRows[coroutine.running()] = nil
+		local landed = #box:GetChildren()
+		box:Destroy()
+		if drew ~= "hi" then
+			return "runChild returned " .. tostring(drew) .. " from a streamed reply"
+		end
+		if landed == 0 then
+			return "a child's reply did not draw into its row's console"
+		end
+
+		-- Stop: a request that never answers still ends. Only this test's child is
+		-- cancelled, so a /selftest during a real run leaves that run's alone.
+		Provider.wire = {
+			streamMessage = function()
+				return { cancel = function() end }
+			end,
+		}
+		local before = table.clone(children)
+		local stopped: string? = nil
+		task.spawn(function()
+			stopped = Agent.runChild(fakeShell, { description = "t", prompt = "p" })
+		end)
+		for cancelChild in pairs(table.clone(children)) do
+			if not before[cancelChild] then cancelChild() end
+		end
+		task.wait()
+		if stopped ~= STOPPED then
+			return "cancelling a subagent did not end it (got " .. tostring(stopped) .. ")"
+		end
+		return nil
+	end)
+	Provider.wire = realWire
+	-- A check that threw between setting a fake row and clearing it.
+	agentRows[coroutine.running()] = nil
+	if not childOk then return false, "subagent check threw: " .. tostring(childErr) end
+	if childErr then return false, childErr :: string end
 
 	return true
 end

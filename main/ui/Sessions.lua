@@ -671,6 +671,9 @@ local function blockedByTurn(): boolean
 	Console.appendLine("Finish or stop the current turn first.", "error")
 	return true
 end
+-- The same refusal for anything else that swaps out what a running turn is
+-- using: the provider, the login, the wire a self-test fakes.
+Sessions.blockedByTurn = blockedByTurn
 
 -- Drops the parked blocks instead of moving them back on screen. Every caller of
 -- this one is about to clear the console anyway.
@@ -724,9 +727,19 @@ local function replayInto(conversation: { any })
 				math.min(REPLAY_MESSAGES, first - 1), first - 1),
 			function()
 				-- Redrawing would destroy the bubble a running turn is streaming
-				-- into — unless there is a peek on, in which case that turn is
-				-- already parked off screen and the visible frame is ours to redraw.
-				if previewHolder == nil and blockedByTurn() then return end
+				-- into, so mid-turn the live view is parked first, the way
+				-- Sessions.reveal parks it for a Find jump, rather than refusing.
+				-- The window is pinned where the tail is now, since a tail that is
+				-- still growing is a snapshot the moment it is drawn; that pin is
+				-- also what puts "Back to the live view" under it. Already parked
+				-- (a peek, or a page back from here) means the visible frame is
+				-- ours to redraw as it is.
+				if Agent.isBusy() and not previewHolder then
+					previewHolder = Console.detach()
+					previewId = currentId
+					windowEnd = #conversation
+					if refreshList then refreshList() end
+				end
 				shown += REPLAY_MESSAGES
 				Console.clear()
 				replay(conversation)

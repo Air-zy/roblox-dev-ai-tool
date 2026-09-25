@@ -65,6 +65,7 @@ Worth stating first, because the request path is in better shape than the UI is.
 | Cleared-result stub | Never remove the block, only blank the content — a dropped `tool_result` orphans its `tool_use` and every later request fails. Their sentinel is `'[Old tool result content cleared]'` (`microCompact.ts:36`); ours is longer on purpose, because they persist cleared output and can restore it, and we cannot. `Agent.lua:366-369` quotes their string correctly. | [verified] |
 | Truncation honesty | `forModel` names the narrower commands to re-run rather than just cutting. `find`/`grep` keep walking past `MAX_RESULTS` purely so "… N more matches" is a real count. `seq` refuses at its cap instead of returning half a sequence. | [verified] |
 | Truncated tool JSON | A tool input cut off by `max_tokens` arrives as invalid JSON; `Agent.lua:1116-1126` reports the `stop_reason` and tells the model to retry smaller, rather than dropping the call. | [verified] |
+| Subagents | `agent` (`tools/agent.lua`, `Agent.runChild`) is their blocking `Agent` tool. It starts a fresh history holding only the prompt and runs the same loop. The last assistant text comes back as the `tool_result`, falling back to the latest reply that had text (`finalizeAgentTool`, `agentToolUtils.ts:297`). Consecutive calls run together, which is their `partitionToolCalls` over a concurrency-safe tool (`toolOrchestration.ts`). The child's tool list keeps `agent` and refuses it at call time. That is their fork path's cache trick (`forkSubagent.ts`), applied to every child. | [verified] |
 
 ---
 
@@ -97,6 +98,19 @@ Not gaps. Recording them so they are not "fixed" into existence later.
   arrives as a `bash` line, and `cat x | grep y` has no honest classification.
   Reasoned out at `Agent.lua:95-108`. **[unverified]** — their two constants
   were not re-read this pass.
+- **The rest of their Agent tool.** Their Agent tool also offers:
+  - typed agents (Explore on Haiku, Plan);
+  - background agents that report with a `<task-notification>`;
+  - `SendMessage`, which resumes an agent from its sidechain transcript;
+  - git worktree isolation;
+  - forks.
+
+  None of it is here. There is one general agent, it always blocks, and it is
+  never saved. The child request also differs from theirs in two ways:
+  - It keeps the parent's system prompt rather than an agent prompt, so its tools
+    and system prompt read the parent's cache.
+  - It keeps the parent's effort, thinking included. Theirs switches thinking off
+    for subagents to hold down output cost (`runAgent.ts:682`). **[verified]**
 
 ---
 
@@ -175,7 +189,7 @@ and authorize at `claude.ai/oauth/authorize`. Current Claude Code uses
 login works; we are depending on a redirect that is nobody's contract. This is
 the one item here worth acting on, and it is an auth change, not a feature.
 
-Applicable to a plugin — has an OAuth token, no filesystem, no MCP, no subagents:
+Applicable to a plugin — has an OAuth token, no filesystem, no MCP:
 
 | Endpoint | Would buy |
 |---|---|
