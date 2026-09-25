@@ -29,16 +29,6 @@ do
 	end
 end
 
--- Studio-only, same treatment. Only `ActiveScript` is read from it here; the
--- shell reaches for GetUserId separately.
-local StudioService: any = nil
-do
-	local ok, service = pcall(game.GetService, game, "StudioService")
-	if ok then
-		StudioService = service
-	end
-end
-
 local Fs = {}
 
 -- Scripts and source
@@ -787,61 +777,6 @@ function Fs.unload()
 	end
 	table.clear(watchConnections)
 	watching = false
-end
-
--- The script the user is actually editing, or nil.
---
--- `ScriptDocument` cannot answer this — it has no "is this the front tab"
--- member, which is what led to the claim in Agent.editorContext that there is no
--- focus API at all. There is: StudioService.ActiveScript, a read-only Instance,
--- and it is the difference between listing six open files and naming the one.
---
--- nil is a real answer, not just a failure: with a 3D viewport in front and no
--- script tab open, nothing is being edited.
-function Fs.activeScript(): Instance?
-	if not StudioService then
-		return nil
-	end
-	local ok, active = pcall(function()
-		return StudioService.ActiveScript
-	end)
-	if ok and typeof(active) == "Instance" then
-		return active
-	end
-	return nil
-end
-
--- Every script currently open in the editor, as { instance, document, active }
--- triples, the ACTIVE one first. Command Bar documents are skipped: they have no
--- script behind them and are not a file anyone is editing.
---
--- Ordered here rather than by the caller because there is only one right order
--- and every caller wants it: GetScriptDocuments returns them in an order nobody
--- has documented, so "the first one" meant nothing before.
-function Fs.openDocuments(): { { inst: Instance, doc: any, active: boolean } }
-	local out: { { inst: Instance, doc: any, active: boolean } } = {}
-	if not ScriptEditorService then
-		return out
-	end
-	local active = Fs.activeScript()
-	pcall(function()
-		for _, doc in ipairs(ScriptEditorService:GetScriptDocuments()) do
-			if not doc:IsCommandBar() then
-				local inst = doc:GetScript()
-				if inst then
-					local entry = { inst = inst, doc = doc, active = inst == active }
-					if entry.active then
-						-- Front of the list, so a caller that can only afford a few
-						-- entries keeps the one that matters.
-						table.insert(out, 1, entry)
-					else
-						out[#out + 1] = entry
-					end
-				end
-			end
-		end
-	end)
-	return out
 end
 
 -- Mode bits

@@ -475,6 +475,20 @@ caching is a prefix match, so reordering them throws away the cache behind it.
 
 ## Context
 
+A script named `AGENTS.md` directly under ServerStorage is the place's
+instruction file, and `CLAUDE.md` is read when there is no AGENTS.md with text
+in it. Only one of the two is sent, following Codex's first-file-wins rule. It
+goes at the end of the system prompt under a one-line header, "Instructions from
+/ServerStorage/AGENTS.md (follow them; they override default behavior):", on
+every request, subagents included.
+
+- **Fresh every request:** it is re-read each time, from the editor tab if one
+  is open, so an edit applies from the next message.
+- **Editable by the agent:** it is also just a file, so the agent can `cat` and
+  `edit` `/ServerStorage/AGENTS.md` like any other.
+- **Cap:** anything past 40,000 characters is cut, with a note saying so.
+- **Visible cost:** Settings shows its share of the context as its own row.
+
 Every turn resends the whole conversation, so one call that dumps 3000 lines
 keeps costing for the rest of the session. Against that: the system prompt and
 tools and the conversation all cache for an hour, grep and find

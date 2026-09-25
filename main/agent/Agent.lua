@@ -17,8 +17,8 @@ local Provider = require(script.Parent:WaitForChild("Provider"))
 local Tools = require(script.Parent:WaitForChild("Tools"))
 local Console = require(ui:WaitForChild("Console"))
 local Settings = require(ui:WaitForChild("Settings"))
--- Only for the editor-context line on each user message: which scripts are open
--- and where the cursor is.
+-- Only for the instruction file: reading ServerStorage/AGENTS.md through the
+-- editor buffer, and naming its path.
 local Fs = require(script.Parent.Parent:WaitForChild("fs"):WaitForChild("Fs"))
 
 local Agent = {}
@@ -243,6 +243,61 @@ local function buildTools(): { any }
 		end
 	end
 	return out
+end
+
+-- Project instructions
+-- The place's own AGENTS.md, or CLAUDE.md when there is none: a script of that
+-- name directly under ServerStorage, which is also where the model can `cat` and
+-- `edit` it like any other file.
+--
+-- One file, first found wins, which is Codex's rule for a directory
+-- (`candidate_filenames` in core/src/agents_md.rs: AGENTS.override.md, AGENTS.md,
+-- then configured fallbacks). A CLAUDE.md that only repeats AGENTS.md is then
+-- not paid for twice. "Found" means it has text in it, so an empty AGENTS.md
+-- left lying around does not hide a real CLAUDE.md.
+--
+-- One header line in front of the file: where it came from, and that it outranks
+-- defaults. Claude Code spends a paragraph on that (MEMORY_INSTRUCTION_PROMPT in
+-- src/utils/claudemd.ts) and then a second line naming the file; this is both in
+-- one. Where it goes is not theirs either: they prepend a <system-reminder> user
+-- message to every request, and here it is the end of the system prompt, which
+-- every provider takes the same way and a subagent inherits without being told.
+--
+-- Read on every request, through Fs.getSource so an open editor tab's unsaved text
+-- counts. Claude Code reads once and holds it until /clear; this costs one lookup
+-- per request, and an edit takes effect on the next one at the price of a single
+-- cache re-write from the system prompt onward.
+local ServerStorage = game:GetService("ServerStorage")
+local INSTRUCTION_FILES = { "AGENTS.md", "CLAUDE.md" }
+-- Claude Code's MAX_MEMORY_CHARACTER_COUNT. Theirs only warns; this cuts, because
+-- the file is one `write` away from the model and it rides on every request.
+local MAX_INSTRUCTION_CHARS = 40000
+
+-- `from` is for the self-test, which must not write into the place's ServerStorage.
+local function instructions(from: Instance?): string?
+	for _, name in ipairs(INSTRUCTION_FILES) do
+		local file = (from or ServerStorage):FindFirstChild(name)
+		local text = if file then Fs.getSource(file) else nil
+		if text and text:match("%S") then
+			text = text:match("^%s*(.-)%s*$") :: string
+			if #text > MAX_INSTRUCTION_CHARS then
+				local kept = safeCut(text, MAX_INSTRUCTION_CHARS)
+				text = string.format("%s\n... [%d characters cut: keep this file under %d]",
+					kept, #text - #kept, MAX_INSTRUCTION_CHARS)
+			end
+			return string.format("Instructions from %s (follow them; they override default behavior):\n\n%s",
+				Fs.instancePath(file), text)
+		end
+	end
+	return nil
+end
+
+-- What every request sends as its system prompt: the reader's own, from Settings,
+-- then the instruction file if the place has one.
+local function systemPrompt(): string
+	local base = Settings.system() or ""
+	local extra = instructions()
+	return if extra then base .. "\n\n" .. extra else base
 end
 
 local term: any = nil
@@ -637,6 +692,9 @@ function Agent.contextBreakdown(): ({ ContextRow }?, boolean)
 	end
 
 	add("System prompt", #(Settings.system() or ""), BYTES_PER_TOKEN_TEXT)
+	-- Its own row rather than folded into the one above: it is the part of the
+	-- system prompt the reader did not type, and the one that can quietly grow.
+	add("Instructions file", #(instructions() or ""), BYTES_PER_TOKEN_TEXT)
 	-- The schemas as they go on the wire. JSONEncode rather than summing the
 	-- strings: the punctuation is most of a schema and most of its token cost,
 	-- and it is exactly what a recursive string-sum would leave out.
@@ -1145,7 +1203,7 @@ function Agent.runChild(parentTerm: any, input: { [string]: any }): string
 		outcome = nil
 		stream = Provider.wire.streamMessage({
 			model = Settings.model(),
-			system = Settings.system(),
+			system = systemPrompt(),
 			messages = messages,
 			effort = Settings.effort(),
 			tools = buildTools(),
@@ -1482,7 +1540,7 @@ local function runTurn(turn: number)
 
 	stream = Provider.wire.streamMessage({
 		model = Settings.model(),
-		system = Settings.system(),
+		system = systemPrompt(),
 		messages = conversation,
 		effort = Settings.effort(),
 		tools = buildTools(),
@@ -1773,82 +1831,6 @@ local function runTurn(turn: number)
 end
 
 -- Entry point
--- What the user currently has open, and where their cursor is. "fix this
--- function" is unanswerable without it and costs a grep to guess at; with it,
--- it is a `sed -n` away.
---
--- Attached to EVERY user message rather than only the first. A cursor captured
--- once at session start is asserting a position the user left ten turns ago,
--- and nothing in the text says it is stale, a wrong cursor is worse than no
--- cursor. This costs nothing to keep current: the newest message sits after the
--- conversation cache breakpoint (see withMessageCache in Claude), so re-sending
--- a changed line here never invalidates the cached prefix.
---
--- Which tab is in FRONT is a separate question from which are open, and this
--- used to say there was no way to ask it — "ScriptDocument cannot say which tab
--- is in front" — and listed all six with equal weight as a result. That was
--- wrong about the API, not about ScriptDocument: `StudioService.ActiveScript` is
--- a read-only Instance naming exactly the script being edited. Fs.openDocuments
--- puts it first and flags it, so "fix this function" resolves to one file
--- instead of six candidates, and the entry that survives the cap below is always
--- the one that matters rather than whichever GetScriptDocuments happened to
--- return first.
---
--- Still a LIST, not just the active one: the others are real context (a model
--- asked to move code between two open files should know both are open), and
--- nil is a real answer for ActiveScript whenever the viewport is in front.
-local MAX_OPEN_DOCS = 6
--- The count cap alone does not bound this. instancePath walks to game joining
--- .Name, and neither nesting depth nor a name's length has a limit, so six
--- entries is six unbounded strings. Whole entries are dropped rather than
--- individual paths cut: a truncated path is one the model cannot hand to
--- cat/sed, which costs the turn this hint exists to save. The budget is checked
--- before an entry is added, not after, so the true bound is this plus one entry
--- — the remaining slack is a single path, which is as tight as it gets without
--- cutting one. Sized so the ordinary six-document case never reaches it.
-local MAX_OPEN_CHARS = 600
-
-local function editorContext(): string
-	local docs = Fs.openDocuments()
-	if #docs == 0 then
-		return ""
-	end
-	local parts: { string } = {}
-	local used = 0
-	for index, entry in ipairs(docs) do
-		if index > MAX_OPEN_DOCS or used > MAX_OPEN_CHARS then
-			parts[#parts + 1] = string.format("… %d more", #docs - (index - 1))
-			break
-		end
-		-- instancePath, not GetFullName: this is a path the model can hand
-		-- straight back to cat/sed/grep. GetFullName's dotted form resolves to
-		-- nothing here, which would make the hint cost a turn instead of saving one.
-		local label = Fs.instancePath(entry.inst)
-		-- The one the user is actually looking at, named as such. Without this the
-		-- list is six paths in an undocumented order and "this file" is a guess.
-		if entry.active then
-			label ..= " [ACTIVE]"
-		end
-		-- GetSelection returns (line, char); the extra parens take the line.
-		local ok, line = pcall(function()
-			return (entry.doc:GetSelection())
-		end)
-		if ok and type(line) == "number" then
-			-- Where they are scrolled to is a different question from where the
-			-- caret is, and it is the one that answers "this function".
-			local viewOk, first, last = pcall(function()
-				return entry.doc:GetViewport()
-			end)
-			label = (viewOk and type(first) == "number" and type(last) == "number")
-				and string.format("%s (cursor line %d, showing %d-%d)", label, line, first, last)
-				or string.format("%s (cursor line %d)", label, line)
-		end
-		parts[#parts + 1] = label
-		used += #label + 2   -- + the ", " that will join it
-	end
-	return "\n\n[open in the editor: " .. table.concat(parts, ", ") .. "]"
-end
-
 function Agent.send(text: string, isLoggedIn: () -> boolean)
 	if busy then return end
 	if not isLoggedIn() then
@@ -1856,13 +1838,12 @@ function Agent.send(text: string, isLoggedIn: () -> boolean)
 		return
 	end
 
-	-- Shown to the model, not to the user: the console echoes what was typed.
 	-- Anchored to the message it is about to become, so Find can scroll back to
 	-- it later; the index is what the insert below lands on.
 	Console.setMessage(#conversation + 1)
 	Console.appendLine(text, "user")
 	Console.setMessage(0)
-	table.insert(conversation, { role = "user", content = text .. editorContext() })
+	table.insert(conversation, { role = "user", content = text })
 	-- Armed per message and reset here, not at session start: a budget is a
 	-- property of the request that asked for one, and the next message without
 	-- `+500k` in it turns the whole mechanism back off.
@@ -2173,6 +2154,50 @@ function Agent.selfTest(): (boolean, string?)
 	if historyChars(mixed) ~= summed then
 		return false, "historyChars and historyBuckets disagree about the same history"
 	end
+
+	-- The instruction file: which one wins, the empty one that must not hide the
+	-- other, and the cap. A loose Folder stands in for ServerStorage.
+	local fileOk, fileErr = pcall(function(): string?
+		local folder = Instance.new("Folder")
+		local function file(name: string, text: string)
+			local module = Instance.new("ModuleScript")
+			module.Name = name
+			module.Source = text
+			module.Parent = folder
+		end
+		local ok, err = pcall(function(): string?
+			if instructions(folder) ~= nil then
+				return "instructions() found a file in an empty folder"
+			end
+			file("CLAUDE.md", "use tabs")
+			local got = instructions(folder) or ""
+			if not got:find("use tabs", 1, true) or not got:find("Instructions from", 1, true) then
+				return "instructions() did not load a lone CLAUDE.md under its header"
+			end
+			file("AGENTS.md", "  \n")
+			if not (instructions(folder) or ""):find("use tabs", 1, true) then
+				return "an empty AGENTS.md hid a CLAUDE.md that has text"
+			end
+			folder:FindFirstChild("AGENTS.md"):Destroy()
+			file("AGENTS.md", "use spaces")
+			got = instructions(folder) or ""
+			if not got:find("use spaces", 1, true) or got:find("use tabs", 1, true) then
+				return "AGENTS.md did not win over CLAUDE.md, or both were sent"
+			end
+			folder:FindFirstChild("AGENTS.md"):Destroy()
+			file("AGENTS.md", string.rep("x\n", MAX_INSTRUCTION_CHARS))
+			got = instructions(folder) or ""
+			if #got > MAX_INSTRUCTION_CHARS + 1000 or not got:find("characters cut", 1, true) then
+				return "an oversized instruction file was not cut to the cap"
+			end
+			return nil
+		end)
+		folder:Destroy()
+		if not ok then error(err, 0) end
+		return err
+	end)
+	if not fileOk then return false, "instruction file check threw: " .. tostring(fileErr) end
+	if fileErr then return false, fileErr :: string end
 
 	-- Subagents. The provider is a fake, so this spends nothing, and the shell is
 	-- one too: the only tool call the fake asks for is `agent`, which a child

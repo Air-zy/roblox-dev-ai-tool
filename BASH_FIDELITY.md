@@ -475,13 +475,13 @@ Researched against the engine reference. Only the ones that would actually pay.
 
 ### Confirmed available, would pay
 
-**`StudioService.ActiveScript`** — **DONE.** `Instance`, read-only. Returns the
-script currently being edited. `Fs.activeScript()` reads it,
-`Fs.openDocuments()` puts that document first and flags it, and
-`editorContext()` renders it `[ACTIVE]`. Still a list, because the other open
-files are real context and `nil` is a real answer whenever the viewport is in
-front — but the entry that survives the 6-entry/600-char cap is now always the
-one that matters.
+**`StudioService.ActiveScript`** — **used, then removed.** `Instance`, read-only.
+It returns the script currently being edited. It fed the
+`[open in the editor: … [ACTIVE] …]` line that used to be appended to every user
+message, and that line is gone: Claude Code has nothing like it. Its IDE hook
+names one focused file, or the lines selected in it, in a separate reminder
+(`utils/messages.ts:3613-3631`). If an editor hint comes back, that is the shape
+to copy.
 
 **`ScriptDocument:GetText(startLine, startChar, endLine, endChar)`,
 `:GetLine(n)`, `:GetLineCount()`** — ranged reads on an *open* document.
@@ -491,8 +491,9 @@ via `GetEditorSource` and slice in Luau. `GetLineCount()` alone would let
 string. Only helps open documents, so it is a fast path, not a replacement.
 
 **`ScriptDocument:GetSelectedText()` / `HasSelectedText()`** — "fix *this*"
-where the user has literally highlighted it. `editorContext()` currently reports
-cursor line + viewport, which is a proxy for the same question.
+where the user has literally highlighted it. Nothing reports the editor state
+today; this is the half of Claude Code's `selected_lines_in_ide` a plugin can
+have.
 
 **`CollectionService`** — **DONE, as a predicate.** `find -tag Enemy` is
 `Fs.hasTag` per node, and `stat` lists an instance's tags sorted.

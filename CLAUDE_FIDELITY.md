@@ -98,6 +98,23 @@ Not gaps. Recording them so they are not "fixed" into existence later.
   arrives as a `bash` line, and `cat x | grep y` has no honest classification.
   Reasoned out at `Agent.lua:95-108`. **[unverified]** — their two constants
   were not re-read this pass.
+- **Where CLAUDE.md goes.** Theirs comes from `getUserContext` (`context.ts`):
+  - It is read once per session, and only `/clear` or compaction re-reads it.
+  - `prependUserContext` (`api.ts:449`, called at `query.ts:660`) then puts it
+    in front of every request as a `<system-reminder>` user message.
+
+  Ours (`Agent.lua`, `instructions`):
+  - It is read on every request, so an edit applies from the next message.
+  - It goes at the end of the system prompt, because two user messages in a row
+    is a shape each of the other four providers would have to accept.
+  - Only one file is sent: `/ServerStorage/AGENTS.md`, else `/ServerStorage/CLAUDE.md`
+    (Codex's first-file-wins rule). There is no folder walk, no `@include`, and
+    no HTML-comment stripping.
+  - Past their 40k recommended maximum it is cut, where theirs only warns.
+
+  Their two-part framing is folded into one header line: the
+  `MEMORY_INSTRUCTION_PROMPT` paragraph plus a "Contents of <path> …" line. Our
+  line keeps the path and the fact that it overrides defaults. **[verified]**
 - **The rest of their Agent tool.** Their Agent tool also offers:
   - typed agents (Explore on Haiku, Plan);
   - background agents that report with a `<task-notification>`;

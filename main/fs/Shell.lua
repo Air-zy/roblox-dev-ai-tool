@@ -7063,13 +7063,6 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		return false, sourceFailure
 	end
 
-	-- openDocuments must not throw, and must assert NOTHING about what is open:
-	-- the user may legitimately have half the place open when the plugin loads.
-	-- The contract is the shape, not the contents.
-	if type(Fs.openDocuments()) ~= "table" then
-		return false, "Fs.openDocuments did not return a table"
-	end
-
 	-- Every command, invoked bare: the one smoke test that covers all of them, and
 	-- it catches a handler that throws when its operands are missing. Safe to run:
 	-- every command that mutates (rm, mv, cp, set, new, mkdir, touch, ln) needs a

@@ -75,7 +75,6 @@ main.lua                        window, toolbar, popups, usage panel
 | beta headers | `providers/Anthropic.lua:53` — read the comment before adding one |
 | history trimming | `Agent.lua:448` `clearOldToolResults`, gated by `cacheIsCold:~392` |
 | one result capped / a turn's batch capped | `Agent.lua:139` `forModel`, `:167` `capTurn` |
-| open-editor hint on each message | `Agent.lua:1098` `editorContext` — `""` when nothing is open; capped by `MAX_OPEN_DOCS`/`MAX_OPEN_CHARS` just above it |
 | login | `providers/AnthropicAuth.lua` owns PKCE and refresh. OpenRouter owns its PKCE/key exchange. OpenAI uses Codex's ChatGPT device OAuth and refresh-token flow; it rejects API keys. NVIDIA and Gemini store a pasted project key |
 | the usage rows in Settings | each `auth.fetchUsage()` returns rows ALREADY FORMATTED (`{label, value, bar?}`). Anthropic reports two rolling utilisation windows, OpenRouter reports credits and the free request cap; `main.lua` `usageRows` just draws whatever it is handed |
 | a shell line runs | `Shell.lua:4762` `Shell.run` -> `runLine:4770` -> `runTokens:4632` -> `runStatements:4436` -> `runCommand:4237`; entered from `Terminal:shell:761` |

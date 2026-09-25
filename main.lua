@@ -411,6 +411,7 @@ local refreshUsage: () -> ()
 -- no entry falls back to the muted grey rather than going invisible.
 local CONTEXT_COLORS: { [string]: Color3 } = {
 	["System prompt"] = Theme.TEXT_LO,
+	["Instructions file"] = Theme.TEXT_MED,
 	["Tool schemas"] = Theme.THINK_CLR,
 	["Your messages"] = Theme.ACCENT,
 	["Assistant"] = Theme.BAR_CLR,
