@@ -199,13 +199,19 @@ local function formatServerResult(content: any): string
 	if content.type == "web_search_tool_result_error" then
 		return "error: " .. tostring(content.error_code)
 	end
+	-- OpenAI returns its search action instead: the pages stay server-side and
+	-- at most their URLs come back, under `sources`.
+	local hits = if type(content.sources) == "table" then content.sources else content
 	local lines: { string } = {}
-	for i, hit in ipairs(content) do
-		table.insert(lines, string.format("%d. %s", i, tostring(hit.title or "(untitled)")))
-		if hit.url then table.insert(lines, "   " .. tostring(hit.url)) end
+	for i, hit in ipairs(hits) do
+		table.insert(lines, string.format("%d. %s", i, tostring(hit.title or hit.url or "(untitled)")))
+		if hit.title and hit.url then table.insert(lines, "   " .. tostring(hit.url)) end
 	end
-	if #lines == 0 then return "(no results)" end
-	table.insert(lines, 1, string.format("%d results", #content))
+	if #lines == 0 then
+		local what = content.query or content.url
+		return if what then "searched: " .. tostring(what) else "(no results)"
+	end
+	table.insert(lines, 1, string.format("%d results", #hits))
 	return table.concat(lines, "\n")
 end
 
