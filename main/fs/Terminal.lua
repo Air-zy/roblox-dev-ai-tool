@@ -32,7 +32,6 @@ local string = string
 local table = table
 local tostring = tostring
 local type = type
-local typeof = typeof
 local pcall = pcall
 local Instance = Instance
 local coroutine = coroutine

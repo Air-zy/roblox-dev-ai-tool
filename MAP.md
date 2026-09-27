@@ -18,18 +18,20 @@ main.lua                        window, toolbar, popups, usage panel
         agent/Provider          which provider is live; the picker
           providers/Stream          one streaming request, retried, cancellable
           providers/Retry           when to come back, and how long to wait
-          providers/ToolJson        decoding arguments the model wrote
+          providers/ToolJson        decoding arguments the model wrote, encoding them back
           providers/Pkce            verifier, challenge, state
           providers/Anthropic       Messages API; one request, SSE back
           providers/AnthropicAuth   PKCE, refresh, usage
           providers/OpenAI          Responses API; translation both ways
           providers/OpenAIAuth      ChatGPT device OAuth and subscription limits
-          providers/OpenRouter      chat/completions; translation both ways
+          providers/ChatCompletions chat/completions wire + translation, OpenRouter and Nvidia
+          providers/OpenRouter      its body, cache breakpoints, free model list
           providers/OpenRouterAuth  PKCE (no refresh: the key is the credential)
           providers/Nvidia          NIM chat/completions; the same translation
-          providers/NvidiaAuth      a pasted nvapi- key, and nothing else
+          providers/KeyAuth         a pasted key: the auth module Gemini and NVIDIA share
+          providers/NvidiaAuth      KeyAuth plus a send-rate meter
           providers/Gemini          native generateContent; thought signatures
-          providers/GeminiAuth      a pasted AI Studio key, and nothing else
+          providers/GeminiAuth      KeyAuth, and nothing else
         agent/Tools             registry; tools/ is one file per tool
     ui/Console -> ui/Markdown -> ui/Theme
       ui/SourceDiff             a tool call's source changes, as text
@@ -52,19 +54,19 @@ main.lua                        window, toolbar, popups, usage panel
 
 | Question | Answer |
 |---|---|
-| the system prompt is built | `providers/Anthropic.lua:305` `systemBlocks` — identity first, user block if non-empty, cache_control on the last. OpenRouter builds a system message in `toChatMessages`; OpenAI sends `instructions` |
+| the system prompt is built | `providers/Anthropic.lua:305` `systemBlocks` — identity first, user block if non-empty, cache_control on the last. OpenRouter and Nvidia build a system message in `ChatCompletions.toMessages`; OpenAI sends `instructions` |
 | the user's system prompt is stored | `Settings.lua:85` `Settings.system()`, default `DEFAULT_SYSTEM:35` (one line, edit-mode framing) |
-| a request is assembled | `providers/Anthropic.lua` `streamMessage` -> `applyReasoning` -> tools+cache -> `withMessageCache`. OpenRouter uses `toChatMessages` + `toChatTools`; OpenAI uses `toResponseInput` + `toResponseTools` |
-| a response is parsed | each wire module's `onFrame`; OpenAI dispatches Responses event types, Anthropic dispatches SSE event names, and OpenRouter reads chat-completion data chunks |
+| a request is assembled | `providers/Anthropic.lua` `streamMessage` -> `applyReasoning` -> tools+cache -> `withMessageCache`. OpenRouter and Nvidia use `ChatCompletions.toMessages` + `toTools`; OpenAI uses `toResponseInput` + `toResponseTools` |
+| a response is parsed | each wire module's `onFrame`; OpenAI dispatches Responses event types, Anthropic dispatches SSE event names, and `ChatCompletions` reads chat-completion data chunks for OpenRouter and Nvidia |
 | the socket, the retries, the latches | `providers/Stream.lua:56` `Stream.open` — `fail:135` is the one decision point, `processFrames:240` splits frames, `start:255` opens each attempt. There is exactly ONE copy of this; providers supply a request and read frames |
 | when a failure is worth retrying | `providers/Retry.lua` — `isRetryable`, `isOverload`, `delay`, `retryAfterSeconds`. Header names stay with the provider that spells them |
-| a tool call's arguments are decoded | `providers/ToolJson.lua:57` `ToolJson.decode` — strict first, then `escapeControlChars:34` for a raw newline the model owed a `\n`. Shared: the failure is the model's, not the wire's |
+| a tool call's arguments are decoded | `providers/ToolJson.lua:38` `ToolJson.decode` — strict first, then `escapeControlChars:18` for a raw newline the model owed a `\n`. Shared: the failure is the model's, not the wire's |
 | effort / thinking / the output ceiling | `providers/Anthropic.lua:160` `applyReasoning` against `MODEL_CAPS:80`; the ceiling is `maxOutput` on the same table. OpenRouter sends `reasoning.effort` and NO `max_tokens` — the model's own ceiling is the right default across several hundred models. `Settings` picks a level and nothing else |
-| Anthropic blocks <-> chat-completion messages | `providers/OpenRouter.lua:273` `toChatMessages` out, `:599` `onFrame` back. The internal conversation is Anthropic-shaped; OpenRouter converts at its own edge so Agent, Sessions and Find never learn a second shape |
-| a thinking block's signature, on OpenRouter | a JSON envelope holding `reasoning_details` (or plain reasoning text). Written in `assemble` inside `streamMessage`, read back by `reasoningFrom:263`. Opaque to everything else, which is what the signature contract already said |
+| Anthropic blocks <-> chat-completion messages | `providers/ChatCompletions.lua:33` `toMessages` out, `:304` `onFrame` back. The internal conversation is Anthropic-shaped; the wire converts at its own edge so Agent, Sessions and Find never learn a second shape |
+| a thinking block's signature, on OpenRouter | a JSON envelope holding `reasoning_details` (or plain reasoning text). Written in `assemble` inside `ChatCompletions.stream`, read back by `reasoningFrom:23`. Opaque to everything else, which is what the signature contract already said |
 | a thinking block's signature, on OpenAI | a JSON envelope holding the complete Responses output sequence, including encrypted reasoning and the server IDs of its paired following items; `toResponseInput` replays it verbatim for the same model and falls back to visible blocks after a model switch |
 | which provider is live | `agent/Provider.lua` — `REGISTRY:20`, `use:64`, `list:47`. Read `Provider.wire.x` AT THE POINT OF USE: the pair is replaced on a switch, and a `local Wire = Provider.wire` would keep talking to the old one |
-| the free model list | `providers/OpenRouter.lua:160` `refreshModels` — fetched, filtered to free AND tool-capable, cached in plugin settings for a day. The seed list at `:77` is only a fallback |
+| the free model list | `providers/OpenRouter.lua:106` `refreshModels` — fetched, filtered to free AND tool-capable, cached in plugin settings for a day. The seed list at `:38` is only a fallback |
 | the turn loop | `Agent.lua:510` `runTurn` |
 | Stop | `Agent.lua:~628` `stopCurrent`, reached through `Agent.stop`. The queued continuation re-checks `cancelRequested` after its wait (`continueTurn:618`), and `committed:592` is what keeps Stop from rolling back a turn already in the history |
 | a turn's result is handled | `Agent.lua:782` `onComplete` -> assemble -> dispatch tools -> `continueTurn:618` |
@@ -77,16 +79,15 @@ main.lua                        window, toolbar, popups, usage panel
 | one result capped / a turn's batch capped | `Agent.lua:139` `forModel`, `:167` `capTurn` |
 | login | `providers/AnthropicAuth.lua` owns PKCE and refresh. OpenRouter owns its PKCE/key exchange. OpenAI uses Codex's ChatGPT device OAuth and refresh-token flow; it rejects API keys. NVIDIA and Gemini store a pasted project key |
 | the usage rows in Settings | each `auth.fetchUsage()` returns rows ALREADY FORMATTED (`{label, value, bar?}`). Anthropic reports two rolling utilisation windows, OpenRouter reports credits and the free request cap; `main.lua` `usageRows` just draws whatever it is handed |
-| a shell line runs | `Shell.lua:4762` `Shell.run` -> `runLine:4770` -> `runTokens:4632` -> `runStatements:4436` -> `runCommand:4237`; entered from `Terminal:shell:761` |
-| a line becomes tokens | `Shell.lua:86` `tokenize` |
-| flags parsed / refused | `Shell.lua:230` `partition` against `SPECS:574` |
-| the command table | `Shell.lua:933` `HANDLERS` |
-| `for` loops | `Shell.lua:4476` `parseLoop`, `:4573` `runLoop`, `:4556` `expandVar`; grouped into ONE pipeline stage by `parseStatements:4341`, run from `runLoopStage:4600` |
-| the list `/help` prints | `Shell.lua:4190` `Shell.COMMANDS` |
-| `$(...)` | `Shell.lua:4700` `expandSubstitutions`, `:4644` `takeSubstitution` — on the raw line, before `tokenize` |
-| the `$ cmd` echo of a multi-command line | `Shell.lua:4416` `label`, quoting via `requote:4404` |
-| heredocs / redirection | `Shell.lua:407` `extractHeredoc`, `:467` `takeRedirect`, `:538` `applyRedirect` |
-| diff | alignment and hunk grouping in `text/Diff.lua` (`Diff.align`, `Diff.hunks`); the flags, the `@@` formatting and the handler stay in `Shell.lua:3951` `diffOne` and `:4011` `HANDLERS.diff` |
+| a shell line runs | `Shell.lua:5838` `Shell.run` -> `ShellRuntime.lua:514` `Runtime.run` -> `execute:116`, which hands each simple command back through `runtimeApi:5787` to `runCommand`; entered from `Terminal:shell:1308` |
+| a line becomes an AST | `ShellSyntax.lua:90` `Syntax.lex`, `:161` `Syntax.parse` |
+| flags parsed / refused | `Shell.lua:138` `partition` against `SPECS:449` |
+| the command table | `Shell.lua:863` `HANDLERS` |
+| loops, `if`, `case`, functions | parsed by `Syntax.parse`, run by `ShellRuntime.lua:116` `execute` |
+| the list `/help` prints | `Shell.lua:5722` `Shell.COMMANDS` |
+| `$(...)`, `$((...))`, braces, globs | `ShellWords.lua:306` `Words.expand`, `:11` `Words.arithmetic` |
+| heredocs / redirection | parsed by `Syntax.parse`, applied in `ShellRuntime.lua` `execute`; the file reads and writes go through `runtimeApi` |
+| diff | alignment and hunk grouping in `text/Diff.lua` (`Diff.align`, `Diff.hunks`); the flags, the `@@` formatting and the handler stay in `Shell.lua:3860` `diffOne` and `:3920` `HANDLERS.diff` |
 | a path becomes an instance | `Fs.lua:304` `Fs.resolve` — also `.luau` suffixes and root case-folding |
 | an instance becomes a path | `Fs.lua:265` `instancePath` |
 | a script is read / written | `Fs.lua:69` `getSource`, `:116` `Fs.writeSource` |
@@ -94,8 +95,8 @@ main.lua                        window, toolbar, popups, usage panel
 | root/service protection | `Fs.lua:691` `Fs.guardProtected` |
 | modification times (we keep our own) | `Fs.lua:507` `Fs.watch` |
 | ls / cat / stat / find / grep / tree | `Terminal.lua:113 / 133 / 206 / 250 / 315 / 402` |
-| a walk stays off the main thread's back | `Fs.lua:645` `Fs.breather` — one call per node in `Terminal:find:281`, `:grep:348`, `:tree:426` and `ls -R` (`Shell.lua:1183`) |
-| the root listing collapses empty services | `Shell.lua:1178` `hideEmpty`; `ls -a /` is the complete form |
+| a walk stays off the main thread's back | `Fs.lua:645` `Fs.breather` — one call per node in `Terminal:find:281`, `:grep:348`, `:tree:426` and `ls -R` (`Shell.lua:1213`) |
+| the root listing collapses empty services | `Shell.lua:1206` `hideEmpty`; `ls -a /` is the complete form |
 | write / multiedit | `Terminal.lua:556 / 603` |
 | the syntax check on a write | `Fs.lua:156` `Fs.syntaxErrors`, appended by `Terminal.lua:550` `withSyntax`. Never rejects a write, only annotates one |
 | Luau is executed | `studio/Exec.lua:424` `Exec.run`; PROLOGUE at `:56`, every entry one physical line |
@@ -122,7 +123,7 @@ main.lua                        window, toolbar, popups, usage panel
 
 | File | Lines | Owns |
 |---|---:|---|
-| `fs/Shell.lua` | 7342 | The command line. The biggest thing here we actually wrote — see below. |
+| `fs/Shell.lua` | 7239 | The command line. The biggest thing here we actually wrote — see below. |
 | `agent/Agent.lua` | 1842 | Turn loop, conversation state, trimming, stop. |
 | `ui/Console.lua` | 1355 | Bubbles, thinking drawers, tool-call blocks, the detached sink. |
 | `text/Regex.lua` | 957 | BRE/ERE engine. Requires nothing. |
@@ -131,8 +132,9 @@ main.lua                        window, toolbar, popups, usage panel
 | `fs/Terminal.lua` | 839 | Commands as tree operations. No parsing. |
 | `fs/Fs.lua` | 843 | Paths, `.Source`, undo, mtime, globs, mode bits. |
 | `agent/providers/OpenAI.lua` | 920 | Responses API, and the translation both ways. |
-| `agent/providers/OpenRouter.lua` | 842 | chat/completions, and the translation both ways. |
-| `agent/providers/Nvidia.lua` | 948 | NIM chat/completions. Two reasoning switches, one per model. |
+| `agent/providers/ChatCompletions.lua` | 415 | The chat/completions wire and translation, shared by OpenRouter and Nvidia. |
+| `agent/providers/OpenRouter.lua` | 354 | Its request body, cache breakpoints and free model list. |
+| `agent/providers/Nvidia.lua` | 460 | NIM chat/completions. Two reasoning switches, one per model. |
 | `agent/providers/Gemini.lua` | 1027 | Native generateContent. Carries thought signatures across turns. |
 | `agent/providers/Anthropic.lua` | 824 | One request. Knows nothing about turns. |
 | `agent/providers/Stream.lua` | 552 | The socket, the retries, the latches. One copy. |
@@ -142,10 +144,11 @@ main.lua                        window, toolbar, popups, usage panel
 | `agent/providers/AnthropicAuth.lua` | 507 | PKCE login, refresh, usage rows. |
 | `agent/providers/OpenAIAuth.lua` | 520 | ChatGPT device OAuth, refresh and Codex subscription-limit rows. |
 | `agent/providers/OpenRouterAuth.lua` | 273 | PKCE login, or a pasted key. Credits. |
-| `agent/providers/NvidiaAuth.lua` | 193 | A pasted key, and a rolling send-rate meter. |
-| `agent/providers/GeminiAuth.lua` | 132 | A pasted key. No flow to speak of. |
+| `agent/providers/KeyAuth.lua` | 90 | The pasted-key auth module, shared by Gemini and NVIDIA. |
+| `agent/providers/NvidiaAuth.lua` | 62 | KeyAuth, and a rolling send-rate meter. |
+| `agent/providers/GeminiAuth.lua` | 27 | KeyAuth. No flow to speak of. |
 | `agent/providers/Retry.lua` | 229 | What is worth retrying, and how long to wait. |
-| `agent/providers/ToolJson.lua` | 103 | Decoding arguments the model wrote. |
+| `agent/providers/ToolJson.lua` | 101 | Decoding arguments the model wrote, and encoding them back. |
 | `agent/providers/Pkce.lua` | 70 | verifier / challenge / state. |
 | `studio/Catalog.lua` | 401 | Free model search / insert. Tool-only. |
 | `ui/Find.lua` | 423 | Conversation search + the find panel. |
@@ -156,7 +159,6 @@ main.lua                        window, toolbar, popups, usage panel
 | `main/Commands.lua` | 279 | Slash commands, and `runShell`, shared by `/sh` and shell mode. |
 | `studio/Props.lua` | 200 | API dump. The only network I/O in fs. |
 | `git/Git.lua` | 818 | Object ids, the path mapping, the index, the tree payload, the remote-tree filters clone reads. No I/O — the requests live in Shell beside curl's. |
-| `util/Sha256.lua` | 181 | For PKCE. |
 | `agent/Tools.lua` | 118 | Registry + dispatch. |
 | `ui/Theme.lua` | 99 | Colours and `make`. |
 | `agent/Provider.lua` | 115 | The active provider, the registry, and the switch. |
@@ -166,22 +168,21 @@ main.lua                        window, toolbar, popups, usage panel
 
 | Lines | Region |
 |---:|---|
-| 1-93 | header, requires, aliases |
-| 94-1030 | parsing: `tokenize:94`, `partition:238`, `extractHeredoc:420`, `takeRedirect:480`, `SPECS:626` |
-| 1031-4756 | HANDLERS — 41 commands + private helpers |
-| 4757-5571 | the GitHub calls, `materialize:4852` (pull and clone share it), and `HANDLERS.git:4928` |
-| 5572-5605 | `Shell.COMMANDS:5579` |
-| 5606-6153 | pipelines, statements, loops, `$(...)`: `runCommand:5606` |
-| 6154-6205 | `Shell.run:6154` -> `runLine` |
-| 6206-end | `Shell.selfTest:6206` |
+| 1-137 | header, requires, aliases |
+| 138-862 | `partition:138`, `SPECS:449` and the shared helpers |
+| 863-4984 | HANDLERS + private helpers |
+| 4985-5715 | `materialize:4985` (pull and clone share it) and `HANDLERS.git:5061` |
+| 5716-5786 | `Shell.COMMANDS:5722`, `runCommand` |
+| 5787-5846 | `runtimeApi:5787`, `Shell.run:5838` |
+| 5847-end | `Shell.selfTest:5847` |
 
-`tokenize`/`partition` and the diff core are pure text and are the next
-extractions; `HANDLERS` is not (below).
+The language itself (lexing, parsing, expansion, execution) is in `ShellSyntax`,
+`ShellWords` and `ShellRuntime`; `HANDLERS` does not split (below).
 
 ## Conventions
 
 - Every mutation goes through `Fs.withUndo`. Bypassing it is data loss.
-- `selfTest` is a convention, not a framework: `Sha256`, `Regex`, `Props`,
+- `selfTest` is a convention, not a framework: `Pkce`, `Regex`, `Props`,
   `Markdown`, `Sessions`, `Find`, `Console`, `Shell`, `Agent`, `Exec`, `Catalog`,
   `Git` and `Terminal` export one, and `/selftest` in `Commands` runs them — on
   demand, not at startup, where ~1800 lines of them ran on the frame the widget

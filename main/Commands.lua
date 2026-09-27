@@ -18,13 +18,12 @@ local Provider = require(agent:WaitForChild("Provider"))
 local Agent = require(agent:WaitForChild("Agent"))
 local Terminal = require(script.Parent:WaitForChild("fs"):WaitForChild("Terminal"))
 local Tools = require(agent:WaitForChild("Tools"))
--- The four the self-test runner needs and nothing else did. Commands already
+-- The three the self-test runner needs and nothing else did. Commands already
 -- reaches into every layer by definition, which is the reason the runner lives
 -- here rather than being handed in as a fifth callback from main.
 local Markdown = require(ui:WaitForChild("Markdown"))
 local Find = require(ui:WaitForChild("Find"))
 local Props = require(script.Parent:WaitForChild("studio"):WaitForChild("Props"))
-local Sha256 = require(script.Parent:WaitForChild("util"):WaitForChild("Sha256")) :: any
 
 local Commands = {}
 
@@ -280,7 +279,6 @@ end
 -- Terminal's entry pulls in Shell, and Shell's pulls in Regex, Sed and Git, so
 -- four of the biggest are behind one name here.
 local SELF_TESTS: { { name: string, run: () -> (boolean, string?) } } = {
-	{ name = "sha256",    run = Sha256.selfTest },
 	{ name = "markdown",  run = Markdown.selfTest },
 	{ name = "terminal",  run = Terminal.selfTest },
 	{ name = "props",     run = Props.selfTest },

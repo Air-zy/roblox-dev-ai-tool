@@ -29,9 +29,6 @@
     "ui": {
       "$path": "main/ui"
     },
-    "util": {
-      "$path": "main/util"
-    },
     "vendor": {
       "$path": "main/vendor"
     }

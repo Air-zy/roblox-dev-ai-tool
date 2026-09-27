@@ -1,39 +1,30 @@
 --!strict
--- Pkce.luau: the PKCE primitives, shared by every provider that logs in.
---
--- RFC 7636. A verifier is high-entropy random; the challenge is
--- base64url(sha256(verifier)); the server compares them, which is what stops an
--- intercepted authorization code being redeemed by anyone but us.
---
--- Extracted when OpenRouter arrived and turned out to want the identical flow —
--- authorize in a browser, paste the code back — differing only in URLs and in
--- what comes back at the end. What is here is the part with no provider in it.
-
-local Sha256 = require(script.Parent.Parent.Parent
-	:WaitForChild("util"):WaitForChild("Sha256")) :: any
+-- Pkce.luau: RFC 7636 primitives, shared by every provider that logs in.
 
 local HttpService = game:GetService("HttpService")
+local EncodingService = game:GetService("EncodingService")
 
 local Pkce = {}
 
--- A high-entropy code_verifier (the spec allows 43-128 chars; this is 43).
---
--- Roblox has no crypto RNG. GenerateGUID(false) returns a 32-hex-char GUID
--- without braces, so two of them concatenated is 64 hex chars = 256 bits, which
--- is what the spec recommends. Hex-decoded to 32 raw bytes, then base64url'd.
+-- URL-safe base64, unpadded, of raw bytes.
+local function b64url(bin: string): string
+	local b64 = buffer.tostring(EncodingService:Base64Encode(buffer.fromstring(bin)))
+	return (b64:gsub("%+", "-"):gsub("/", "_"):gsub("=", ""))
+end
+
+-- 43 chars from 256 bits. Roblox has no crypto RNG, so the bits are two GUIDs.
 function Pkce.verifier(): string
 	local hex = (HttpService:GenerateGUID(false) .. HttpService:GenerateGUID(false)):gsub("-", "")
 	local bytes = {}
 	for i = 1, #hex, 2 do
 		bytes[#bytes + 1] = string.char(tonumber(string.sub(hex, i, i + 1), 16) :: number)
 	end
-	return Sha256.b64url(table.concat(bytes))
+	return b64url(table.concat(bytes))
 end
 
--- code_challenge = base64url(sha256(verifier)), always S256. `plain` is in the
--- spec and is not worth offering: it sends the verifier itself.
+-- Always S256; `plain` would send the verifier itself.
 function Pkce.challenge(verifier: string): string
-	return Sha256.base64url(verifier)
+	return b64url(EncodingService:ComputeStringHash(verifier, Enum.HashAlgorithm.Sha256))
 end
 
 -- An opaque CSRF token. Any unguessable string works.
@@ -42,9 +33,7 @@ function Pkce.state(): string
 end
 
 -- Self-test
--- The vector is RFC 7636 appendix B, which is the whole point of pinning this:
--- a challenge that is merely well-formed still fails every login, and the
--- failure arrives from the server as an opaque `invalid_grant`.
+-- RFC 7636 appendix B. A wrong challenge only shows up as `invalid_grant`.
 function Pkce.selfTest(): (boolean, string?)
 	local verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 	local expected = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"

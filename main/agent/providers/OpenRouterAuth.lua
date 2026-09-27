@@ -27,7 +27,6 @@
 local Pkce = require(script.Parent:WaitForChild("Pkce"))
 
 local HttpService = game:GetService("HttpService")
-local warn = warn
 
 -- The `plugin` global only exists in the root plugin Script, not in the
 -- ModuleScripts it requires, so the caller hands it over via Initialize.

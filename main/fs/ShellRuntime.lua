@@ -301,9 +301,6 @@ local function execute(ast: any, terminal: any, api: any, budget: any, input: an
 			end
 			local handled = builtin(argv, stream)
 			if handled then return handled end
-			-- All argv entries are now data; even an expanded literal '>' must stay
-			-- an argument when the legacy command dispatcher receives it.
-			argv.quoted = {}; for at = 1, #argv do argv.quoted[at] = true end
 			local stdin = stream.connected and stream.text:sub(stream.at) or nil
 			local answer = api.command(terminal, argv, stdin, stream)
 			if stdin ~= nil and api.consumes[argv[1]] then stream.at = #stream.text + 1 end

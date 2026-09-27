@@ -407,18 +407,20 @@ main/
     providers/
       Stream.lua         one streaming request: retries, cancel, SSE framing
       Retry.lua          what is worth retrying, and how long to wait
-      ToolJson.lua       decoding arguments the model wrote
+      ToolJson.lua       decoding arguments the model wrote, encoding them back
       Pkce.lua           verifier, challenge, state
       Anthropic.lua      Messages API client, SSE streaming
       AnthropicAuth.lua  PKCE login, token storage and refresh
       OpenAI.lua         Responses API client, and the translation both ways
       OpenAIAuth.lua     ChatGPT device OAuth, refresh and Codex plan limits
-      OpenRouter.lua     chat/completions client, and the translation both ways
+      ChatCompletions.lua chat/completions client and translation, for the two below
+      OpenRouter.lua     its request body, cache breakpoints, free model list
       OpenRouterAuth.lua PKCE login, or a pasted key
-      Nvidia.lua         NIM chat/completions client, and the same translation
-      NvidiaAuth.lua     a pasted nvapi- key, and nothing else
+      Nvidia.lua         NIM request body, reasoning switches, curated models
+      KeyAuth.lua        a pasted key: the auth module Gemini and NVIDIA share
+      NvidiaAuth.lua     KeyAuth plus a send-rate meter
       Gemini.lua         native generateContent client, and the translation both ways
-      GeminiAuth.lua     a pasted AI Studio key
+      GeminiAuth.lua     KeyAuth for an AI Studio key
     Agent.lua     history and the tool-use loop
     Tools.lua     tool registry
     tools/        one file per tool
@@ -444,8 +446,6 @@ main/
     Console.lua   output, streaming reply, tool calls
     Settings.lua  prefs, panel, usage bars
     Sessions.lua  session list, save/load/restore
-  util/
-    Sha256.lua    PKCE hashing
 ```
 
 Requires inside a folder are just script.Parent:WaitForChild. Only five files
@@ -515,8 +515,7 @@ tools, and Stop or Escape ends it.
 
 ## Self-tests
 
-`/selftest` runs them: Sha256 against the FIPS vectors, PKCE against the RFC 7636
-vector, retry classification and backoff, tool-argument repair, every provider's
+`/selftest` runs them: PKCE against the RFC 7636 vector, retry classification and backoff, tool-argument repair, every provider's
 request translation, Markdown parsing plus every streaming prefix leaving
 RichText balanced, Terminal across its commands, flags and globs, Regex, Sed and
 Git underneath it, and Props against the API dump. Every provider's tests run,

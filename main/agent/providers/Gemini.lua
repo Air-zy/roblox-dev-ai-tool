@@ -77,6 +77,7 @@ local HttpService = game:GetService("HttpService")
 local warn = warn
 
 local Stream = require(script.Parent:WaitForChild("Stream"))
+local ToolJson = require(script.Parent:WaitForChild("ToolJson"))
 
 local Gemini = {}
 
@@ -266,12 +267,7 @@ function refreshModels(): (boolean, string?)
 	local out: { any } = {}
 	for _, entry in ipairs(data) do
 		local methods = entry.supportedGenerationMethods
-		local usable = false
-		if type(methods) == "table" then
-			for _, method in ipairs(methods) do
-				if method == "generateContent" then usable = true break end
-			end
-		end
+		local usable = type(methods) == "table" and table.find(methods, "generateContent") ~= nil
 		if usable and type(entry.name) == "string" and isTextModel(bareId(entry.name)) then
 			local id = bareId(entry.name)
 			local display = entry.displayName or id
@@ -341,22 +337,6 @@ local function acceptsModelId(id: string): boolean
 end
 
 -- Outbound
-local function resultText(content: any): string
-	if type(content) == "string" then return content end
-	if type(content) == "table" then
-		local parts: { string } = {}
-		for _, block in ipairs(content) do
-			if type(block) == "table" and type(block.text) == "string" then
-				parts[#parts + 1] = block.text
-			elseif type(block) == "string" then
-				parts[#parts + 1] = block
-			end
-		end
-		return table.concat(parts, "\n")
-	end
-	return tostring(content)
-end
-
 -- What the parser stashed in a thinking block's signature: the thought text, the
 -- thought part's own signature, and call id -> signature for the function calls
 -- in that same turn.
@@ -404,7 +384,7 @@ local function toContents(messages: { any }): { any }
 							-- into the text, so the model can tell a failed call
 							-- from one that returned the word "error".
 							response = {
-								output = resultText(block.content),
+								output = ToolJson.resultText(block.content),
 								error = if block.is_error then true else nil,
 							},
 						},

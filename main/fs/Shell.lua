@@ -297,58 +297,8 @@ local function takeCount(operands: { string }): (string?, number?)
 end
 
 -- Pathname expansion belongs to ShellWords and is complete before dispatch.
-
--- Redirects on argv assembled by find -exec still use this adapter. Ordinary
--- shell redirection, including heredocs, is parsed and executed by ShellRuntime.
+-- Redirection, including heredocs, is parsed and executed by ShellRuntime.
 local DEV_NULL = "/dev/null"
-local function takeRedirect(argv: { string }): ({ string }, string?, boolean, string?, boolean, string?)
-	local kept: { string } = {}
-	local target: string? = nil
-	local append = false
-	local errTarget: string? = nil
-	local errAppend = false
-	local inTarget: string? = nil
-	-- Which positions came out of quotes, tagged on by parseStatements. A quoted
-	-- `>` is a one-character ARGUMENT — `grep '>' f.luau` searches for it — and
-	-- reading it as an operator dropped the pattern and truncated the file being
-	-- searched, in silence. Same rule the METACHARACTERS gate applies to `<`.
-	local wasQuoted = (argv :: any).quoted or {}
-	local i = 1
-	while i <= #argv do
-		local arg = argv[i]
-		-- `glued` is always empty now that tokenize splits `>` off its own word,
-		-- and it is still read: this has to keep working on an argv assembled
-		-- anywhere other than the tokenizer, and a match that silently ignored
-		-- the tail would take the NEXT operand as the path instead.
-		local stream, arrow, glued = arg:match("^([12&]?)(>>?)(.*)$")
-		if arrow and wasQuoted[i] then
-			arrow = nil
-		end
-		if arg == "<" and not wasQuoted[i] then
-			-- `wc -l < f.luau`. The path is the next word; tokenize has already
-			-- split `<` off whatever it was glued to.
-			inTarget = argv[i + 1] or ""
-			i += 1
-		elseif arrow then
-			local path = glued
-			if path == "" then
-				path = argv[i + 1] or ""
-				i += 1
-			end
-			if stream == "2" then
-				errAppend = arrow == ">>"
-				errTarget = path
-			elseif stream ~= "&" then
-				append = arrow == ">>"
-				target = path
-			end
-		else
-			kept[#kept + 1] = arg
-		end
-		i += 1
-	end
-	return kept, target, append, errTarget, errAppend, inTarget
-end
 
 -- Bash commands with no DataModel equivalent. Naming them buys a fast, specific
 -- failure; the alternative is not "the model never tries chmod", it is a
@@ -477,25 +427,6 @@ local function announce(lines: { string }): string
 		note(text)
 	end
 	return ""
-end
-
-local function applyRedirect(self: any, path: string, content: string, append: boolean): string
-	local target, err = self:ensureScript(path)
-	if not target then
-		return fail("bash", err)
-	end
-	if not isScript(target) then
-		return "bash: not a script: " .. instancePath(target)
-	end
-	local body = content
-	if body ~= "" and body:sub(-1) ~= "\n" then
-		body ..= "\n"
-	end
-	if append then
-		body = (getSource(target) or "") .. body
-	end
-	local s, writeErr = self:write(instancePath(target), body)
-	return s or fail("bash", writeErr)
 end
 
 -- The flag spec for each command. Declared here rather than beside runCommand so
@@ -2457,8 +2388,6 @@ HANDLERS.find = function(self, argv)
 					out[#out + 1] = value
 				end
 			end
-			;(out :: any).quoted = {}
-			for index = 1, #out do (out :: any).quoted[index] = true end
 			return out
 		end
 
@@ -5792,18 +5721,6 @@ table.sort(COMMANDS)
 -- copy that goes stale the moment a handler is added.
 Shell.COMMANDS = COMMANDS
 
--- Shell metacharacters that survive tokenizing as their own token. Folding them
--- into an argument silently is worse than saying they don't work. A QUOTED one
--- is exempt: `grep "&" f` is a pattern, not a background job, which is what the
--- quoted-position set from tokenize() is for.
---
--- `<` used to be in here. It is a real input redirection now, so the only thing
--- left with no meaning is backgrounding.
-local METACHARACTERS: { [string]: boolean } = {
-	["&"] = true,
-}
-
-
 -- Commands that can consume a stream. Anything else in a pipeline is a mistake
 -- worth naming: `ls | ls` silently ignoring its input is how a wrong answer
 -- looks exactly like a right one.
@@ -5813,39 +5730,13 @@ local STDIN_COMMANDS: { [string]: boolean } = {
 	sed = true, tr = true, cut = true,
 }
 
--- One command, already tokenized. `stdin` is a heredoc body or the previous
--- stage's output; `> path` sends this command's output to a script instead.
--- Forward-declared: a `for` loop is a pipeline STAGE, so runCommand has to be
--- able to reach it, and the loop body runs back through runTokens, which is
--- defined below both of them.
+-- One command, already expanded. `stdin` is a heredoc body or the previous
+-- stage's output. Copied, so stripping `command` below leaves the caller's argv
+-- alone: the runtime reads argv[1] again after this returns.
 function runCommand(self: any, argv: { string }, stdin: string?): (string, boolean)
 	failed, unmatched, missText, trailer = false, false, false, nil
-	local args, redirect, append, errRedirect, errAppend, inRedirect = takeRedirect(argv)
-	-- `< path` replaces stdin. A pipe on the left loses to it, which is bash's
-	-- rule and the only one that can be right: the redirect is the more specific
-	-- instruction, and it was written after the pipe.
-	--
-	-- Read as a FILE — resolve, then its source — rather than through Terminal:cat,
-	-- which renders a non-script's properties. `wc -l < /Workspace` counting the
-	-- lines of a property dump is a number that means nothing.
-	if inRedirect then
-		if inRedirect == "" then
-			return fail("bash", "`<` needs a path to read from"), false
-		end
-		local target, resolveErr = self:resolve(inRedirect)
-		if not target then
-			return fail("bash", resolveErr), false
-		end
-		local source = getSource(target)
-		if not source then
-			return fail("bash", "not a script: " .. instancePath(target)), false
-		end
-		stdin = source
-	end
+	local args = table.clone(argv)
 	if #args == 0 then
-		if redirect and redirect ~= DEV_NULL then
-			return applyRedirect(self, redirect, stdin or "", append), not failed
-		end
 		return "", true
 	end
 
@@ -5887,49 +5778,7 @@ function runCommand(self: any, argv: { string }, stdin: string?): (string, boole
 			cmd, table.concat(COMMANDS, " "))), false
 	end
 
-	local ok = not (failed or unmatched)
-	-- `failed` means the output IS the error message, so a `2>` target is where
-	-- that message goes and stdout is left empty — which is what makes
-	-- `find /Nope -name x 2>/dev/null` finally quiet, and `cmd 2>err.luau` put the
-	-- reason somewhere readable. A command that did not fail has nothing to send:
-	-- `2>` is not allowed to eat a real answer.
-	if failed and errRedirect then
-		if errRedirect ~= DEV_NULL then
-			-- Written with `failed` cleared, so the only thing that can set it again
-			-- is this write, and a report of "could not save the error" is not
-			-- swallowed along with the error it was reporting.
-			local message = output
-			failed = false
-			local written = applyRedirect(self, errRedirect, message, errAppend)
-			if failed then
-				return written, false
-			end
-		end
-		output = ""
-		-- The two flags, set to what is now TRUE of this command rather than left
-		-- describing the moment before the redirect.
-		--
-		-- `failed` means "this errored and its output is the message". After the
-		-- message has been sent elsewhere that is no longer so — the output is
-		-- empty — and it is the reason runPipeline stops, which exists only to
-		-- keep an error from flowing on as data. With nothing to leak there is
-		-- nothing to stop for, and bash runs the rest of the pipeline anyway:
-		-- `find /Nope 2>/dev/null | wc -l` is 0, not an abandoned pipeline.
-		--
-		-- `unmatched` carries the false status onward, so `&&` still skips and
-		-- `||` still fires. Silencing an error must not make it look like success.
-		failed = false
-		unmatched = true
-	end
-	if redirect == DEV_NULL then
-		return "", ok        -- ran it, threw the output away
-	end
-	if redirect then
-		-- `failed` is read AGAIN because applyRedirect can set it: a write that
-		-- could not land is its own failure, on top of whatever the command said.
-		return applyRedirect(self, redirect, output, append), ok and not failed
-	end
-	return output, ok
+	return output, not (failed or unmatched)
 end
 
 -- The runtime passes already-expanded argv to the command table and receives
@@ -6674,8 +6523,7 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		  why = "a backslashed ; is a word, not a statement break" },
 		{ line = "echo a \\| b", want = "a | b",
 		  why = "a backslashed | is a word, not a pipe" },
-		-- The quoted forms of the same thing, which parseStatements also cut:
-		-- takeRedirect learned about the quoted set in §3.10 and this did not.
+		-- The quoted forms of the same thing.
 		{ line = "echo ';'", want = ";", why = "a quoted ; is an argument" },
 		{ line = "echo '|'", want = "|", why = "a quoted | is an argument" },
 

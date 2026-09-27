@@ -240,8 +240,8 @@ In the order I would take them:
    models actually in use, tool results are permanently destroyed — no
    spill-to-disk, gone — at **15% of the window**, where the same number is a
    correct 75% on Haiku. One constant, right for the model it was tuned against
-   and wrong for the rest. `contextWindow(model)` is already exported by both
-   providers (`Anthropic.lua:836`, `OpenRouter.lua:857`) and used only by the
+   and wrong for the rest. `contextWindow(model)` is already exported by every
+   provider (`Anthropic.lua:114`, `OpenRouter.lua:338`, …) and used only by the
    settings panel, so the plumbing is there. Not in §4 because it is not a
    divergence from Claude Code — theirs is calibrated the same way — but it is
    the highest-value item on the page.

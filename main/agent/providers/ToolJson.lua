@@ -1,31 +1,15 @@
 --!strict
--- ToolJson.luau: decoding a tool call's arguments, which the model wrote.
---
--- Extracted from Anthropic.luau when OpenRouter arrived. The failure it repairs
--- is the model's, not the transport's, so it happens identically on any wire:
--- every JSON-tool provider hands over a string some language model generated a
--- token at a time, and each gets the same illegal byte in the same place.
+-- ToolJson.luau: decoding the tool arguments a model wrote, and the two
+-- conversions every non-Anthropic wire needs on the way back out.
 
 local HttpService = game:GetService("HttpService")
 
 local ToolJson = {}
 
--- A tool call's arguments, decoded, or nil if they never became valid JSON.
---
--- The strict decode is the answer on every ordinary call. The repair below it
--- exists because the model sometimes writes a LITERAL newline inside a JSON
--- string instead of `\n`, most often in a long `write`/`multiedit` body
--- carrying a block comment. The stop reason on those turns is a normal tool
--- call, not a truncation: nothing was cut off, the JSON is complete and
--- balanced and simply illegal, and JSONDecode refuses the whole thing over one
--- byte.
---
--- Escaping it is a reading, not a guess. RFC 8259 forbids an unescaped control
--- character inside a string, so one appearing there has exactly one possible
--- intent, and the repair only ever runs after the strict parse has already
--- failed. Everything outside a string is left exactly as it arrived, so a
--- genuinely truncated call still fails — which is what makes the "retry with a
--- smaller input" hint the agent prints in its place true.
+-- Models sometimes write a LITERAL newline inside a JSON string instead of `\n`,
+-- and JSONDecode refuses the whole call over it. RFC 8259 forbids an unescaped
+-- control character there, so escaping it has one possible reading. Only inside
+-- strings, and only after the strict parse fails: a truncated call still fails.
 local UNESCAPED: { [string]: string } = {
 	["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t",
 	["\b"] = "\\b", ["\f"] = "\\f",
@@ -50,13 +34,10 @@ local function escapeControlChars(json: string): string
 	return table.concat(out)
 end
 
--- Returns the arguments and whether the repair was needed. The caller warns
--- rather than this function, so that a selfTest can exercise the repair without
--- printing a warning into every startup.
+-- The arguments or nil, and whether the repair was needed (the caller warns).
 function ToolJson.decode(json: string): (any?, boolean)
 	local parsed
-	-- JSONDecode("") throws; a no-arg tool call never emits any argument
-	-- fragments, so the accumulator stays "".
+	-- A no-arg call streams no fragments, and JSONDecode("") throws.
 	if pcall(function()
 		parsed = HttpService:JSONDecode(json ~= "" and json or "{}")
 	end) then
@@ -70,20 +51,37 @@ function ToolJson.decode(json: string): (any?, boolean)
 	return parsed, true
 end
 
+-- A tool_use input as a JSON object string. `{}` would encode as `[]`.
+function ToolJson.encode(input: any): string
+	if type(input) ~= "table" or next(input) == nil then return "{}" end
+	local ok, encoded = pcall(function() return HttpService:JSONEncode(input) end)
+	return if ok then encoded else "{}"
+end
+
+-- A tool_result's content as one string; a restored session may hold blocks.
+function ToolJson.resultText(content: any): string
+	if type(content) == "string" then return content end
+	if type(content) == "table" then
+		local parts: { string } = {}
+		for _, block in ipairs(content) do
+			if type(block) == "table" and type(block.text) == "string" then
+				parts[#parts + 1] = block.text
+			elseif type(block) == "string" then
+				parts[#parts + 1] = block
+			end
+		end
+		return table.concat(parts, "\n")
+	end
+	return tostring(content)
+end
+
 -- Self-test
--- The strict path must stay strict, and the repair must only ever rescue an
--- unescaped control character INSIDE a string: a body that is genuinely
--- truncated has to keep failing, or the "retry with a smaller input" the agent
--- prints in its place becomes a lie.
 function ToolJson.selfTest(): (boolean, string?)
 	local good = ToolJson.decode('{"path":"/a","content":"one\\ntwo"}')
 	if not good or good.content ~= "one\ntwo" then
 		return false, "a valid tool input did not decode"
 	end
-	-- The reported failure: a literal newline where the model owed a \n. The one
-	-- BETWEEN values is legal whitespace and must survive untouched, which is the
-	-- half that says the repair tracks string boundaries rather than replacing
-	-- every newline in the document.
+	-- The newline between values is legal and must survive untouched.
 	local repaired = ToolJson.decode('{"path":"/a",\n"content":"one\ntwo"}')
 	if not repaired or repaired.content ~= "one\ntwo" then
 		return false, "a literal newline inside a JSON string was not repaired"

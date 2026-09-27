@@ -66,28 +66,6 @@ local function supportsReasoning(model: string): boolean
 	return model:match("^gpt%-[56]") ~= nil or model:match("^o%d") ~= nil
 end
 
-local function toolArguments(input: any): string
-	if type(input) ~= "table" or next(input) == nil then return "{}" end
-	local ok, encoded = pcall(function() return HttpService:JSONEncode(input) end)
-	return if ok then encoded else "{}"
-end
-
-local function resultText(content: any): string
-	if type(content) == "string" then return content end
-	if type(content) == "table" then
-		local parts: { string } = {}
-		for _, block in ipairs(content) do
-			if type(block) == "table" and type(block.text) == "string" then
-				parts[#parts + 1] = block.text
-			elseif type(block) == "string" then
-				parts[#parts + 1] = block
-			end
-		end
-		return table.concat(parts, "\n")
-	end
-	return tostring(content)
-end
-
 local function reasoningEnvelope(signature: string?): (any?, { any }?, string?)
 	if type(signature) ~= "string" or signature == "" then return nil, nil, nil end
 	local ok, envelope = pcall(function() return HttpService:JSONDecode(signature) end)
@@ -146,7 +124,7 @@ local function toResponseInput(messages: { any }, model: string?): { any }
 					out[#out + 1] = {
 						type = "function_call_output",
 						call_id = block.tool_use_id,
-						output = resultText(block.content),
+						output = ToolJson.resultText(block.content),
 					}
 				elseif block.type == "text" and type(block.text) == "string" then
 					textParts[#textParts + 1] = block.text
@@ -196,7 +174,7 @@ local function toResponseInput(messages: { any }, model: string?): { any }
 								type = "function_call",
 								call_id = block.id,
 								name = block.name,
-								arguments = toolArguments(block.input),
+								arguments = ToolJson.encode(block.input),
 							}
 						end
 					elseif isServerResult(block) then
@@ -789,7 +767,7 @@ local function selfTest(): (boolean, string?)
 	if input[4].arguments ~= '{"command":"ls"}' then
 		return false, "tool arguments did not encode as a JSON object string"
 	end
-	if toolArguments({}) ~= "{}" then
+	if ToolJson.encode({}) ~= "{}" then
 		return false, "an empty tool input did not encode as an object"
 	end
 
