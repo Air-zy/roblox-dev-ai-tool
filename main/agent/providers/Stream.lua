@@ -75,16 +75,19 @@ function Stream.open(config: {
 	}, callbacks: {
 		onError: ((string, string?) -> ())?,
 		onRetry: ((string, number, number, number) -> ())?,
+		-- "Forget what I just told you": everything this attempt emitted is void,
+		-- because the whole request is being sent again. Opt-in; see `emitted`.
+		onDiscard: (() -> ())?,
 	}): Handle
 
 	-- Set the moment anything reaches the caller, and it is what makes retrying
 	-- safe: onText has already been appended to a bubble and onToolUseStart has
-	-- already put a block on screen, so a second attempt would render both twice
-	-- and there is no callback for "forget what I just told you". A retry is
-	-- therefore only ever offered before the first content block. That is not
-	-- much of a restriction in practice, because the failures worth retrying —
-	-- 429, 529, a stream that went quiet waiting on an uncached prefix — all
-	-- happen before the model has said anything.
+	-- already put a block on screen, so a second attempt would render both twice.
+	-- A caller without onDiscard is therefore only ever retried before the first
+	-- content block. One WITH it is retried after, too: a stream can open, answer,
+	-- and then go quiet mid-answer long enough for Roblox to close it, and failing
+	-- the turn there threw the whole thing away. Claude Code does the same — its
+	-- streaming fallback tombstones the partial message and asks again.
 	local emitted = false
 	-- Per-attempt latch. Distinct from handle.cancelled, which means the USER
 	-- stopped this and must never be undone; this one only means the current
@@ -126,6 +129,7 @@ function Stream.open(config: {
 	-- than only its own attempt, and is reset per attempt below.
 	local startedAt = os.time()
 	local firstByteAt: number? = nil
+	local lastByteAt: number? = nil
 
 	-- Forward-declared so `fail` can re-enter it.
 	local start: (() -> ())
@@ -222,11 +226,17 @@ function Stream.open(config: {
 		local allowed = attempts < Retry.MAX_ATTEMPTS
 			and not windowed
 			and (not overload or overloadAttempts < Retry.MAX_OVERLOAD_ATTEMPTS)
-		if not emitted and allowed and Retry.isRetryable(status, body) then
+		if (not emitted or callbacks.onDiscard) and allowed and Retry.isRetryable(status, body) then
 			local wait = Retry.delay(attempts, Retry.retryAfterSeconds(responseHeaders))
 			attempts += 1
 			warn(string.format("[agent] %s — retrying in %.1fs (attempt %d/%d)",
 				message, wait, attempts, Retry.MAX_ATTEMPTS))
+			-- Before onRetry, so the caller has cleared the dead attempt off the
+			-- screen by the time the retry line lands under it.
+			if emitted and callbacks.onDiscard then
+				callbacks.onDiscard()
+			end
+			emitted = false
 			-- Said out loud, because a silent backoff is indistinguishable from
 			-- the hang this whole mechanism exists to survive: same spinner, same
 			-- nothing, for up to eight seconds. The caller decides how to show it;
@@ -373,9 +383,11 @@ function Stream.open(config: {
 		-- different fixes: before the first byte is the server reprocessing an
 		-- uncached prefix, which is a caching problem; after it is a stall mid-answer,
 		-- which is not. Wall clock, because the thing being measured is a network
-		-- wait, and seconds are enough against a window Roblox puts near 20.
+		-- wait. Roblox does not document the window's length; the silence the
+		-- Error handler reports is the measurement of it.
 		startedAt = os.time()
 		firstByteAt = nil
+		lastByteAt = nil
 
 		-- Built per attempt rather than once, so a refreshed credential is picked
 		-- up by the retry that forced the refresh.
@@ -406,8 +418,8 @@ function Stream.open(config: {
 
 		if not ok or not client then
 			-- Not routed through `fail`: there is no stream to close and no status to
-			-- classify. Six clients may exist at once, so this is also what a leak
-			-- from an earlier turn eventually looks like.
+			-- classify. Four clients may exist at once (HttpService docs), so this is
+			-- also what a leak, or too many subagents at once, looks like.
 			if callbacks.onError then callbacks.onError("Failed to create stream client: " .. tostring(err)) end
 			return
 		end
@@ -428,6 +440,7 @@ function Stream.open(config: {
 		stream.MessageReceived:Connect(function(message: string)
 			if handle.cancelled or dead or myGeneration ~= generation then return end
 			if firstByteAt == nil then firstByteAt = os.time() end
+			lastByteAt = os.time()
 			-- A JSON error body is tried FIRST, and this used to be the other way
 			-- around: the old code looked for an "event:" line and only reached for
 			-- JSON when it found none. That heuristic is Anthropic-shaped — an
@@ -493,9 +506,13 @@ function Stream.open(config: {
 					"silent for %ds, no first byte — the prefix was almost certainly uncached and the server was still reading it",
 					now - startedAt)
 			else
+				-- Silence measured from the LAST byte. It used to be from the first,
+				-- which reported the whole time spent streaming as a stall.
 				where = string.format(
-					"first byte after %ds, then stalled %ds mid-answer",
-					(firstByteAt :: number) - startedAt, now - (firstByteAt :: number))
+					"first byte after %ds, streamed %ds, then silent %ds mid-answer",
+					(firstByteAt :: number) - startedAt,
+					(lastByteAt :: number) - (firstByteAt :: number),
+					now - (lastByteAt :: number))
 			end
 			-- errorMessage carries the HttpError name, which is what Retry.isRetryable
 			-- matches InactivityTimeout on; the status here is 200 for a stream that

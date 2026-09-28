@@ -52,7 +52,9 @@ end
 -- InactivityTimeout is ours. Roblox closes a stream that goes quiet, which
 -- happens when the server is still reading an uncached prefix and has sent
 -- nothing yet. Retrying is the right move precisely because the failed attempt
--- still warmed that prefix, so the second one starts talking sooner.
+-- still warmed that prefix, so the second one starts talking sooner. It also
+-- happens mid-answer, when the server pauses between events for longer than
+-- Roblox waits; see `emitted` in Stream for when that one is retried.
 --
 -- It was also the ONLY transport failure matched here, and the rest arrive the
 -- same way: no HTTP status at all (the Error signal reports -1) and the

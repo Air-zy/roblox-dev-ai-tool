@@ -1071,21 +1071,32 @@ local function runToolUse(shell: any, block: any, call: any, stopReason: string?
 	}
 end
 
--- Runs jobs side by side and returns once every one has finished. A single job
--- runs inline, which keeps an ordinary tool call on exactly the path it always
--- took. Jobs must not throw: one that never gets to the counter leaves the
--- caller asleep for good, which is why runTurn's jobs answer their own failures.
+-- How many jobs runAll lets run at once. The jobs are subagents, each holding a
+-- stream open, and HttpService allows four streams in total. The fourth is the
+-- parent's: its socket is only closed once onComplete returns, and onComplete is
+-- what is running these.
+local MAX_AT_ONCE = 3
+
+-- Runs jobs side by side and returns once every one has finished; past
+-- MAX_AT_ONCE, the next starts as soon as one ends. A single job runs inline,
+-- which keeps an ordinary tool call on exactly the path it always took. Jobs must
+-- not throw: one that never gets to the counter leaves the caller asleep for
+-- good, which is why runTurn's jobs answer their own failures.
 local function runAll(jobs: { () -> () })
 	if #jobs == 1 then
 		jobs[1]()
 		return
 	end
 	local left = #jobs
+	local taken = 0
 	local waiter: thread? = nil
-	for _, job in ipairs(jobs) do
+	for _ = 1, math.min(MAX_AT_ONCE, #jobs) do
 		task.spawn(function()
-			job()
-			left -= 1
+			while taken < #jobs do
+				taken += 1
+				jobs[taken]()
+				left -= 1
+			end
 			if left == 0 and waiter then
 				task.defer(waiter)
 			end
@@ -1112,8 +1123,6 @@ end
 -- call reads the parent's cached tools and system prompt instead. Claude Code's
 -- fork path keeps its Agent tool in the child for the same reason.
 --
--- ponytail: no concurrency cap, every agent call in a batch opens its stream at
--- once; cap it if a provider's rate limit starts to bite.
 -- ponytail: a child's history is never trimmed; give it clearOldToolResults (on
 -- a clock of its own) once children run long enough to need it.
 -- ponytail: children are not saved or resumable, only their result reaches the
@@ -1122,6 +1131,10 @@ local CHILD_NOTE = "\n\nYou are running as a subagent: do the task with your too
 	.. "(the agent tool is not available to you), then reply with a concise report; "
 	.. "that final message is all the caller receives."
 local STOPPED = "stopped by the user"
+-- What an attempt's leftovers say once the stream died mid-answer and the
+-- request went out again. Only the screen ever held them: the history is written
+-- in onComplete, and our tools are dispatched from there too, so none of it ran.
+local DISCARDED = "cut off mid-answer; discarded and asked again"
 
 function Agent.runChild(parentTerm: any, input: { [string]: any }): string
 	-- Its own cwd and shell variables, starting where the caller is, so a child's
@@ -1249,6 +1262,17 @@ function Agent.runChild(parentTerm: any, input: { [string]: any }): string
 			onComplete = settle,
 			onError = function(message: string)
 				settle({ ok = false, error = message })
+			end,
+			onDiscard = function()
+				if bubble then
+					bubble.finishThinking()
+					bubble.setError(DISCARDED)
+				end
+				bubble, thinkingSeen = nil, false
+				for id, call in pairs(pending) do
+					call.setResult(DISCARDED, true)
+					pending[id] = nil
+				end
 			end,
 		})
 		-- Stopped while the request was still being set up (a token refresh
@@ -1816,6 +1840,21 @@ local function runTurn(turn: number)
 				"  %s — retrying in %.0fs (%d/%d)", reason, wait, attempt, ofAttempts), "system")
 		end,
 
+		-- That retry, when the dead attempt had already put things on screen.
+		-- ponytail: only the current bubble is cleared; one a server tool split off
+		-- earlier in the attempt keeps its text. Track every bubble if that shows up.
+		onDiscard = function()
+			bubble.finishThinking()
+			bubble.setError(DISCARDED)
+			for id, call in pairs(pendingCalls) do
+				call.setResult(DISCARDED, true)
+				pendingCalls[id] = nil
+			end
+			-- `text` is what Stop commits to the history, so it must not keep the
+			-- dead attempt's words. The next delta opens a fresh bubble.
+			text, bubbleText, thinkingSeen, splitPending = "", "", false, true
+		end,
+
 		onError = function(message: string)
 			if finish() then return end
 			warn("[agent] " .. message)
@@ -2227,6 +2266,23 @@ function Agent.selfTest(): (boolean, string?)
 		runAll({ yieldingJob, yieldingJob })
 		if done ~= 2 then
 			return string.format("runAll returned with %d of 2 jobs finished", done)
+		end
+		-- More jobs than streams: all of them finish, never more than the cap at once.
+		local live, peak, finished = 0, 0, 0
+		local capped: { () -> () } = {}
+		for i = 1, MAX_AT_ONCE + 2 do
+			capped[i] = function()
+				live += 1
+				peak = math.max(peak, live)
+				task.wait()
+				live -= 1
+				finished += 1
+			end
+		end
+		runAll(capped)
+		if finished ~= #capped or peak ~= MAX_AT_ONCE then
+			return string.format("runAll finished %d of %d jobs, %d at once (cap %d)",
+				finished, #capped, peak, MAX_AT_ONCE)
 		end
 
 		local fakeShell = {

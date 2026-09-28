@@ -412,6 +412,7 @@ local function streamMessage(args: {
 		onComplete: ((any) -> ())?,
 		onError: ((string, string?) -> ())?,
 		onRetry: ((string, number, number, number) -> ())?,
+		onDiscard: (() -> ())?,  -- the attempt so far is void; it is being asked again
 	}): Stream.Handle
 	local function noopHandle()
 		return { cancelled = true, cancel = function() end }
@@ -721,6 +722,7 @@ local function streamMessage(args: {
 	}, {
 		onError = callbacks.onError,
 		onRetry = callbacks.onRetry,
+		onDiscard = callbacks.onDiscard,
 	})
 end
 
