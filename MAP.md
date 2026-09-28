@@ -46,6 +46,7 @@ main.lua                        window, toolbar, popups, usage panel
       text/Regex                BRE/ERE engine
       text/Diff                 line alignment, hunk grouping
       text/Sed                  sed engine
+      text/Awk                  awk language: lexer, parser, interpreter
       git/Git                   object ids, path mapping, working-tree walk
       vendor/LuauParser         Luau grammar; the syntax check on write
 ```
@@ -104,6 +105,7 @@ main.lua                        window, toolbar, popups, usage panel
 | free models | `studio/Catalog.lua:186` `search`, `:247` `load` |
 | regex compiled / matched | `text/Regex.lua:772` `compile`, `:743` `Program:find` |
 | sed parsed / applied | `text/Sed.lua:195` `parseSedCommand`, `:102` `substitute` |
+| awk parsed / run | `text/Awk.lua:185` `lex`, `:343` `parse`, `:2631` `Awk.run`; records `:1617` `readRecord`, fields `:1484` `splitWith`, the time limit `:1398` `tick`. The handler is `Shell.lua:4151` `HANDLERS.awk`, and `exitStatus:424` is how it reports a status or an error beside its output |
 | property names / defaults | `studio/Props.lua:90` `names`, `:137` `default` |
 | sessions | `Sessions.lua:172` `save`, `:396` `load`, `:516` `restoreLast` |
 | a session is bound to its provider | stamped on the index Entry in `save`, checked in `load:396`, filtered in `restoreLast:516`. Missing means Claude, so nothing written before this needs migrating. A cross-provider restore is refused: thinking signatures are only readable by the provider that issued them |
@@ -156,6 +158,7 @@ main.lua                        window, toolbar, popups, usage panel
 | `ui/Markdown.lua` | 346 | Markdown to labels. |
 | `text/Diff.lua` | 157 | Line alignment (LCS over the differing middle) and hunk grouping. Pure text; requires nothing. |
 | `text/Sed.lua` | 329 | sed engine. Pure text. |
+| `text/Awk.lua` | 2754 | awk: lexer, parser, tree-walking interpreter, printf. Requires only Regex; file I/O comes in as callbacks. |
 | `main/Commands.lua` | 279 | Slash commands, and `runShell`, shared by `/sh` and shell mode. |
 | `studio/Props.lua` | 200 | API dump. The only network I/O in fs. |
 | `git/Git.lua` | 818 | Object ids, the path mapping, the index, the tree payload, the remote-tree filters clone reads. No I/O — the requests live in Shell beside curl's. |
@@ -182,7 +185,7 @@ The language itself (lexing, parsing, expansion, execution) is in `ShellSyntax`,
 ## Conventions
 
 - Every mutation goes through `Fs.withUndo`. Bypassing it is data loss.
-- `selfTest` is a convention, not a framework: `Pkce`, `Regex`, `Props`,
+- `selfTest` is a convention, not a framework: `Pkce`, `Regex`, `Awk`, `Props`,
   `Markdown`, `Sessions`, `Find`, `Console`, `Shell`, `Agent`, `Exec`, `Catalog`,
   `Git` and `Terminal` export one, and `/selftest` in `Commands` runs them — on
   demand, not at startup, where ~1800 lines of them ran on the frame the widget

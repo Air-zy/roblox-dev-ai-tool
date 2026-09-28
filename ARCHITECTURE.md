@@ -310,6 +310,15 @@ grep is BRE, `.` is a metacharacter there exactly as it is everywhere else:
 `grep game.Workspace` also matches `gameXWorkspace`, and `\.` or `-F` is how you
 ask for the literal.
 
+awk is the language, not a column cutter: `text/Awk.luau` lexes, parses and
+interprets POSIX awk, with gawk as the reference wherever POSIX leaves a choice,
+and `tests/run.mjs` checks it against a real gawk. Fields, `-F`, `-v`, ranges,
+user functions, `getline < file` and `print > file` all work on scripts the way
+they work on files, and its patterns are ERE from the same engine. What it
+refuses is the part that would start a shell from inside a command: `system()`,
+`cmd | getline` and `print | cmd`, each with the pipe spelling in the message.
+A runaway loop stops after 20 seconds, yielding a frame as it goes.
+
 A search that finds nothing exits 1; a command-handler error exits 2. `true`,
 `false`, `!`, and `$?` work with `&&`/`||`. Pipelines pass only stdout to the
 next stage, retain diagnostics on stderr, and use the last stage's status.
@@ -440,6 +449,7 @@ main/
   text/
     Regex.lua     BRE/ERE engine
     Sed.lua       sed engine
+    Awk.lua       awk language
   ui/
     Theme.lua     palette, fonts, the make helper
     Markdown.lua  markdown to renderable blocks
@@ -517,8 +527,8 @@ tools, and Stop or Escape ends it.
 
 `/selftest` runs them: PKCE against the RFC 7636 vector, retry classification and backoff, tool-argument repair, every provider's
 request translation, Markdown parsing plus every streaming prefix leaving
-RichText balanced, Terminal across its commands, flags and globs, Regex, Sed and
-Git underneath it, and Props against the API dump. Every provider's tests run,
+RichText balanced, Terminal across its commands, flags and globs, Regex, Sed, Awk
+and Git underneath it, and Props against the API dump. Every provider's tests run,
 not only the live one — a translation bug in the provider you are not using would
 otherwise surface the moment you switched, which is the worst time to find one.
 
@@ -534,7 +544,7 @@ clearing it; the conversation is redrawn from storage immediately after.
 
 For shell development outside Studio, `node tests/run.mjs <path-to-luau>
 <path-to-bash>` runs the real modules against a small test-only Roblox boundary,
-the full `Shell.selfTest`, copy-buffer/failure checks, and Bash differential
-tests. The runner is [tests/run.mjs](tests/run.mjs). This does not verify Studio's
+the full `Shell.selfTest`, copy-buffer/failure checks, and Bash and gawk
+differential tests. The runner is [tests/run.mjs](tests/run.mjs). This does not verify Studio's
 actual undo/redo, UI, network services, or engine-only Git checks; `/selftest`
 remains the integration check in Studio.

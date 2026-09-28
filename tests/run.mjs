@@ -7,6 +7,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import printfCases from './printf-cases.mjs';
 import shellCases from './shell-cases.mjs';
+import awkCases from './awk-cases.mjs';
 
 const root = path.resolve(import.meta.dirname, '..');
 const binary = process.argv[2] || 'luau';
@@ -50,6 +51,35 @@ const languageVectors = shellCases.map(source => {
   return `{ source = ${luaString(source)}, out = ${luaString(answer.stdout.toString('utf8').replace(/\n$/, ''))}, code = ${answer.status} }`;
 });
 modules['tests/ShellOracle'] = `return { ${languageVectors.join(',\n')} }`;
+// gawk ships with Git for Windows beside that bash, and is the awk the vectors
+// were chosen against. Each case gets its own directory holding its files. The
+// argv goes through a NUL-separated file for the same reason printf's does: a
+// Windows command line reaching MSYS is re-parsed, which eats backslashes and
+// brace-expands `/x{2,3}/` into two arguments.
+const awkVectors = awkCases.map(c => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'awk-case-'));
+  for (const [name, text] of Object.entries(c.files || {})) fs.writeFileSync(path.join(dir, name), text);
+  fs.writeFileSync(path.join(dir, '.argv'), [...(c.args || []), c.p, ...(c.ops || [])].map(arg => arg + '\0').join(''));
+  fs.writeFileSync(path.join(dir, '.stdin'), c.in ?? '');
+  const answer = spawnSync(bash, ['--noprofile', '--norc', '-c', 'mapfile -d "" -t args < .argv; exec -a awk gawk "${args[@]}" < .stdin'], {
+    cwd: dir, timeout: 10000, env: { ...process.env, LC_ALL: 'C' },
+  });
+  fs.rmSync(dir, { recursive: true, force: true });
+  if (answer.error || answer.status === null) throw new Error(`gawk oracle failed: ${c.p}\n${answer.error || answer.stderr}`);
+  const flags = [...(c.args || [])];
+  let fieldSep = 'nil';
+  const assigns = [];
+  while (flags.length) {
+    const flag = flags.shift();
+    if (flag === '-F') fieldSep = luaString(flags.shift());
+    else if (flag === '-v') assigns.push(luaString(flags.shift()));
+  }
+  const files = Object.entries(c.files || {}).map(([name, text]) => `[${luaString(name)}] = ${luaString(text)}`);
+  return `{ program = ${luaString(c.p)}, fs = ${fieldSep}, assigns = { ${assigns.join(', ')} }, ` +
+    `operands = { ${(c.ops || []).map(luaString).join(', ')} }, stdin = ${c.in === undefined ? 'nil' : luaString(c.in)}, ` +
+    `files = { ${files.join(', ')} }, out = ${luaString(answer.stdout)}, code = ${answer.status} }`;
+});
+modules['tests/AwkOracle'] = `return { ${awkVectors.join(',\n')} }`;
 const sources = Object.entries(modules).map(([name, source]) => `[${JSON.stringify(name)}] = ${literal(source)}`).join(',\n');
 const runner = `local sources = {\n${sources}\n}
 local base = getfenv()
@@ -95,6 +125,22 @@ for index, vector in ipairs(loadModule(node('tests/PrintfOracle'))) do
       table.concat(vector.args, ' | '), vector.out, tostring(vector.failed), out, tostring(err)))
 end
 print('Bash printf differential checks: ${vectors.length} passed')
+local Awk = loadModule(node('main/text/Awk'))
+local awkFailures = {}
+for index, vector in ipairs(loadModule(node('tests/AwkOracle'))) do
+  local files = vector.files
+  local out, err, code = Awk.run({ program = vector.program, fs = vector.fs, assigns = vector.assigns,
+    operands = vector.operands, stdin = vector.stdin, environ = { HOME = '/' },
+    read = function(name) if files[name] then return files[name] end return nil, 'no such file' end,
+    write = function(name, text, append) files[name] = (append and files[name] or '') .. text end })
+  if out ~= vector.out or code ~= vector.code then
+    awkFailures[#awkFailures + 1] = string.format('gawk vector %d (%s): expected %q / %d, got %q / %d %s',
+      index, vector.program, vector.out, vector.code, out, code, err)
+  end
+end
+for _, failure in ipairs(awkFailures) do print(failure) end
+assert(#awkFailures == 0, #awkFailures .. ' gawk vectors failed')
+print('gawk differential checks: ${awkVectors.length} passed')
 local Terminal, Shell = loadModule(node('main/fs/Terminal')), loadModule(node('main/fs/Shell'))
 for index, vector in ipairs(loadModule(node('tests/ShellOracle'))) do
   local terminal = Terminal.new(shim.game)

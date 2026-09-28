@@ -2,16 +2,15 @@
 
 Scope: `fs/Shell.lua`, `fs/ShellSyntax.lua`, `fs/ShellWords.lua`,
 `fs/ShellRuntime.lua`, `fs/ShellBuiltins.lua`, `fs/Terminal.lua`, `fs/Fs.lua`,
-`text/Regex.lua`, `text/Sed.lua`. The `bash` tool and `/sh` are the same call —
+`text/Regex.lua`, `text/Sed.lua`, `text/Awk.lua`. The `bash` tool and `/sh` are the same call —
 `Shell.run`.
 
 Keep this honest or delete it. The point of the file is the **Lies** section;
 everything else is context for it.
 
-The tool description says "Bash-style shell over a live in-memory vfs". That
-first phrase is a claim, and this is the audit of it. It used to say "real bash
-shell"; the wording was changed because it was the stronger claim and this
-document is what has to back it.
+The tool description says "real bash shell over a live in-memory vfs, with
+network". That first phrase is the strongest claim the plugin makes, and this is
+the audit of it: §2 is what backs it, and §3 and §4 are where it does not hold.
 
 ---
 
@@ -36,10 +35,10 @@ design spliced `$(...)` into the raw text *before* tokenizing, which is why it
 had to refuse any substitution output containing `; | & ' " \` — that whole
 class of refusal is gone with the design that caused it.
 
-**54 commands**, from `help`:
+**55 commands**, from `help`:
 
 ```
-: [ basename break cat cd chmod command continue cp curl cut diff dirname du
+: [ awk basename break cat cd chmod command continue cp curl cut diff dirname du
 echo egrep exit export false fgrep file find git grep head help ln local ls
 mkdir mv printf pwd read return rm rmdir sed seq sort stat tail test touch tr
 tree true uniq unset wc wget which whoami
@@ -207,7 +206,7 @@ Correct calls, listed so they are not mistaken for the section above.
   prose is the divergence here; the status is not. The prose is dropped for a
   downstream stage and by a `||` that handles it, so `grep X f | wc -l` is 0 and
   `grep X f || echo absent` prints exactly `absent`.
-- **`UNSUPPORTED` table** — `awk chown sudo ps kill man quit compgen unzip tar
+- **`UNSUPPORTED` table** — `chown sudo ps kill man quit compgen unzip tar
   xargs` each fail with a specific reason and a working substitute, instead of
   "command not found".
 - **`find` with no test is refused**, even with `-delete` or `-maxdepth`: a path
@@ -266,6 +265,40 @@ Correct calls, listed so they are not mistaken for the section above.
   `config.json` and `README.md` are text; a name with no extension is assumed to
   be a script, which is what every instance name in a place actually is.
 
+### awk
+
+A real interpreter (`text/Awk.lua`), not a column cutter: the whole POSIX
+language, including user functions, `getline` in its four file and input forms,
+printf, range patterns, paragraph mode and `print > file`, plus the extensions
+every awk in use shares (`delete arr`, `nextfile`, `length(arr)`, `**`, hex
+constants, a regex `RS`). Where POSIX leaves a choice, gawk's reading is taken,
+and 260 vectors are checked against a real gawk (see **Verification**).
+
+Refused, each with the pipe spelling in the message: `system()`,
+`cmd | getline` and `print | cmd`. All three run a shell command from inside a
+handler, which needs a nested, forked shell run that the handler contract does
+not offer. gawk-only functions (`gensub`, `strftime`, `asort`, …) are undefined,
+as in POSIX awk, and the error says where they come from.
+
+Where it differs from gawk:
+
+- `for (k in a)` visits keys in insertion order. POSIX leaves the order open and
+  every awk picks its own.
+- Regex matches are leftmost by backtracking, not POSIX leftmost-longest:
+  `match("xy", /x|xy/)` gives `RLENGTH` 1 where gawk gives 2. It is the engine
+  grep and sed use.
+- `010` is ten, as POSIX has it. gawk reads it as octal.
+- A parse-time warning (`"\."` is read as `.`) is printed after the program's
+  output rather than before it. That is the per-command stream concatenation of
+  §3.1.
+- Strings are bytes: `length("é")` is 2, which is also what gawk says under
+  `LC_ALL=C`.
+
+The exit status is gawk's: `exit N` gives N, a syntax error 1, and a runtime
+error or a refusal 2. A runtime error keeps whatever was printed before it; awk
+is the one handler that can report output and an error together (see
+`exitStatus` in `Shell.lua`).
+
 ### Not implemented
 
 - `tee`.
@@ -290,6 +323,10 @@ silently.
 | Syntax and arithmetic nesting | 64 |
 | Call, function and expansion depth | 32 |
 | `printf` output | 1 MB |
+| awk run time | 20 s, yielding |
+| awk output, files included | 4 MB |
+| awk call depth | 200 |
+| awk field index and NF | 100 000 |
 
 ---
 
@@ -598,6 +635,7 @@ node tests/run.mjs <path-to-luau> <path-to-bash>
 |---|---|---|
 | `printf` | every vector passed as argv to a real Bash `printf` builtin, compared byte for byte including NUL, and on success/failure | 56 |
 | Shell language | every case run through `bash --noprofile --norc`, comparing stdout **and** numeric exit status: quoting, expansion, arithmetic, `if`/`case`/loops, functions, `local`, forks, `read`/`IFS`, stream ordering under `2>&1` | 55 |
+| awk | every vector run through a real gawk under `LC_ALL=C`, argv passed NUL-separated so MSYS cannot re-parse it, comparing stdout byte for byte **and** the exit status: fields, `RS`, patterns and ranges, strnum comparison, number formatting, printf, every builtin, arrays, functions, getline, `-v`, errors | 260 |
 | Copy semantics | editor-buffer carry and rollback on a failed `cp` | `tests/CopyBuffers.lua` |
 | DataModel behaviour | everything with no bash equivalent — `cp`/`mv`/`rm` on Instances, `cd`/`PWD`/`OLDPWD`, `find -delete` and `-o` scoping, `diff -r`, the `.luau` parse-check rule, stderr interleaving through real handlers | `fs/ShellTests.lua`, run inside `Shell.selfTest` |
 | Everything else | `Shell.selfTest`, `Regex.selfTest`, `Props.selfTest` | in full |

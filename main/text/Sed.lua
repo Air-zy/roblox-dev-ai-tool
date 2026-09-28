@@ -104,10 +104,23 @@ local function substitute(program: any, text: string, replacement: string,
 	local out: { string } = {}
 	local at = 1
 	local seen, changed = 0, 0
+	-- Where the last non-empty match ended, for the rule below.
+	local lastEnd = -1
 	while at <= #text + 1 do
 		local start, finish, caps = program:find(text, at)
 		if not start then
 			break
+		end
+		-- An empty match right where a real one ended is not another match, and
+		-- is not counted as one: `s/b*/-/g` on "abc" is "-a-c-" and `s/b*/-/2`
+		-- on "bbb" changes nothing, as GNU sed has both. Taking it gave "-a--c-".
+		if (finish :: number) < start and start == lastEnd + 1 then
+			if start > #text then
+				break
+			end
+			out[#out + 1] = text:sub(at, start)
+			at = start + 1
+			continue
 		end
 		seen += 1
 		-- `s/x/y/2` replaces the second match and no other; `s/x/y/2g` replaces
@@ -127,6 +140,7 @@ local function substitute(program: any, text: string, replacement: string,
 			at = start + 1
 		else
 			at = (finish :: number) + 1
+			lastEnd = finish :: number
 		end
 		if replace and not global then
 			break

@@ -33,6 +33,9 @@ local parseSedCommand = Sed.parseSedCommand
 local sedSelects = Sed.sedSelects
 local substitute = Sed.substitute
 local TR_ESCAPES = Sed.ESCAPES
+-- The awk language, the same split as sed: the handler reads the program and
+-- the files here, and what awk means lives in text/Awk.
+local Awk = require(script.Parent.Parent:WaitForChild("text"):WaitForChild("Awk"))
 -- The only reach out of fs/: the shell has to know which words are tools rather
 -- than commands, so it can say so instead of reporting "unknown command".
 local Tools = require(script.Parent.Parent:WaitForChild("agent"):WaitForChild("Tools"))
@@ -323,13 +326,6 @@ local UNSUPPORTED: { [string]: string } = {
 	-- rather than left to "unknown command" because a model reaching for it wants
 	-- that list and would otherwise get it by accident, from a failure.
 	compgen = "no completion here; `help` lists the commands and `help NAME` gives one's flags",
-	-- Named with their replacements, because both are reached for as the fallback
-	-- after something else was missing, and the answer nobody wants there is "use
-	-- the run tool", which executes arbitrary Luau at plugin permission to do what
-	-- a pipe already does. curl and wget were on this list for the same reason
-	-- until they became commands.
-	awk = "no awk; `cut -d: -f2` takes a column, `sed -n '10,40p'` a line range, " ..
-		"and `grep -A/-B/-C` gives context",
 	-- Named with the redirect for the same reason curl and wget were, back when
 	-- they were only on this list: an archive is reached for as the way to get a
 	-- library in, and there is a direct one. Deflate is not written here — a
@@ -339,8 +335,13 @@ local UNSUPPORTED: { [string]: string } = {
 	unzip = "no archives here; `git clone <owner>/<repo> [dest]` reads a repository's " ..
 		"scripts straight into the place, which is what a release zip was going to be for",
 	tar = "no archives here; see `unzip`",
+	-- Named with its replacement, because it is reached for as the fallback after
+	-- something else was missing, and the answer nobody wants there is "use the
+	-- run tool", which executes arbitrary Luau at plugin permission to do what a
+	-- pipe already does. curl, wget and awk were on this list for the same reason
+	-- until they became commands.
 	xargs = "no xargs; `for f in $(grep -rl Foo); do ... $f; done` runs a command " ..
-		"per item, and a filter can be piped straight into grep/head/tail/wc/sort/uniq/cut/sed/tr",
+		"per item, and a filter can be piped straight into grep/head/tail/wc/sort/uniq/cut/sed/tr/awk",
 }
 
 -- Which script class a suffix asks for. Owned by Fs, because `write` creates
@@ -415,6 +416,13 @@ local function note(text: string)
 	trailer = text
 end
 
+-- A status the three flags above cannot spell. They only reach 0, 1 and 2, and
+-- `awk '... exit 3'` means 3; awk also reports a runtime error beside the
+-- output it already printed, which `fail()` cannot, since it means the output
+-- IS the message. So awk returns its stdout, puts the error through note(), and
+-- sets this.
+local exitStatus: number? = nil
+
 -- What a mutation DID is a diagnostic, not data. The POSIX equivalents are
 -- silent on success; this harness reports instead, because a transcript that
 -- never says what changed is unreadable. It reports on STDERR, though: riding on
@@ -447,6 +455,12 @@ local PARTIAL_TIME = "compares modification times, and this plugin only knows th
 	"has observed since it loaded — an unknown time would silently pick a side"
 
 local SPECS: { [string]: FlagSpec } = {
+	-- -F, -v and -f are POSIX awk's whole command line; the long spellings are gawk's.
+	awk = {
+		value = "Ffv",
+		long = { ["--field-separator"] = "value:-F", ["--file"] = "value:-f",
+			["--assign"] = "value:-v" },
+	},
 	basename = {
 		bool = "a", value = "s",
 		long = { ["--multiple"] = "bool:-a", ["--suffix"] = "value:-s" },
@@ -650,14 +664,15 @@ local SPECS: { [string]: FlagSpec } = {
 			["--regexp-extended"] = "bool:-E", ["--expression"] = "value:-e" },
 		why = { ["-z"] = NO_NUL },
 	},
-	-- -f is a printf format string, and there is no printf here to honour one.
-	-- Named rather than silently dropped, because the thing it is usually reached
-	-- for is zero-padding, which -w does.
+	-- -f is a printf format string, and seq does not take one. Named rather than
+	-- silently dropped, with the two spellings that do the same: -w for the
+	-- zero-padding -f is usually reached for, and printf, which reuses its
+	-- format across every value it is given.
 	seq = {
 		bool = "w", value = "s",
 		long = { ["--separator"] = "value:-s", ["--equal-width"] = "bool:-w" },
-		why = { ["-f"] = "is a printf format and there is no printf here; -w " ..
-			"zero-pads to equal width, which is what -f is usually asked for" },
+		why = { ["-f"] = "is not supported; -w zero-pads to equal width, and " ..
+			"`printf '%03g\\n' $(seq 1 10)` formats each value" },
 	},
 	sort = {
 		bool = "bcfnrRsuV", value = "kot",
@@ -3991,14 +4006,13 @@ HANDLERS.diff = function(self, argv)
 	return table.concat(out, "\n")
 end
 
--- cut: the field-splitting that had no spelling here at all.
+-- cut: fields split on one literal character.
 --
--- The gap it fills is narrow and real. `awk` is refused, and its stand-in was
--- "use sed -n for a line range" — which answers a different question: a range
--- picks ROWS, and every `awk '{print $2}'` anyone writes wants a COLUMN. There
--- was no way to take the second field of anything, so a model reaching for one
--- had to fall back to `run`, which executes arbitrary Luau to do what a filter
--- does.
+-- It came before awk did, when awk was refused and its stand-in was "use sed -n
+-- for a line range" — which answers a different question: a range picks ROWS,
+-- and every `awk '{print $2}'` anyone writes wants a COLUMN. awk is real now
+-- (text/Awk) and splits on whitespace runs; cut is the one where `a::b` has an
+-- empty second field.
 --
 -- LIST syntax is cut's own: `1`, `1,3`, `2-`, `-3`, `2-4`, in any combination,
 -- and the output is always in FILE order with duplicates collapsed, never in the
@@ -4129,6 +4143,57 @@ HANDLERS.cut = function(self, argv, stdin)
 		rendered[#rendered + 1] = part.body
 	end
 	return table.concat(rendered, "\n")
+end
+
+-- awk: the language is text/Awk's; this is the command line and the files.
+-- Operands go through as ARGV rather than being read up front, because awk
+-- decides what each one is when it reaches it: `x=1` is an assignment, `-` is
+-- stdin, and a BEGIN can rewrite the list before any of it is read.
+HANDLERS.awk = function(self, argv, stdin)
+	local _, values, operands = parse(argv)
+	local program
+	if values["-f"] then
+		local sources: { string } = {}
+		for _, path in ipairs(values["-f"]) do
+			local source, err = textInput(self, { path }, nil)
+			if not source then
+				return fail("awk", err)
+			end
+			sources[#sources + 1] = source
+		end
+		program = table.concat(sources, "\n")
+	else
+		program = table.remove(operands, 1)
+		if not program then
+			return fail("awk", "requires a program, e.g. awk '{print $1}' file, or -f script")
+		end
+	end
+	-- ENVIRON is the shell's exported variables; nothing else here is an environment.
+	local environ: { [string]: string } = {}
+	local state = self.shellState
+	if state then
+		for name in pairs(state.exported) do
+			environ[name] = state.vars[name]
+		end
+	end
+	local out, err, code = Awk.run({
+		program = program, fs = valueOf(values, "-F"), assigns = values["-v"],
+		operands = operands, stdin = stdin, environ = environ, breathe = Fs.breather(),
+		read = function(path: string): (string?, string?)
+			return textInput(self, { path }, nil)
+		end,
+		-- Through :write, so each file awk writes is one undo record and one diff.
+		write = function(path: string, text: string, append: boolean): string?
+			local existing = if append then self:resolve(path) else nil
+			local _, writeErr = self:write(path, (existing and getSource(existing) or "") .. text)
+			return writeErr
+		end,
+	})
+	if err ~= "" then
+		note((err:gsub("\n$", "")))
+	end
+	exitStatus = code
+	return out
 end
 
 HANDLERS.tr = function(self, argv, stdin)
@@ -5727,14 +5792,14 @@ Shell.COMMANDS = COMMANDS
 local STDIN_COMMANDS: { [string]: boolean } = {
 	cat = true, grep = true, egrep = true, fgrep = true,
 	head = true, tail = true, wc = true, sort = true, uniq = true,
-	sed = true, tr = true, cut = true,
+	sed = true, tr = true, cut = true, awk = true,
 }
 
 -- One command, already expanded. `stdin` is a heredoc body or the previous
 -- stage's output. Copied, so stripping `command` below leaves the caller's argv
 -- alone: the runtime reads argv[1] again after this returns.
 function runCommand(self: any, argv: { string }, stdin: string?): (string, boolean)
-	failed, unmatched, missText, trailer = false, false, false, nil
+	failed, unmatched, missText, trailer, exitStatus = false, false, false, nil, nil
 	local args = table.clone(argv)
 	if #args == 0 then
 		return "", true
@@ -5811,7 +5876,7 @@ function runtimeApi()
 		command = function(term, argv, stdin, stream)
 			local out, ok = runCommand(term, argv, stdin)
 			local erroring, isProse, notes = failed, missText, trailer
-			local code = ok and 0 or erroring and 2 or 1
+			local code = exitStatus or (ok and 0 or erroring and 2 or 1)
 			local function line(text) return text ~= "" and text:sub(-1) ~= "\n" and text .. "\n" or text end
 			if erroring then return { out = "", code = code, err = line(out) } end
 			if isProse then return { out = "", code = code, err = notes and line(notes) or "", prose = out } end
@@ -5828,7 +5893,9 @@ function runtimeApi()
 					if flags:find("n", 1, true) then newline = false end
 				end
 				if newline then out ..= "\n" end
-			elseif not rawOutput then out = line(out) end
+			-- awk's bytes are already its own: every print ends in ORS, and a last
+			-- `printf "x"` ends in nothing on purpose.
+			elseif not rawOutput and argv[1] ~= "awk" then out = line(out) end
 			return { out = out, code = code, err = notes and line(notes) or "",
 				preserveNewline = rawOutput and (stdin == nil or stream.preserveNewline == true) }
 		end,
@@ -5845,6 +5912,9 @@ end
 -- parsing, a glob stops anchoring, or a handler throws on a bare invocation.
 -- The API-dump half of this now lives in Props.selfTest.
 function Shell.selfTest(probe: any): (boolean, string?)
+	-- The awk language on its own, before the handler that feeds it files.
+	local awkOk, awkErr = Awk.selfTest()
+	if not awkOk then return false, "awk: " .. tostring(awkErr) end
 	local todoOk, todoErr = pcall(function()
 		return require(script.Parent:WaitForChild("ShellTests")).run(getmetatable(probe), Shell)
 	end)
@@ -6395,6 +6465,14 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		  want = "alpha\n[beta]\ngamma\ndelta\nepsilon", why = "sed & is the whole match" },
 		{ line = "sed 's/beta/[\\&]/' Sample.luau",
 		  want = "alpha\n[&]\ngamma\ndelta\nepsilon", why = "sed \\& is a literal ampersand" },
+		-- An empty match where a real one just ended is no match at all, and does
+		-- not count toward N in s///N. Each want is what GNU sed prints.
+		{ line = "echo abc | sed 's/b*/-/g'", want = "-a-c-",
+		  why = "s///g skips the empty match right after a real one" },
+		{ line = "echo abc | sed 's/x*/-/g'", want = "-a-b-c-", why = "s///g on an always-empty match" },
+		{ line = "echo abc | sed 's/b*/-/2'", want = "a-c", why = "s///N counts real matches" },
+		{ line = "echo bbb | sed 's/b*/-/2'", want = "bbb",
+		  why = "the empty match after a whole-line match is not a second one" },
 		-- BRE in sed too: bare + is text, \+ is the quantifier.
 		{ line = "sed 's/l\\+/L/' Sample.luau",
 		  want = "aLpha\nbeta\ngamma\ndeLta\nepsiLon", why = "sed is BRE by default" },
@@ -6538,7 +6616,30 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		{ line = "find . -name Sample.luau -exec wc -l {} \\; | wc -l", want = "1",
 		  why = "-exec output is ordinary stdout and pipes like any other" },
 
-		-- cut. Taking a COLUMN had no spelling here at all before: awk is refused
+		-- awk, through the handler: files, pipes, raw bytes, the status and the
+		-- two streams. The language itself is pinned in Awk.selfTest and against
+		-- gawk in tests/awk-cases.mjs.
+		{ line = "awk -F: '{print $2}' Columns.luau", want = "b\n\nh", why = "awk takes a field" },
+		{ line = "awk '{ s += $1 } END { print s }' Nums.luau", want = "42", why = "awk sums a column" },
+		{ line = "cat Nums.luau | awk '$1 > 5'", want = "10\n30", why = "awk reads a pipe" },
+		{ line = "awk 'NR==2, NR==3' Sample.luau", want = "beta\ngamma", why = "awk takes a range" },
+		{ line = "awk '!seen[$0]++' Dupes.luau | wc -l", want = "2", why = "awk dedups" },
+		{ line = "awk -v n=2 'NR <= n' Sample.luau", want = "alpha\nbeta", why = "-v assigns" },
+		{ line = "awk 'BEGIN { printf \"x\" }' | wc -c", want = "1",
+		  why = "awk's output is its own bytes; no newline is added" },
+		{ line = "awk 'BEGIN { exit 3 }'; echo $?", want = "3", why = "awk's exit status is its own" },
+		{ line = "awk 'BEGIN { print \"out\"; print \"err\" > \"/dev/stderr\" }' 2>/dev/null",
+		  want = "out", why = "/dev/stderr is stderr" },
+		{ line = "awk '{ print } END { print 1/z }' Nums.luau 2>/dev/null; echo $?",
+		  want = "10\n2\n30\n2", why = "a runtime error keeps the output printed before it" },
+		{ line = "X=exported; export X; awk 'BEGIN { print ENVIRON[\"X\"] }'", want = "exported",
+		  why = "ENVIRON is the exported shell variables" },
+		{ line = "awk '{ print $1 > \"AwkOut.txt\" }' Nums.luau; sed -n p AwkOut.txt", want = "10\n2\n30",
+		  why = "print > file writes a script" },
+		{ line = "awk 'BEGIN { while ((getline l < \"Sample.luau\") > 0) n++; print n }'", want = "5",
+		  why = "getline reads a script" },
+
+		-- cut. Taking a COLUMN had no spelling here at all before awk was real,
 		-- and its stand-in was `sed -n`, which picks rows, not fields.
 		{ line = "cut -d: -f2 Columns.luau", want = "b\n\nh", why = "cut takes a field" },
 		{ line = "cut -d: -f1,3 Columns.luau", want = "a:c\nd:f\ng:i",
@@ -6767,6 +6868,11 @@ function Shell.selfTest(probe: any): (boolean, string?)
 			-- The case-sensitivity change has exactly one regression shape: a
 			-- search that used to work now finds nothing. It has to say so.
 			{ line = "grep HUMANOID Cased.luau", want = "grep %-i" },
+			-- awk refuses the three things that run a shell command, and says how
+			-- to write each with a pipe instead.
+			{ line = "awk '{ print | \"sort\" }' Nums.luau", want = "pipe awk's own output" },
+			{ line = "awk 'BEGIN { system(\"ls\") }'", want = "system%(%) runs a shell command" },
+			{ line = "awk '{ print'", want = "syntax error" },
 		}) do
 			local got = Shell.run(probe, case.line)
 			if not got:match(case.want) then
