@@ -179,12 +179,20 @@ handlers["/model"] = function(arg)
 		end
 		return
 	end
+	-- An exact id wins over an earlier one that merely contains it, or
+	-- `claude-opus-5` would select `claude-opus-5-5` listed above it.
+	local match
 	for _, entry in ipairs(Provider.wire.MODELS) do
-		if entry.id == arg or entry.id:find(arg, 1, true) then
-			Settings.setModel(entry.id)
-			Console.appendLine("Model: " .. entry.id, "info")
-			return
+		if entry.id == arg then
+			match = entry
+			break
 		end
+		if not match and entry.id:find(arg, 1, true) then match = entry end
+	end
+	if match then
+		Settings.setModel(match.id)
+		Console.appendLine("Model: " .. match.id, "info")
+		return
 	end
 	-- An id the list has never heard of, so a model released after this build
 	-- is still reachable by name. The provider decides what one of its ids looks
@@ -328,6 +336,57 @@ handlers["/settings"] = function()
 	if openSettings then openSettings(true) end
 end
 
+-- Images for the next message. A file picker because a plugin gets neither
+-- clipboard images nor drag and drop. They wait for the text rather than going
+-- now: a picture on its own asks nothing.
+local IMAGE_TYPES: { [string]: string } = {
+	gif = "image/gif", jpeg = "image/jpeg", jpg = "image/jpeg",
+	png = "image/png", webp = "image/webp",
+}
+-- Anthropic takes 10 MB of base64 per image, and base64 is 4/3 of the file.
+local MAX_IMAGE_BYTES = 7000000
+
+handlers["/attach"] = function()
+	if not Provider.wire.acceptsImages then
+		Console.appendLine(Provider.label() .. " can't take images", "error")
+		return
+	end
+	local filter: { string } = {}
+	for ext in pairs(IMAGE_TYPES) do filter[#filter + 1] = ext end
+	table.sort(filter)
+	local ok, files = pcall(function()
+		return game:GetService("StudioService"):PromptImportFilesAsync(filter)
+	end)
+	if not ok then
+		Console.appendLine("attach: " .. tostring(files), "error")
+		return
+	end
+	-- nil is the picker's own answer when any one file is over its 100 MB cap.
+	if files == nil then
+		Console.appendLine("attach: a file was over 100 MB", "error")
+		return
+	end
+	for _, file in ipairs(files) do
+		local ext = (file.Name:match("%.(%w+)$") or ""):lower()
+		local mediaType = IMAGE_TYPES[ext]
+		if not mediaType then
+			Console.appendLine("attach: " .. file.Name .. " is not a png, jpg, gif or webp", "error")
+		elseif file.Size > MAX_IMAGE_BYTES then
+			Console.appendLine(string.format("attach: %s is %.1f MB, the limit is %.0f MB",
+				file.Name, file.Size / 1e6, MAX_IMAGE_BYTES / 1e6), "error")
+		else
+			local data = buffer.tostring(game:GetService("EncodingService"):Base64Encode(
+				buffer.fromstring(file:GetBinaryContents())))
+			local waiting = Agent.attach({
+				type = "image",
+				source = { type = "base64", media_type = mediaType, data = data },
+			})
+			Console.appendLine(string.format("attached %s (%d waiting for your next message)",
+				file.Name, waiting), "info")
+		end
+	end
+end
+
 -- The find panel has a button and Shift+Esc; this is the third way in, and the
 -- only one that carries the query with it. Studio hands a plugin widget no key
 -- events at all while one of its text boxes is taking them, so a command typed
@@ -349,6 +408,7 @@ Commands.SLASH_COMMANDS = {
 	{ cmd = "/selftest", desc = "Run every module's self-test (redraws the console)" },
 	{ cmd = "/sh",       desc = "Run a terminal command, or bare to stay in the shell" },
 	{ cmd = "/find",     desc = "Search this chat, thinking included" },
+	{ cmd = "/attach",   desc = "Pick images to send with your next message" },
 	{ cmd = "/clear",    desc = "Clear output + conversation" },
 	{ cmd = "/help",     desc = "Show all commands" },
 }

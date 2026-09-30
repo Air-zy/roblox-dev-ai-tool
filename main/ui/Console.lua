@@ -1534,8 +1534,10 @@ end
 -- conversation rather than into a bubble it holds for the length of a turn.
 
 -- What the reader actually typed, out of either message shape. A user message is
--- a plain string until a cache breakpoint rewrites it into text blocks, and a
--- user message that is only a tool_result batch carries nothing they wrote.
+-- a plain string unless it carries an /attach image (or was saved by an old build
+-- that rewrote it into text blocks), and a user message that is only a
+-- tool_result batch carries nothing they wrote. An image shows as "[image]", the
+-- same text Sessions saves in its place, so live and restored views match.
 -- Lives here rather than in Sessions because it is what a stored message LOOKS
 -- like, which is the renderer's business; Sessions keeps using it for titles.
 function Console.userText(message: any): string?
@@ -1548,6 +1550,8 @@ function Console.userText(message: any): string?
 	for _, block in ipairs(content) do
 		if type(block) == "table" and block.type == "text" and type(block.text) == "string" then
 			table.insert(parts, block.text)
+		elseif type(block) == "table" and block.type == "image" then
+			table.insert(parts, "[image]")
 		end
 	end
 	return #parts > 0 and table.concat(parts, "\n") or nil

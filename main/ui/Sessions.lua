@@ -487,10 +487,37 @@ local function stubOldResults(conversation: { any }, keep: number): { any }
 	return out
 end
 
+-- Returns a COPY with every image replaced by the "[image]" Console shows for it.
+-- Each image is megabytes of base64: in the archive it would sit in the place
+-- file, and in the mirror it is exactly the settings-file bloat MIRROR_BYTES
+-- exists to stop, out of stubOldResults' reach because it rides in a user
+-- message. A restored session goes on without the picture; the model is told
+-- one was there.
+local function withoutImages(conversation: { any }): { any }
+	local out = table.clone(conversation)
+	for i, message in ipairs(conversation) do
+		if type(message.content) == "table" then
+			local content: { any }? = nil
+			for j, block in ipairs(message.content) do
+				if type(block) == "table" and block.type == "image" then
+					content = content or table.clone(message.content)
+					;(content :: { any })[j] = { type = "text", text = "[image]" }
+				end
+			end
+			if content then
+				local copy = table.clone(message)
+				copy.content = content
+				out[i] = copy
+			end
+		end
+	end
+	return out
+end
+
 -- Called on every busy -> idle transition, so a crash costs at most the turn that
 -- was in flight.
 function Sessions.save()
-	local conversation = Agent.conversation()
+	local conversation = withoutImages(Agent.conversation())
 	if #conversation == 0 then return end
 
 	local ok, json = pcall(function() return HttpService:JSONEncode(conversation) end)
@@ -1315,6 +1342,19 @@ end
 -- a stub that drops a tool_result breaks the tool_use pairing, and an empty
 -- tool_use input re-encodes as `[]` and is rejected outright.
 function Sessions.selfTest(): (boolean, string?)
+	-- An image must never reach storage, and stripping it must not touch the live
+	-- conversation, which is what the next request is built from.
+	local image = { type = "image", source = { type = "base64", media_type = "image/png", data = "AAAA" } }
+	local live = { { role = "user", content = { image, { type = "text", text = "look" } } } }
+	local saved = withoutImages(live)
+	if saved[1].content[1].type ~= "text" or saved[1].content[1].text ~= "[image]"
+		or saved[1].content[2].text ~= "look" then
+		return false, "an attached image would be saved into the session"
+	end
+	if live[1].content[1] ~= image then
+		return false, "withoutImages stripped the live conversation"
+	end
+
 	local big = string.rep("x", 5000)
 	local conversation: { any } = {}
 	for i = 1, 8 do

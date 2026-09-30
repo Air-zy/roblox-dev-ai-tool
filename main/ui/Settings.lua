@@ -8,7 +8,7 @@
 -- OpenRouter and OpenAI take reasoning.effort — and carries the same five
 -- levels either way. It governs
 -- total token spend for the whole response: prose, tool calls, and thinking
--- alike. "high" is the API default.
+-- alike. "high" is the default on most models; Opus 5.5 defaults to "medium".
 --
 -- The level is stored globally and always kept, the way /effort does it in
 -- Claude Code, which never asks whether the model supports the parameter. The
@@ -51,7 +51,7 @@ Settings.DEFAULT_SYSTEM = DEFAULT_SYSTEM
 local EFFORT_LEVELS: { { name: string, api: string, hint: string } } = {
 	{ name = "Low",    api = "low",    hint = "fastest, cheapest" },
 	{ name = "Medium", api = "medium", hint = "balanced" },
-	{ name = "High",   api = "high",   hint = "API default" },
+	{ name = "High",   api = "high",   hint = "most models' default" },
 	{ name = "Xhigh",  api = "xhigh",  hint = "long agentic work" },
 	{ name = "Max",    api = "max",    hint = "no token constraints" },
 }
@@ -62,7 +62,7 @@ local state = {
 	-- Resolved in Initialize, not here: main.luau requires this module before it
 	-- calls Provider.Initialize, so there is no wire to ask yet.
 	model = "",
-	effort = 3,  -- High, matching the API default
+	effort = 3,  -- High, the default on most models
 	system = DEFAULT_SYSTEM,
 	-- Off by default and deliberately not remembered as "on" by accident:
 	-- `run` executes arbitrary Luau at plugin permission level.

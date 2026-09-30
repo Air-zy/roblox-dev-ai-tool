@@ -29,21 +29,128 @@ local Auth: any = nil
 -- api.openai.com: that is separately billed Platform API usage.
 local RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 
--- Curated rather than fetched. GET /models only returns identifiers and owners,
--- not whether an id supports Responses, function calling, reasoning, or web
--- search, so turning it directly into a picker would offer unusable audio,
--- image and embedding models. `/model <id>` still allows another compatible id.
--- Context is this endpoint's ceiling, max_context_window in Codex's own
--- codex-rs/models-manager/models.json, not the Platform API's 1.05M.
+-- Fetched from the endpoint Codex's own picker reads, not the Platform API's
+-- GET /models, which returns ids and owners only and would offer audio, image
+-- and embedding models. This one returns the account's coding models with
+-- Codex's picker rules attached. The list below is the first-run fallback.
+-- Context is this endpoint's ceiling, max_context_window, not the Platform
+-- API's 1.05M. `/model <id>` still allows another compatible id.
+--
+-- ponytail: client_version is pinned to a real Codex release. Every model
+-- carries a minimal_client_version, and a server that filters on it would hide
+-- newer ones from an old pin. Bump it when a model Codex lists is missing here.
+local MODELS_URL = "https://chatgpt.com/backend-api/codex/models?client_version=0.159.2"
+local KEY_MODEL_CACHE = "openai_models"
+local KEY_MODEL_CACHE_AT = "openai_models_at"
+local MODEL_CACHE_MAX_AGE = 24 * 3600
+local plugin: any = nil  -- set via Initialize, for the roster cache
+local refreshModels: () -> (boolean, string?)
+
 OpenAI.MODELS = {
-	{ id = "gpt-6-astra", label = "GPT-6 Astra", name = "GPT-6 Astra", hint = "most capable · 872K", context = 872000 },
-	{ id = "gpt-6-sol", label = "GPT-6 Sol", name = "GPT-6 Sol", hint = "workhorse · 872K", context = 872000 },
-	{ id = "gpt-6-luna", label = "GPT-6 Luna", name = "GPT-6 Luna", hint = "fast, affordable · 872K", context = 872000 },
+	{ id = "gpt-6-astra", label = "GPT-6 Astra", name = "6 Astra", hint = "most capable · 872K", context = 872000 },
+	{ id = "gpt-6.1-sol", label = "GPT-6.1 Sol", name = "6.1 Sol", hint = "workhorse · 872K", context = 872000 },
+	{ id = "gpt-6-luna", label = "GPT-6 Luna", name = "6 Luna", hint = "fast, affordable · 872K", context = 872000 },
 }
 OpenAI.DEFAULT_MODEL = "gpt-6-astra"
+-- Image blocks in a user message are translated (toResponseInput); /attach checks this.
+OpenAI.acceptsImages = true
 
-local function Initialize(authModule: any)
+-- "GPT-6.1-Sol" -> "6.1 Sol", for the chip. Every model here is a GPT, so the
+-- word is padding, the way Gemini drops "Gemini" and Anthropic drops "Claude".
+local function shortName(display: string): string
+	local trimmed = display:gsub("^[Gg][Pp][Tt]%-", ""):gsub("%-", " ")
+	return if trimmed ~= "" then trimmed else display
+end
+
+local function Initialize(authModule: any, pluginRef: any)
 	Auth = authModule
+	plugin = pluginRef
+	if not plugin then return end
+	local cached = plugin:GetSetting(KEY_MODEL_CACHE)
+	if type(cached) == "string" and cached ~= "" then
+		local ok, decoded = pcall(function() return HttpService:JSONDecode(cached) end)
+		if ok and type(decoded) == "table" and #decoded > 0 then
+			OpenAI.MODELS = decoded
+		end
+	end
+	local at = plugin:GetSetting(KEY_MODEL_CACHE_AT)
+	if type(at) ~= "number" or os.time() - at > MODEL_CACHE_MAX_AGE then
+		task.spawn(refreshModels)
+	end
+end
+
+local function contextHint(limit: number): string
+	if limit >= 1000000 then
+		return string.format("%gM", limit / 1000000)
+	end
+	return string.format("%dk", math.floor(limit / 1000))
+end
+
+-- Codex's own picker rule: visibility "list" only, in priority order. The
+-- hidden entries are real models, review and trial ones, not for choosing.
+local function rosterRows(models: { any }): { any }
+	local rows: { any } = {}
+	for _, m in ipairs(models) do
+		if type(m) == "table" and type(m.slug) == "string" and m.visibility == "list" then
+			local context = tonumber(m.max_context_window) or tonumber(m.context_window)
+			local display = if type(m.display_name) == "string" then m.display_name else m.slug
+			rows[#rows + 1] = {
+				id = m.slug,
+				label = display,
+				name = shortName(display),
+				hint = if context then contextHint(context) else nil,
+				context = context,
+				priority = tonumber(m.priority) or 1e9,  -- not math.huge: rows are JSON-cached
+			}
+		end
+	end
+	table.sort(rows, function(a, b) return a.priority < b.priority end)
+	return rows
+end
+
+-- Yields; call it from a task.spawn.
+function refreshModels(): (boolean, string?)
+	if not Auth then return false, "not initialized" end
+	local token = Auth.getAccessToken()
+	local accountId = Auth.getAccountId()
+	if not token or not accountId then return false, "not logged in" end
+	local headers = {
+		["Authorization"] = "Bearer " .. token,
+		["ChatGPT-Account-ID"] = accountId,
+		["accept"] = "application/json",
+	}
+	if Auth.isFedramp() then headers["X-OpenAI-Fedramp"] = "true" end
+
+	local ok, response = pcall(function()
+		return HttpService:RequestAsync({ Url = MODELS_URL, Method = "GET", Headers = headers })
+	end)
+	if not ok then
+		return false, "model list request failed: " .. tostring(response)
+	end
+	local res = response :: any
+	if res.StatusCode ~= 200 then
+		return false, string.format("model list: HTTP %d", res.StatusCode)
+	end
+	local parsed
+	if not pcall(function() parsed = HttpService:JSONDecode(res.Body) end) then
+		return false, "model list: response was not JSON"
+	end
+	local models = (parsed :: any).models
+	local rows = if type(models) == "table" then rosterRows(models) else {}
+	if #rows == 0 then
+		-- Never replace a working list with an empty one.
+		return false, "model list: nothing to pick"
+	end
+	OpenAI.MODELS = rows
+	if plugin then
+		-- The rows, not the response: each entry carries its whole prompt and
+		-- the full list runs to hundreds of kilobytes.
+		pcall(function()
+			plugin:SetSetting(KEY_MODEL_CACHE, HttpService:JSONEncode(rows))
+			plugin:SetSetting(KEY_MODEL_CACHE_AT, os.time())
+		end)
+	end
+	return true
 end
 
 local function acceptsModelId(id: string): boolean
@@ -118,9 +225,24 @@ local function toResponseInput(messages: { any }, model: string?): { any }
 			out[#out + 1] = { role = message.role, content = content }
 		elseif type(content) == "table" and message.role == "user" then
 			local textParts: { string } = {}
+			-- An attached image makes the message a parts list, images first as
+			-- they are in the history; without one it stays the plain string.
+			local images: { any } = {}
+			local function flush()
+				if #images == 0 then
+					appendMessage("user", textParts)
+					return
+				end
+				if #textParts > 0 then
+					images[#images + 1] = { type = "input_text", text = table.concat(textParts, "\n") }
+					table.clear(textParts)
+				end
+				out[#out + 1] = { role = "user", content = images }
+				images = {}
+			end
 			for _, block in ipairs(content) do
 				if block.type == "tool_result" then
-					appendMessage("user", textParts)
+					flush()
 					out[#out + 1] = {
 						type = "function_call_output",
 						call_id = block.tool_use_id,
@@ -128,9 +250,16 @@ local function toResponseInput(messages: { any }, model: string?): { any }
 					}
 				elseif block.type == "text" and type(block.text) == "string" then
 					textParts[#textParts + 1] = block.text
+				elseif block.type == "image" and type(block.source) == "table"
+					and block.source.type == "base64" then
+					images[#images + 1] = {
+						type = "input_image",
+						image_url = "data:" .. tostring(block.source.media_type)
+							.. ";base64," .. tostring(block.source.data),
+					}
 				end
 			end
-			appendMessage("user", textParts)
+			flush()
 		elseif type(content) == "table" then
 			-- OpenAI pairs a reasoning item with the output item that followed it.
 			-- Replaying only the encrypted reasoning shell and rebuilding that next
@@ -889,10 +1018,33 @@ local function selfTest(): (boolean, string?)
 		or RESPONSES_URL:find("api.openai.com", 1, true) then
 		return false, "OpenAI provider is not pinned to the subscription-backed Codex endpoint"
 	end
+	local rows = rosterRows({
+		{ slug = "gpt-b", display_name = "B", visibility = "list", priority = 2, max_context_window = 872000 },
+		{ slug = "gpt-hidden", display_name = "H", visibility = "hide", priority = 0 },
+		{ slug = "gpt-a", display_name = "GPT-6.1-Sol", visibility = "list", priority = 1, context_window = 272000 },
+	})
+	if #rows ~= 2 or rows[1].id ~= "gpt-a" or rows[2].id ~= "gpt-b"
+		or rows[1].context ~= 272000 or rows[2].context ~= 872000 then
+		return false, "Codex roster was not filtered to picker models in priority order"
+	end
+	if rows[1].name ~= "6.1 Sol" or rows[1].label ~= "GPT-6.1-Sol" then
+		return false, "the GPT prefix was not trimmed from the chip name, or was trimmed from the label"
+	end
+	local pictured = toResponseInput({ { role = "user", content = {
+		{ type = "image", source = { type = "base64", media_type = "image/png", data = "AAAA" } },
+		{ type = "text", text = "look" },
+	} } }, "gpt-6-astra")
+	local parts = pictured[1] and pictured[1].content
+	if type(parts) ~= "table" or #parts ~= 2
+		or parts[1].type ~= "input_image" or parts[1].image_url ~= "data:image/png;base64,AAAA"
+		or parts[2].type ~= "input_text" or parts[2].text ~= "look" then
+		return false, "an attached image did not reach Responses as input_image before the text"
+	end
 	return true
 end
 
 OpenAI.Initialize = Initialize
+OpenAI.refreshModels = refreshModels
 OpenAI.streamMessage = streamMessage
 OpenAI.acceptsModelId = acceptsModelId
 OpenAI.selfTest = selfTest

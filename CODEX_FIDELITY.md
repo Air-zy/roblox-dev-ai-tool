@@ -291,11 +291,14 @@ silently ignoring a future model migration signal is meaningful. **[gap]**
 
 ### Models
 
-The picker is curated in `OpenAI.MODELS`; `/model <id>` accepts additional
-Responses-compatible OpenAI ids by pattern. Upstream has a models manager,
-cached metadata, and can react to the `x-models-etag` signal. Static context
-windows, supported features, defaults, and display names can therefore drift in
-this plugin. **[gap]**
+The picker is fetched from `codex/models?client_version=…`, the endpoint
+upstream's models manager reads, filtered by upstream's own picker rule
+(`visibility == "list"`, sorted by `priority`) and cached in plugin settings for
+a day; the curated `OpenAI.MODELS` is the offline fallback. `/model <id>`
+accepts additional Responses-compatible OpenAI ids by pattern. Upstream also
+refreshes on the `x-models-etag` signal and pins `client_version` to its own
+build; this plugin does neither, so a new model can take up to a day to appear,
+and the pinned version has to be bumped by hand. **[partial]**
 
 Do not replace the picker with an unfiltered public model list. Availability
 alone does not establish Responses, Codex entitlement, tool, reasoning, or web
@@ -380,12 +383,12 @@ subscription capacity consumed reprocessing the same prefix.
 
 ### 11.2 Use Codex model metadata and ETag refresh
 
-The static roster will age. Implement the applicable model-metadata request,
-cache it in plugin settings with an ETag, validate capabilities before showing a
-model, and keep the curated list as an offline fallback.
+The metadata request and the day-long cache are in (`OpenAI.refreshModels`).
+Left: refresh on `x-models-etag` instead of the clock, and use the per-model
+`supported_reasoning_levels` to clamp effort.
 
-**Cost today:** stale availability/context/features, with failures appearing only
-after selection.
+**Cost today:** a new model can take a day to show, and `max` effort on a model
+that tops out at `xhigh` (e.g. `gpt-5.5`) is sent as-is rather than clamped.
 
 ### 11.3 Make `parallel_tool_calls` honest
 

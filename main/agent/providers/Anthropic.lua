@@ -12,8 +12,9 @@
 -- real filesystem, so Settings.system() has to say there is no disk here.
 --
 -- Public API:
---   Initialize(auth)
+--   Initialize(auth, plugin)
 --   streamMessage({ model, system, messages, maxTokens, tools, webSearch }, callbacks) -> handle
+--   refreshModels()
 --   acceptsModelId(id)
 --   MODELS, DEFAULT_MODEL
 --
@@ -53,14 +54,21 @@ local ANTHROPIC_VERSION = "2023-06-01"
 local ANTHROPIC_BETA = "claude-code-20250219,oauth-2025-04-20"
 
 -- The identity block Anthropic checks for. Must be the FIRST system block.
+-- Still enforced: sent as "" on 2026-09-30, every request came back 429
+-- rate_limit_error, which the retry loop then spent four attempts on. Claude
+-- Code's source (system.ts) lists two other accepted prefixes; the Agent SDK
+-- one is untested here and may bill a different usage window.
 local CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
 
 -- Per-model thinking + effort support.
 --   thinking = "adaptive": thinking:{type:"adaptive"}; the model decides when and
 --     how deeply to think, steered by effort. thinking:{type:"enabled"} with
 --     budget_tokens returns a 400 on these models.
---   thinking = "budget": legacy extended thinking. budget_tokens is the only
---     control; output_config.effort is NOT supported and must be omitted.
+--   thinking = "budget": legacy extended thinking, sized by budget_tokens.
+--   thinking = "none": no thinking parameter at all, for a listed model that
+--     reports neither.
+-- `effort` is separate because it is: Opus 4.5 takes both, Haiku 4.5 only the
+-- budget, and output_config.effort on a model without it is a 400.
 -- Unknown models default to adaptive, matching every current Claude release.
 --
 -- maxOutput is the documented per-model output ceiling. A ceiling is not a
@@ -80,32 +88,28 @@ local CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for 
 -- maxOutput's — over-reporting how full the window is costs nothing, while
 -- under-reporting it hides the one thing the row exists to warn about.
 --
--- ponytail: hand-written, and it goes stale the day a model ships — the numbers
--- here were copied from Claude Code's own table and were already wrong for two
--- of these three. Claude Code keeps the same table but treats it as a fallback
--- under GET /v1/models, which reports max_tokens AND max_input_tokens per model
--- and is the upgrade path if this is ever wrong again. Five models and a 400
--- that says so is not yet worth a fetch and a cache.
---
--- `bound` marks models whose thinking blocks are tied to the exact prefix they
--- were produced under ("preserved thinking"). Microcompact rewrites old
--- tool_result content in place, and a system prompt or tool toggle mid-session
--- is an edit too; on accounts created from 2026-08-31 a replayed block after any
--- of those is a 400. drop_block makes the server drop the stale blocks instead.
--- https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
+-- This table is the fallback, not the source. refreshModels below replaces it
+-- with what GET /v1/models reports per model, max_tokens, max_input_tokens and
+-- the capability tree, so a model that ships after this build is shaped right
+-- without an edit here. The table still decides a first run, an offline one,
+-- and every turn if the list endpoint ever refuses the token.
 local MODEL_CAPS: { [string]: { thinking: string, effort: boolean, maxOutput: number,
-	context: number, bound: boolean? } } = {
-	["claude-opus-5-5"]           = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000, bound = true },
-	["claude-fable-5-1"]          = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000, bound = true },
+	context: number } } = {
+	["claude-opus-5-5"]           = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
+	["claude-fable-5-1"]          = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
+	["claude-sonnet-5-5"]         = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
 	["claude-opus-5"]             = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
 	["claude-sonnet-5"]           = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
 	["claude-haiku-4-5"]          = { thinking = "budget",   effort = false, maxOutput = 64000,  context = 200000 },
 }
 local DEFAULT_CAPS = { thinking = "adaptive", effort = true, maxOutput = 64000, context = 200000 }
 
+-- The fetched roster's caps by id, filled by adopt() further down.
+local fetched: { [string]: any } = {}
+
 local function capsFor(model: string): { thinking: string, effort: boolean, maxOutput: number,
-	context: number, bound: boolean? }
-	return MODEL_CAPS[model] or DEFAULT_CAPS
+	context: number }
+	return fetched[model] or MODEL_CAPS[model] or DEFAULT_CAPS
 end
 
 -- The input window for a model id, for the settings panel's context row. Exported
@@ -152,7 +156,7 @@ end
 local MODELS = {
 	{ id = "claude-opus-5-5",  label = "Claude Opus 5.5 (recommended)", name = "Opus 5.5",  hint = "recommended" },
 	{ id = "claude-fable-5-1", label = "Claude Fable 5.1 (most capable)", name = "Fable 5.1", hint = "most capable" },
-	{ id = "claude-sonnet-5",  label = "Claude Sonnet 5 (balanced)",    name = "Sonnet 5",  hint = "balanced" },
+	{ id = "claude-sonnet-5-5", label = "Claude Sonnet 5.5 (balanced)", name = "Sonnet 5.5", hint = "balanced" },
 	{ id = "claude-haiku-4-5", label = "Claude Haiku 4.5 (fastest)",    name = "Haiku 4.5", hint = "fastest" },
 }
 local DEFAULT_MODEL = "claude-opus-5-5"
@@ -180,8 +184,140 @@ local function webSearchTool(maxUses: number): any
 	}
 end
 
-local function Initialize(oauthModule: any)
+-- The live roster: every model the account can reach. Same endpoint and OAuth
+-- beta as Claude Code's capability cache (modelCapabilities.ts), which only
+-- runs for Anthropic staff, so a subscriber token being accepted here is
+-- untested; a refusal just leaves MODELS and MODEL_CAPS above in charge.
+-- Cached for a day like the other fetched rosters.
+local MODELS_URL = "https://api.anthropic.com/v1/models?limit=1000"
+local KEY_MODEL_CACHE = "anthropic_models"
+local KEY_MODEL_CACHE_AT = "anthropic_models_at"
+local MODEL_CACHE_MAX_AGE = 24 * 3600
+local plugin: any = nil  -- set via Initialize, for the roster cache
+
+local function contextHint(limit: number): string
+	if limit >= 1000000 then
+		return string.format("%gM", limit / 1000000)
+	end
+	return string.format("%dk", math.floor(limit / 1000))
+end
+
+local function supported(node: any): boolean
+	return type(node) == "table" and node.supported == true
+end
+
+-- One /v1/models entry as a picker row that carries its own caps. Nil when
+-- neither the entry nor MODEL_CAPS says how to ask the model to think: a guess
+-- of adaptive for a model that only takes budget_tokens is a 400 on every turn,
+-- so such a model stays reachable by `/model` but off the list.
+-- ponytail: effort is on/off per model, not per level. A legacy model without
+-- xhigh or max is a 400 at those two; clamp from capabilities.effort if it bites.
+local function rosterEntry(entry: any): any?
+	if type(entry) ~= "table" or type(entry.id) ~= "string" then return nil end
+	local known = MODEL_CAPS[entry.id]
+	local caps = entry.capabilities
+	local thinking, effort
+	if type(caps) == "table" then
+		local types = type(caps.thinking) == "table" and caps.thinking.types or nil
+		thinking = if types and supported(types.adaptive) then "adaptive"
+			elseif types and supported(types.enabled) then "budget"
+			else "none"
+		effort = supported(caps.effort)
+	elseif known then
+		thinking, effort = known.thinking, known.effort
+	else
+		return nil
+	end
+	local context = tonumber(entry.max_input_tokens) or (known and known.context) or DEFAULT_CAPS.context
+	local display = if type(entry.display_name) == "string" then entry.display_name else entry.id
+	return {
+		id = entry.id,
+		label = display,
+		name = (display:gsub("^Claude%s+", "")),
+		hint = contextHint(context),
+		context = context,
+		maxOutput = tonumber(entry.max_tokens) or (known and known.maxOutput) or DEFAULT_CAPS.maxOutput,
+		thinking = thinking,
+		effort = effort,
+	}
+end
+
+-- The one place a roster becomes MODELS, from the fetch and from the cache
+-- alike, so a cache written by an older build is read by this one's rules. In
+-- place, because MODELS is exported by reference. Never empties a working list.
+local function adopt(entries: { any }): boolean
+	local rows: { any } = {}
+	for _, entry in ipairs(entries) do
+		local row = rosterEntry(entry)
+		if row then rows[#rows + 1] = row end
+	end
+	if #rows == 0 then return false end
+	table.clear(MODELS)
+	table.clear(fetched)
+	for _, row in ipairs(rows) do
+		MODELS[#MODELS + 1] = row
+		fetched[row.id] = row
+	end
+	return true
+end
+
+-- Yields; call it from a task.spawn.
+local function refreshModels(): (boolean, string?)
+	if not OAuth then return false, "not initialized" end
+	local token = OAuth.getAccessToken()
+	if not token then return false, "not logged in" end
+
+	local ok, response = pcall(function()
+		return HttpService:RequestAsync({
+			Url = MODELS_URL,
+			Method = "GET",
+			Headers = {
+				["Authorization"] = "Bearer " .. token,
+				["anthropic-version"] = ANTHROPIC_VERSION,
+				["anthropic-beta"] = ANTHROPIC_BETA,
+				["x-app"] = "cli",
+				["accept"] = "application/json",
+			},
+		})
+	end)
+	if not ok then
+		return false, "model list request failed: " .. tostring(response)
+	end
+	local res = response :: any
+	if res.StatusCode ~= 200 then
+		return false, string.format("model list: HTTP %d", res.StatusCode)
+	end
+	local parsed
+	if not pcall(function() parsed = HttpService:JSONDecode(res.Body) end) then
+		return false, "model list: response was not JSON"
+	end
+	local data = (parsed :: any).data
+	if type(data) ~= "table" or not adopt(data) then
+		return false, "model list: nothing usable"
+	end
+	if plugin then
+		-- The raw entries, not the rows, so the next build re-derives the caps.
+		pcall(function()
+			plugin:SetSetting(KEY_MODEL_CACHE, HttpService:JSONEncode(data))
+			plugin:SetSetting(KEY_MODEL_CACHE_AT, os.time())
+		end)
+	end
+	return true
+end
+
+local function Initialize(oauthModule: any, pluginRef: any)
 	OAuth = oauthModule
+	plugin = pluginRef
+	if not plugin then return end
+	local cached = plugin:GetSetting(KEY_MODEL_CACHE)
+	if type(cached) == "string" and cached ~= "" then
+		local ok, decoded = pcall(function() return HttpService:JSONDecode(cached) end)
+		if ok and type(decoded) == "table" then adopt(decoded) end
+	end
+	local at = plugin:GetSetting(KEY_MODEL_CACHE_AT)
+	if type(at) ~= "number" or os.time() - at > MODEL_CACHE_MAX_AGE then
+		task.spawn(refreshModels)
+	end
 end
 
 -- Builds the thinking/effort part of the body.
@@ -189,90 +325,41 @@ local function applyReasoning(bodyTable: { [string]: any }, model: string, effor
 	local caps = capsFor(model)
 
 	if caps.effort and effort and effort ~= "" then
-		-- Request-level, no beta header on current models. "high" is the API
-		-- default, so passing it is the same as omitting it.
+		-- Request-level, no beta header on current models. Always sent, never
+		-- left to the default: that is "high" on most models but "medium" on
+		-- Opus 5.5, so omitting it would quietly change what the setting means.
 		bodyTable.output_config = { effort = effort }
 	end
 
 	if caps.thinking == "adaptive" then
-		-- "summarized" is the documented default, and Claude Code omits the field
-		-- entirely, so this is explicit rather than load-bearing. It is spelled
-		-- out because the drawer once opened on blocks whose thinking field was
-		-- empty, which "omitted" would explain — but that was a guess, and the
-		-- API reference contradicts it. The real cause was never found. If empty
-		-- thinking blocks come back, this line is not what fixed it.
+		-- Load-bearing. Since Opus 4.7 the default is "omitted", which streams
+		-- thinking blocks with an empty thinking field, and that is every model
+		-- listed here: it is why the drawer once opened on empty blocks. On the
+		-- 5.5 models "summarized" also carries the progress notes the model
+		-- writes between tool calls, which come back as thinking blocks there.
 		bodyTable.thinking = { type = "adaptive", display = "summarized" }
-		if caps.bound then
-			bodyTable.thinking.block_binding = { prefix_mismatch_behavior = "drop_block" }
-		end
+		-- Preserved thinking ties a block to the exact prefix it was produced
+		-- under. Microcompact rewrites old tool_result content in place, and a
+		-- system prompt or tool toggle mid-session is an edit too; on accounts
+		-- created from 2026-08-31 a replayed block after any of those is a 400.
+		-- drop_block makes the server drop the stale blocks instead. Sent on every
+		-- adaptive model rather than a hand-kept list of the bound ones: the object
+		-- is accepted on every model that accepts `thinking`, and a list is what a
+		-- newly fetched model would be missing from.
+		-- https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
+		bodyTable.thinking.block_binding = { prefix_mismatch_behavior = "drop_block" }
 	elseif caps.thinking == "budget" then
 		-- Thinking tokens come out of max_tokens, and the API requires the budget
 		-- to be strictly under it. There is nothing to tune: a budget is a
 		-- ceiling on thinking, not a quota that gets spent, so handing over
 		-- everything but one token costs nothing on a turn that thinks briefly
-		-- and never truncates one that does not. Effort does not enter into it —
-		-- these are the models that reject output_config.effort outright.
+		-- and never truncates one that does not. Effort does not enter into it; it
+		-- is its own field, set above on the models that take one.
 		bodyTable.thinking = {
 			type = "enabled",
 			budget_tokens = (bodyTable.max_tokens :: number) - 1,
 		}
 	end
-end
-
--- The moving cache breakpoint on the conversation.
---
--- Returns a COPY. The conversation table is the SAME table across turns
--- Agent.luau never rebuilds it, only appends, and it is also what Sessions
--- persists and replays, so writing anything into it here leaks request-shaping
--- into stored history. That is not hypothetical: this used to REPLACE a user
--- message's string content with a one-element block array so the breakpoint had
--- a block to sit on, which turned every user message in the history into a
--- table. Sessions.replay draws user turns from string content, so a restored
--- session showed the assistant's side and none of yours, and titleOf fell
--- through to a date for the same reason.
---
--- Copying also removes the need to strip old breakpoints. Anthropic caps a
--- request at 4 cache_control blocks (system + tools + messages combined); a tag
--- written into the live table survived into later turns, so turn 3 sent three
--- of them and every call failed with "A maximum of 4 blocks with cache_control
--- may be provided." A fresh copy per request cannot accumulate.
---
--- Shallow throughout: only the last message, its block list and its last block
--- are cloned, so this is three small tables however long the conversation is.
-local function withMessageCache(messages: { any }): { any }
-	-- 1h, the same TTL the system and tool breakpoints use.
-	--
-	-- This used to be the default 5m, on the reasoning that a breakpoint which
-	-- moves and grows every turn would have its write cost doubled. That is not
-	-- what happens while the cache is warm: the lookup is a longest-prefix
-	-- match, so turn N+1 reads turn N's entry and writes only the delta. The
-	-- 2x lands on one turn's new messages; a 5m expiry costs a 1.25x rewrite of
-	-- the entire history. This is a plugin people leave docked while they read
-	-- code, so the gaps this UI is made of are exactly the ones that expire it.
-	--
-	-- ponytail: no overage gating. Claude Code drops to 5m for a subscriber who
-	-- is into overage, and latches the choice for the whole session because
-	-- flipping TTL mid-session busts the server-side cache. If plan usage ever
-	-- drives this, latch it once at session start, never per turn.
-	local CACHE = { type = "ephemeral", ttl = "1h" }
-
-	local out = table.clone(messages)
-	local lastMessage = out[#out]
-	local content = lastMessage and lastMessage.content
-	if type(content) == "table" and #content > 0 and type(content[#content]) == "table" then
-		local blocks = table.clone(content)
-		local tail = table.clone(blocks[#blocks])
-		tail.cache_control = CACHE
-		blocks[#blocks] = tail
-		local copy = table.clone(lastMessage)
-		copy.content = blocks
-		out[#out] = copy
-	elseif type(content) == "string" and content ~= "" then
-		local copy = table.clone(lastMessage)
-		copy.content = { { type = "text", text = content, cache_control = CACHE } }
-		out[#out] = copy
-	end
-	return out
 end
 
 -- streamMessage: streaming via CreateWebStreamClient (SSE)
@@ -352,8 +439,7 @@ local function streamMessage(args: {
 	-- the gaps this UI is made of, and every expiry reprocesses system + tools
 	-- from cold. A 1h write costs 2x instead of 1.25x, but this prefix is small
 	-- and static, the whole thing is paid once an hour. The conversation
-	-- breakpoint below is 1h for the same reason; see withMessageCache, which
-	-- is where the argument for the other answer used to live.
+	-- breakpoint below is 1h for the same reason.
 	--
 	-- That 2x may never actually be charged, and the breakpoint stays anyway.
 	-- There is a MINIMUM cacheable prefix and it varies by model, 512 tokens on
@@ -370,9 +456,7 @@ local function streamMessage(args: {
 	local bodyTable: { [string]: any } = {
 		model = model,
 		max_tokens = maxTokens,
-		-- messages is set below, through withMessageCache. Deliberately absent
-		-- here: it was assigned raw and overwritten thirty lines later, which
-		-- read as though the untagged conversation went on the wire.
+		-- messages and the conversation's cache_control are set together below.
 		stream = true,  -- CRITICAL: enable streaming
 		system = systemBlocks,
 	}
@@ -403,12 +487,24 @@ local function streamMessage(args: {
 		bodyTable.tool_choice = { type = "auto" }
 	end
 
-	-- The conversation itself is the part that grows every turn. Marking the
-	-- last block of the last message means everything before it, the whole
-	-- prior history, is a cache read on the next call, not a reprocess. This
-	-- is the breakpoint that actually matters as the tool loop climbs; the
-	-- system and tools breakpoints above are small and static by comparison.
-	bodyTable.messages = withMessageCache(args.messages)
+	-- The conversation itself is the part that grows every turn, and its
+	-- breakpoint is the one that matters as the tool loop climbs: everything
+	-- before it is a cache read on the next call, not a reprocess. The top-level
+	-- field is automatic caching, where the API puts that breakpoint on the last
+	-- cacheable block and moves it forward itself. It replaced a hand-placed tag
+	-- on a copied last message, whose bookkeeping had already leaked tags into
+	-- saved history once and overflowed the 4-breakpoint cap once.
+	--
+	-- 1h for the same reason as the two above. A breakpoint that moves every
+	-- turn does not pay the 2x on the whole history while the cache is warm: the
+	-- lookup is a longest-prefix match, so each turn writes only its delta.
+	--
+	-- ponytail: no overage gating. Claude Code drops to 5m for a subscriber who
+	-- is into overage, and latches the choice for the whole session because
+	-- flipping TTL mid-session busts the server-side cache. If plan usage ever
+	-- drives this, latch it once at session start, never per turn.
+	bodyTable.cache_control = { type = "ephemeral", ttl = "1h" }
+	bodyTable.messages = args.messages
 
 	local bodyStr = HttpService:JSONEncode(bodyTable)
 
@@ -620,6 +716,16 @@ local function streamMessage(args: {
 				-- is not mistaken for a failure worth retrying on top of a
 				-- delivered answer.
 				ctrl.finish(function()
+					-- A declined request is an HTTP 200 with stop_reason "refusal",
+					-- and whatever streamed before it is to be discarded, not kept:
+					-- committed, a tool_use in it would run. Reported as a failure so
+					-- every caller drops it the way it drops any other.
+					if stopReason == "refusal" then
+						if callbacks.onError then
+							callbacks.onError("the model declined this request (stop_reason: refusal); rephrase it or pick another model")
+						end
+						return
+					end
 					if callbacks.onComplete then
 						callbacks.onComplete({
 							ok = true,
@@ -668,9 +774,9 @@ local function streamMessage(args: {
 				headers = {
 					["Authorization"] = "Bearer " .. (accessToken :: string),
 					["anthropic-version"] = ANTHROPIC_VERSION,
-					["anthropic-beta"] = if capsFor(model).bound
-						then ANTHROPIC_BETA .. ",thinking-binding-controls-2026-08-01"
-						else ANTHROPIC_BETA,
+					-- Unconditional: block_binding without it is a 400, and the header
+					-- alone changes nothing on a request that does not set the field.
+					["anthropic-beta"] = ANTHROPIC_BETA .. ",thinking-binding-controls-2026-08-01",
 					["x-app"] = "cli",
 					["content-type"] = "application/json",
 					["accept"] = "text/event-stream",
@@ -726,11 +832,6 @@ local function streamMessage(args: {
 end
 
 -- Self-test
--- withMessageCache both shapes the request and has to leave the caller's
--- history alone, and each half fails silently in its own way: a tag written
--- into the live conversation accumulates until Anthropic rejects the request
--- over the 4-breakpoint cap, and a rewritten user message survives into the
--- saved session, where replay no longer recognises it.
 local function selfTest(): (boolean, string?)
 	-- Retry moved to its own module and took its assertions with it. Chained
 	-- rather than dropped: it is still this provider's retry behaviour, and
@@ -739,52 +840,6 @@ local function selfTest(): (boolean, string?)
 	if not retryOk then return false, "Retry: " .. tostring(retryErr) end
 	local jsonOk, jsonErr = ToolJson.selfTest()
 	if not jsonOk then return false, "ToolJson: " .. tostring(jsonErr) end
-
-	local function countTags(messages: { any }): number
-		local tags = 0
-		for _, message in ipairs(messages) do
-			if type(message.content) == "table" then
-				for _, block in ipairs(message.content) do
-					if type(block) == "table" and block.cache_control then tags += 1 end
-				end
-			end
-		end
-		return tags
-	end
-
-	local conversation: { any } = {
-		{ role = "user", content = "hello" },
-		{ role = "assistant", content = { { type = "text", text = "hi" } } },
-		{ role = "user", content = "again" },
-	}
-
-	local wire = withMessageCache(conversation)
-	if conversation[3].content ~= "again" then
-		return false, "withMessageCache rewrote a live user message; session replay loses it"
-	end
-	if countTags(conversation) ~= 0 then
-		return false, "withMessageCache tagged the live conversation"
-	end
-	if countTags(wire) ~= 1 then
-		return false, string.format("withMessageCache put %d breakpoints in the request, expected 1", countTags(wire))
-	end
-	if type(wire[3].content) ~= "table" or wire[3].content[1].text ~= "again" then
-		return false, "withMessageCache lost the text of the message it tagged"
-	end
-
-	-- Turn two: the same conversation, one message longer. Breakpoints must not
-	-- accumulate across requests, that is the 4-cap failure.
-	table.insert(conversation, { role = "assistant", content = { { type = "text", text = "ok" } } })
-	table.insert(conversation, { role = "user", content = {
-		{ type = "tool_result", tool_use_id = "t1", content = "ok" },
-	} })
-	local wire2 = withMessageCache(conversation)
-	if countTags(wire2) ~= 1 then
-		return false, string.format("withMessageCache accumulated %d breakpoints by turn two", countTags(wire2))
-	end
-	if conversation[#conversation].content[1].cache_control ~= nil then
-		return false, "withMessageCache tagged a live tool_result block"
-	end
 
 	-- applyReasoning picks between two request shapes that each 400 if they
 	-- reach the wrong model: budget_tokens on an adaptive model, effort on one
@@ -802,13 +857,8 @@ local function selfTest(): (boolean, string?)
 		return false, "effort did not reach output_config on a model that supports it"
 	end
 
-	if adaptive.thinking.block_binding ~= nil then
-		return false, "block_binding was sent to a model without preserved thinking"
-	end
-	local bound: { [string]: any } = { max_tokens = 128000 }
-	applyReasoning(bound, "claude-opus-5-5", "high")
-	if not bound.thinking.block_binding
-		or bound.thinking.block_binding.prefix_mismatch_behavior ~= "drop_block" then
+	if not adaptive.thinking.block_binding
+		or adaptive.thinking.block_binding.prefix_mismatch_behavior ~= "drop_block" then
 		return false, "a preserved-thinking model will 400 after microcompact edits its history"
 	end
 
@@ -825,6 +875,34 @@ local function selfTest(): (boolean, string?)
 		return false, string.format(
 			"budget_tokens was %s, expected max_tokens - 1",
 			tostring(budget.thinking.budget_tokens))
+	end
+
+	-- A fetched model is asked to think the way /v1/models says it can, and a
+	-- wrong reading is a 400 on every turn of it.
+	local function thinks(kind: string): any
+		return { supported = true, types = {
+			adaptive = { supported = kind == "adaptive" },
+			enabled = { supported = kind == "budget" },
+		} }
+	end
+	local fresh = rosterEntry({ id = "claude-test-9", display_name = "Claude Test 9",
+		max_tokens = 128000, max_input_tokens = 1000000,
+		capabilities = { thinking = thinks("adaptive"), effort = { supported = true } } })
+	if not fresh or fresh.thinking ~= "adaptive" or not fresh.effort or fresh.maxOutput ~= 128000
+		or fresh.context ~= 1000000 or fresh.name ~= "Test 9" then
+		return false, "an adaptive model from /v1/models was not shaped as one"
+	end
+	local legacy = rosterEntry({ id = "claude-test-4", max_tokens = 64000, max_input_tokens = 200000,
+		capabilities = { thinking = thinks("budget"), effort = { supported = false } } })
+	if not legacy or legacy.thinking ~= "budget" or legacy.effort then
+		return false, "a budget_tokens model from /v1/models would get adaptive thinking or effort"
+	end
+	if rosterEntry({ id = "claude-test-0" }) ~= nil then
+		return false, "a model with no capabilities and no table entry was listed on a guess"
+	end
+	local bare = rosterEntry({ id = "claude-haiku-4-5" })
+	if not bare or bare.thinking ~= "budget" then
+		return false, "a known model without capabilities lost its table caps"
 	end
 
 	if not needsTokenRefresh(401, nil) then return false, "401 does not trigger a token refresh" end
@@ -859,6 +937,9 @@ return {
 	streamMessage = streamMessage,
 	selfTest = selfTest,
 	MODELS = MODELS,
+	refreshModels = refreshModels,
+	-- Image blocks are this API's own shape and go through untouched.
+	acceptsImages = true,
 	acceptsModelId = acceptsModelId,
 	contextWindow = contextWindow,
 	DEFAULT_MODEL = DEFAULT_MODEL,

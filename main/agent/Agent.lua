@@ -308,6 +308,8 @@ end
 
 local term: any = nil
 local conversation: { any } = {}
+-- Image blocks picked with /attach, waiting for the next message to carry them.
+local pendingImages: { any } = {}
 local busy = false
 local onBusyChanged: ((boolean) -> ())? = nil
 -- Fired where the conversation is complete and valid but the run is nowhere
@@ -396,6 +398,7 @@ end
 
 function Agent.reset()
 	conversation = {}
+	pendingImages = {}
 	-- The window is empty again, so the last measurement no longer describes it.
 	-- input/output/cached are deliberately left alone: those are what this session
 	-- has SPENT, and clearing the history does not un-spend it.
@@ -406,6 +409,8 @@ end
 -- copying it, so later turns append to the same list the caller holds.
 function Agent.restore(messages: { any })
 	conversation = messages
+	-- Picked for the chat being left, not this one.
+	pendingImages = {}
 	-- This prefix was last written by whatever session saved it, so nothing here
 	-- is cached under the current one. Clearing the stamp says so, which makes
 	-- the first turn after a restore the free one to clear on.
@@ -501,7 +506,7 @@ local CLEARED = "[Old tool result content cleared]"
 local TRIGGER_CHARS = 200000    -- ~50k tokens of history before this is worth looking at
 local MIN_SAVING_CHARS = 80000  -- ~20k tokens; below this even a paid-for re-write is not worth it
 local URGENT_BUFFER_TOKENS = 13000 -- headroom left below the window; theirs, AUTOCOMPACT_BUFFER_TOKENS
-local COLD_AFTER = 60 * 60      -- seconds; the full 1h TTL withMessageCache asks for, not a hair under
+local COLD_AFTER = 60 * 60      -- seconds; the full 1h TTL the conversation cache asks for, not a hair under
 
 -- Past COLD_AFTER the 1h TTL has expired, the whole prefix is re-written on the
 -- next request whatever we do, and clearing first only shrinks what gets
@@ -591,6 +596,11 @@ local HISTORY_BUCKETS = {
 	{ key = "toolResults", label = "Tool results" },
 }
 
+-- ponytail: one size for every image, a 1080p screenshot on the high-resolution
+-- tier (~2.7k tokens) in this file's 4-chars-per-token unit. A small one is
+-- overstated; the per-image cost is ceil(w/28)*ceil(h/28) if this ever matters.
+local IMAGE_CHARS = 2700 * 4
+
 local function historyBuckets(messages: { any }): { [string]: number }
 	local out = { user = 0, assistant = 0, toolCalls = 0, toolResults = 0 }
 	for _, message in ipairs(messages) do
@@ -614,6 +624,9 @@ local function historyBuckets(messages: { any }): { [string]: number }
 						if block.input ~= nil then
 							out.toolCalls += inputChars(block.input, 0)
 						end
+					elseif block.type == "image" then
+						-- Its base64 length says nothing about its token cost.
+						out[mine] += IMAGE_CHARS
 					else
 						-- text and thinking. Both belong to whoever's message they are in.
 						if type(block.text) == "string" then out[mine] += #block.text end
@@ -1875,6 +1888,12 @@ local function runTurn(turn: number)
 	end
 end
 
+-- Queues an image block for the next Agent.send. Returns how many are waiting.
+function Agent.attach(block: any): number
+	table.insert(pendingImages, block)
+	return #pendingImages
+end
+
 -- Entry point
 function Agent.send(text: string, isLoggedIn: () -> boolean)
 	if busy then return end
@@ -1883,12 +1902,22 @@ function Agent.send(text: string, isLoggedIn: () -> boolean)
 		return
 	end
 
+	-- Attached images go in front of the text, the order the API reads a picture
+	-- best in. No provider check: /attach made one, and a switch resets the agent.
+	local content: any = text
+	if #pendingImages > 0 then
+		content = pendingImages
+		table.insert(content, { type = "text", text = text })
+		pendingImages = {}
+	end
+	local message = { role = "user", content = content }
+
 	-- Anchored to the message it is about to become, so Find can scroll back to
 	-- it later; the index is what the insert below lands on.
 	Console.setMessage(#conversation + 1)
-	Console.appendLine(text, "user")
+	Console.appendLine(Console.userText(message) or text, "user")
 	Console.setMessage(0)
-	table.insert(conversation, { role = "user", content = text })
+	table.insert(conversation, message)
 	-- Armed per message and reset here, not at session start: a budget is a
 	-- property of the request that asked for one, and the next message without
 	-- `+500k` in it turns the whole mechanism back off.
