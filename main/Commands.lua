@@ -337,26 +337,57 @@ handlers["/settings"] = function()
 	if openSettings then openSettings(true) end
 end
 
--- Images for the next message. A file picker because a plugin gets neither
--- clipboard images nor drag and drop. They wait for the text rather than going
--- now: a picture on its own asks nothing.
+-- Files for the next message, from /attach or the + button. A file picker
+-- because a plugin gets neither clipboard images nor drag and drop. They wait
+-- for the text rather than going now: a file on its own asks nothing.
+--
+-- Images ride in the message, since the model has to see the pixels. Any other
+-- file that is text is written to the scratch folder and the message carries
+-- its path: it costs nothing until the agent reads it, a big one can be read a
+-- piece at a time, and it works on every provider. The write is the ordinary
+-- one, so `Main.lua` lands as a script named Main, undo included.
 local IMAGE_TYPES: { [string]: string } = {
 	gif = "image/gif", jpeg = "image/jpeg", jpg = "image/jpeg",
 	png = "image/png", webp = "image/webp",
 }
 -- Anthropic takes 10 MB of base64 per image, and base64 is 4/3 of the file.
 local MAX_IMAGE_BYTES = 7000000
+local SCRATCH = "/ServerStorage/tmp"
 
-handlers["/attach"] = function()
+local function attachImage(file: any, mediaType: string)
 	if not Provider.wire.acceptsImages then
-		Console.appendLine(Provider.label() .. " can't take images", "error")
+		Console.appendLine(string.format("attach: %s can't take images", Provider.label()), "error")
+	elseif file.Size > MAX_IMAGE_BYTES then
+		Console.appendLine(string.format("attach: %s is %.1f MB, the limit is %.0f MB",
+			file.Name, file.Size / 1e6, MAX_IMAGE_BYTES / 1e6), "error")
+	else
+		local data = buffer.tostring(game:GetService("EncodingService"):Base64Encode(
+			buffer.fromstring(file:GetBinaryContents())))
+		Agent.attach({ type = "image", source = { type = "base64", media_type = mediaType, data = data } },
+			file.Name)
+	end
+end
+
+local function attachText(file: any)
+	local text = file:GetBinaryContents()
+	-- A NUL or broken UTF-8 is a binary file: a PDF, a .rbxm, an archive.
+	if text:find("\0", 1, true) or not utf8.len(text) then
+		Console.appendLine("attach: " .. file.Name .. " is neither text nor an image", "error")
 		return
 	end
-	local filter: { string } = {}
-	for ext in pairs(IMAGE_TYPES) do filter[#filter + 1] = ext end
-	table.sort(filter)
+	term:shell("mkdir -p " .. SCRATCH)
+	local path = SCRATCH .. "/" .. file.Name
+	local wrote, err = term:write(path, text)
+	if not wrote then
+		Console.appendLine("attach: " .. tostring(err), "error")
+		return
+	end
+	Agent.attach({ type = "text", text = "[attached: " .. path .. "]" }, file.Name)
+end
+
+function Commands.attach()
 	local ok, files = pcall(function()
-		return game:GetService("StudioService"):PromptImportFilesAsync(filter)
+		return game:GetService("StudioService"):PromptImportFilesAsync()
 	end)
 	if not ok then
 		Console.appendLine("attach: " .. tostring(files), "error")
@@ -368,25 +399,12 @@ handlers["/attach"] = function()
 		return
 	end
 	for _, file in ipairs(files) do
-		local ext = (file.Name:match("%.(%w+)$") or ""):lower()
-		local mediaType = IMAGE_TYPES[ext]
-		if not mediaType then
-			Console.appendLine("attach: " .. file.Name .. " is not a png, jpg, gif or webp", "error")
-		elseif file.Size > MAX_IMAGE_BYTES then
-			Console.appendLine(string.format("attach: %s is %.1f MB, the limit is %.0f MB",
-				file.Name, file.Size / 1e6, MAX_IMAGE_BYTES / 1e6), "error")
-		else
-			local data = buffer.tostring(game:GetService("EncodingService"):Base64Encode(
-				buffer.fromstring(file:GetBinaryContents())))
-			local waiting = Agent.attach({
-				type = "image",
-				source = { type = "base64", media_type = mediaType, data = data },
-			})
-			Console.appendLine(string.format("attached %s (%d waiting for your next message)",
-				file.Name, waiting), "info")
-		end
+		local mediaType = IMAGE_TYPES[(file.Name:match("%.(%w+)$") or ""):lower()]
+		if mediaType then attachImage(file, mediaType) else attachText(file) end
 	end
 end
+
+handlers["/attach"] = Commands.attach
 
 -- The find panel has a button and Shift+Esc; this is the third way in, and the
 -- only one that carries the query with it. Studio hands a plugin widget no key
@@ -406,10 +424,10 @@ Commands.SLASH_COMMANDS = {
 	{ cmd = "/model",    desc = "Switch model" },
 	{ cmd = "/provider", desc = "Switch provider" },
 	{ cmd = "/settings", desc = "Open the settings panel" },
-	{ cmd = "/selftest", desc = "Run every module's self-test (redraws the console)" },
-	{ cmd = "/sh",       desc = "Run a terminal command, or bare to stay in the shell" },
+	{ cmd = "/selftest", desc = "Run all self-tests (redraws the console)" },
+	{ cmd = "/sh",       desc = "Run a shell command, or enter the shell" },
 	{ cmd = "/find",     desc = "Search this chat, thinking included" },
-	{ cmd = "/attach",   desc = "Pick images to send with your next message" },
+	{ cmd = "/attach",   desc = "Attach files to your next message" },
 	{ cmd = "/clear",    desc = "Clear output + conversation" },
 	{ cmd = "/help",     desc = "Show all commands" },
 }

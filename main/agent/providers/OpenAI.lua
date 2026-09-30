@@ -70,6 +70,14 @@ local function Initialize(authModule: any, pluginRef: any)
 	if type(cached) == "string" and cached ~= "" then
 		local ok, decoded = pcall(function() return HttpService:JSONDecode(cached) end)
 		if ok and type(decoded) == "table" and #decoded > 0 then
+			-- Re-derived on the way in, not trusted: the cache holds finished rows,
+			-- and one written by a build with other naming rules would otherwise be
+			-- served as-is for up to a day. Gemini's applyRoster has the same rule.
+			for _, row in ipairs(decoded) do
+				if type(row) == "table" and type(row.label) == "string" then
+					row.name = shortName(row.label)
+				end
+			end
 			OpenAI.MODELS = decoded
 		end
 	end

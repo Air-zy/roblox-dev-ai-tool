@@ -313,8 +313,13 @@ end
 
 local term: any = nil
 local conversation: { any } = {}
--- Image blocks picked with /attach, waiting for the next message to carry them.
-local pendingImages: { any } = {}
+-- Attachments picked with /attach or the + button, waiting for the next message
+-- to carry them: the block that goes on the wire, and the label its chip shows.
+local pending: { { block: any, label: string } } = {}
+local onPendingChanged: (() -> ())? = nil
+local function pendingChanged()
+	if onPendingChanged then onPendingChanged() end
+end
 local busy = false
 local onBusyChanged: ((boolean) -> ())? = nil
 -- Fired where the conversation is complete and valid but the run is nowhere
@@ -403,7 +408,8 @@ end
 
 function Agent.reset()
 	conversation = {}
-	pendingImages = {}
+	pending = {}
+	pendingChanged()
 	-- The window is empty again, so the last measurement no longer describes it.
 	-- input/output/cached are deliberately left alone: those are what this session
 	-- has SPENT, and clearing the history does not un-spend it.
@@ -415,7 +421,8 @@ end
 function Agent.restore(messages: { any })
 	conversation = messages
 	-- Picked for the chat being left, not this one.
-	pendingImages = {}
+	pending = {}
+	pendingChanged()
 	-- This prefix was last written by whatever session saved it, so nothing here
 	-- is cached under the current one. Clearing the stamp says so, which makes
 	-- the first turn after a restore the free one to clear on.
@@ -1912,10 +1919,25 @@ local function runTurn(turn: number)
 	end
 end
 
--- Queues an image block for the next Agent.send. Returns how many are waiting.
-function Agent.attach(block: any): number
-	table.insert(pendingImages, block)
-	return #pendingImages
+-- Queues a block for the next Agent.send.
+function Agent.attach(block: any, label: string)
+	table.insert(pending, { block = block, label = label })
+	pendingChanged()
+end
+
+function Agent.detach(index: number)
+	table.remove(pending, index)
+	pendingChanged()
+end
+
+-- The waiting attachments, in the order they will be sent. Read-only.
+function Agent.attachments(): { { block: any, label: string } }
+	return pending
+end
+
+-- One listener, the chip strip; called whenever the queue changes.
+function Agent.watchAttachments(listener: () -> ())
+	onPendingChanged = listener
 end
 
 -- Entry point
@@ -1926,13 +1948,15 @@ function Agent.send(text: string, isLoggedIn: () -> boolean)
 		return
 	end
 
-	-- Attached images go in front of the text, the order the API reads a picture
-	-- best in. No provider check: /attach made one, and a switch resets the agent.
+	-- Attachments go in front of the text, the order the API reads a picture best
+	-- in. No provider check: /attach made one, and a switch resets the agent.
 	local content: any = text
-	if #pendingImages > 0 then
-		content = pendingImages
+	if #pending > 0 then
+		content = {}
+		for _, item in ipairs(pending) do table.insert(content, item.block) end
 		table.insert(content, { type = "text", text = text })
-		pendingImages = {}
+		pending = {}
+		pendingChanged()
 	end
 	local message = { role = "user", content = content }
 

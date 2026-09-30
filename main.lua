@@ -212,6 +212,100 @@ local findButton = make("TextButton", {
 
 local outputFrame = Console.mount(root, 2)
 
+-- What is attached to the next message, a chip each with an x to drop it. Its
+-- own row above the input rather than inside it: the model chip and Stop are
+-- centred on the input row's height, and a strip in there would pull them off
+-- the text. Hidden while empty, which the list layout skips.
+local attachStrip = make("Frame", {
+	Name = "Attachments",
+	Parent = root,
+	BackgroundColor3 = Theme.BG_INPUT,
+	BorderSizePixel = 0,
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	LayoutOrder = 3,
+	Visible = false,
+})
+make("UIListLayout", {
+	Parent = attachStrip,
+	FillDirection = Enum.FillDirection.Horizontal,
+	Wraps = true,
+	Padding = UDim.new(0, 6),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+})
+make("UIPadding", {
+	Parent = attachStrip,
+	PaddingLeft = UDim.new(0, 8),
+	PaddingRight = UDim.new(0, 8),
+	PaddingTop = UDim.new(0, 6),
+	PaddingBottom = UDim.new(0, 6),
+})
+
+local function renderAttachments()
+	for _, child in ipairs(attachStrip:GetChildren()) do
+		if child:IsA("Frame") then child:Destroy() end
+	end
+	local items = Agent.attachments()
+	attachStrip.Visible = #items > 0
+	for i, item in ipairs(items) do
+		local chip = make("Frame", {
+			Parent = attachStrip,
+			BackgroundColor3 = Theme.BG_SURFACE,
+			BorderSizePixel = 0,
+			Size = UDim2.new(0, 0, 0, 22),
+			AutomaticSize = Enum.AutomaticSize.X,
+			LayoutOrder = i,
+		})
+		make("UICorner", { Parent = chip, CornerRadius = UDim.new(0, 4) })
+		make("UIListLayout", {
+			Parent = chip,
+			FillDirection = Enum.FillDirection.Horizontal,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+			Padding = UDim.new(0, 4),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		})
+		make("UIPadding", { Parent = chip, PaddingLeft = UDim.new(0, 6) })
+		make("TextLabel", {
+			Parent = chip,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(0, 14, 1, 0),
+			FontFace = Theme.ICON,
+			TextSize = 13,
+			TextColor3 = Theme.TEXT_MED,
+			Text = if item.block.type == "image" then "image" else "page",
+			LayoutOrder = 1,
+		})
+		local name = make("TextLabel", {
+			Parent = chip,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(0, 0, 1, 0),
+			AutomaticSize = Enum.AutomaticSize.X,
+			FontFace = Theme.SANS,
+			TextSize = 12,
+			TextColor3 = Theme.TEXT_HI,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Text = item.label,
+			LayoutOrder = 2,
+		})
+		make("UISizeConstraint", { Parent = name, MaxSize = Vector2.new(180, math.huge) })
+		local remove = make("TextButton", {
+			Parent = chip,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(0, 20, 1, 0),
+			FontFace = Theme.ICON,
+			TextSize = 14,
+			TextColor3 = Theme.TEXT_LO,
+			Text = "x-small",
+			AutoButtonColor = false,
+			LayoutOrder = 3,
+		})
+		remove.MouseEnter:Connect(function() remove.TextColor3 = Theme.TEXT_HI end)
+		remove.MouseLeave:Connect(function() remove.TextColor3 = Theme.TEXT_LO end)
+		remove.MouseButton1Click:Connect(function() Agent.detach(i) end)
+	end
+end
+Agent.watchAttachments(renderAttachments)
+
 -- Grows with the text now that Shift+Enter can add lines, capped so a pasted
 -- wall of code cannot eat the console. The output frame is resized from this
 -- row's real height below rather than from the old hardcoded 64.
@@ -222,7 +316,7 @@ local inputRow = make("Frame", {
 	BorderSizePixel = 0,
 	Size = UDim2.new(1, 0, 0, 32),
 	AutomaticSize = Enum.AutomaticSize.Y,
-	LayoutOrder = 3,
+	LayoutOrder = 4,
 })
 make("UISizeConstraint", {
 	Parent = inputRow,
@@ -235,19 +329,23 @@ make("Frame", {
 	BorderSizePixel = 0,
 	Size = UDim2.new(1, 0, 0, 1),
 })
--- Pinned to the top rather than centred: the row grows downward now, and a
--- prompt caret that drifts to the middle of a six-line message reads as a bug.
-make("TextLabel", {
+-- Attach, where a prompt caret used to sit. Pinned to the top rather than
+-- centred: the row grows downward, and a button that drifts to the middle of a
+-- six-line message reads as a bug.
+local attachButton = make("TextButton", {
+	Name = "AttachButton",
 	Parent = inputRow,
 	BackgroundTransparency = 1,
 	Size = UDim2.new(0, 24, 0, 32),
-	FontFace = Theme.MONO,
-	TextSize = 14,
-	TextColor3 = Theme.ACCENT,
-	TextXAlignment = Enum.TextXAlignment.Center,
-	TextYAlignment = Enum.TextYAlignment.Center,
-	Text = "❯",
+	FontFace = Theme.ICON,
+	TextSize = 18,
+	TextColor3 = Theme.TEXT_MED,
+	Text = "plus-small",
+	AutoButtonColor = false,
 })
+attachButton.MouseEnter:Connect(function() attachButton.TextColor3 = Theme.TEXT_HI end)
+attachButton.MouseLeave:Connect(function() attachButton.TextColor3 = Theme.TEXT_MED end)
+attachButton.MouseButton1Click:Connect(Commands.attach)
 local stopButton = make("TextButton", {
 	Name = "StopButton",
 	Parent = inputRow,
@@ -357,12 +455,17 @@ make("UIPadding", { Parent = inputBox, PaddingTop = UDim.new(0, 8), PaddingBotto
 -- console behind it. That was the stutter while typing, not a Roblox artefact.
 local lastInputHeight = -1
 local function fitOutput()
+	-- The attachment strip rides above the input row and takes its room from
+	-- the console too, but only while it is shown.
 	local height = inputRow.AbsoluteSize.Y
+		+ (if attachStrip.Visible then attachStrip.AbsoluteSize.Y else 0)
 	if height == lastInputHeight then return end
 	lastInputHeight = height
 	outputFrame.Size = UDim2.new(1, 0, 1, -(32 + height))
 end
 inputRow:GetPropertyChangedSignal("AbsoluteSize"):Connect(fitOutput)
+attachStrip:GetPropertyChangedSignal("AbsoluteSize"):Connect(fitOutput)
+attachStrip:GetPropertyChangedSignal("Visible"):Connect(fitOutput)
 fitOutput()
 
 -- Settings popup
@@ -851,15 +954,15 @@ local modelPopup = make("ScrollingFrame", {
 	Visible = false,
 	ZIndex = 45,
 })
--- Insurance rather than the mechanism: the models page shows at most
--- MAX_MODEL_ROWS entries, so this only ever binds on the effort page.
+-- Insurance rather than the mechanism: the model list scrolls inside a fixed
+-- height, so this only ever binds on the effort page.
 make("UISizeConstraint", { Parent = modelPopup, MaxSize = Vector2.new(240, 320) })
 
--- At most this many models on screen at once. OpenRouter's free roster is about
--- twenty and every one of them has a long slug, so the list was taller than the
--- widget and ran off the top of it. Four plus a search box is the whole list
--- reachable in a couple of keystrokes, and a fixed popup height.
+-- How many models show before the list scrolls. OpenRouter's free roster is
+-- about twenty, and drawn in full the popup ran off the top of the widget. The
+-- search box above and Provider/Effort below stay put while it scrolls.
 local MAX_MODEL_ROWS = 4
+local POPUP_ROW = 28
 
 -- Built ONCE and never destroyed, which is the entire trick: drawPopup runs on
 -- every keystroke, and a TextBox that gets rebuilt underneath the person typing
@@ -925,7 +1028,7 @@ local function popupRow(
 		BackgroundColor3 = Theme.BG_DARK,
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
-		Size = UDim2.new(1, 0, 0, 28),
+		Size = UDim2.new(1, 0, 0, POPUP_ROW),
 		Text = "",
 		AutoButtonColor = false,
 		LayoutOrder = order,
@@ -988,6 +1091,7 @@ local function popupRow(
 		})
 	end
 	row.MouseButton1Click:Connect(onClick)
+	return row
 end
 
 local function popupNote(order: number, text: string)
@@ -1085,47 +1189,64 @@ local function drawPopup()
 	end
 
 	local current = Settings.model()
+	-- Every match, in a list of its own that scrolls. Its canvas is set rather
+	-- than automatic: every row is POPUP_ROW tall, and a known height is what
+	-- lets the list open scrolled to the current model on the same frame.
+	local list = make("ScrollingFrame", {
+		Parent = modelPopup,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 0, 0),
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+		ScrollBarThickness = 4,
+		ScrollBarImageColor3 = Theme.BORDER,
+		LayoutOrder = 1,
+		ZIndex = 46,
+	})
+	make("UIListLayout", { Parent = list, SortOrder = Enum.SortOrder.LayoutOrder })
 	-- Matched against the id as well as the name, because the id is what carries
 	-- the vendor: "ox" should find stealth/ox-alpha, and so should "stealth".
-	local shown, matches = 0, 0
+	local matches = 0
+	local currentAt: number? = nil
 	for _, entry in ipairs(Provider.wire.MODELS) do
 		local hit = modelQuery == ""
 			or entry.name:lower():find(modelQuery, 1, true) ~= nil
 			or entry.id:lower():find(modelQuery, 1, true) ~= nil
 		if hit then
 			matches += 1
-			if shown < MAX_MODEL_ROWS then
-				shown += 1
-				-- The parenthetical rides in the trailing column rather than being
-				-- dropped: it is the only thing separating "Max only" from "fastest"
-				-- at the moment of choosing.
-				local id, name, hint = entry.id, entry.name, entry.hint
-				popupRow(shown, name, id == current and "check-small" or nil, hint, false, function()
-					Settings.setModel(id)
-					modelPopup.Visible = false
-					refreshModel()
-				end)
-			end
+			-- The parenthetical rides in the trailing column rather than being
+			-- dropped: it is the only thing separating "Max only" from "fastest"
+			-- at the moment of choosing.
+			local id, name, hint = entry.id, entry.name, entry.hint
+			if id == current then currentAt = matches end
+			popupRow(matches, name, id == current and "check-small" or nil, hint, false, function()
+				Settings.setModel(id)
+				modelPopup.Visible = false
+				refreshModel()
+			end).Parent = list
 		end
 	end
 
-	local n = shown
 	if matches == 0 then
-		n += 1
-		popupNote(n, "Nothing matches that.")
-	elseif matches > shown then
-		-- Said rather than silently truncated: the selected model can easily be
-		-- one of the ones not drawn, and without this the list looks complete.
-		n += 1
-		popupNote(n, string.format("%d more — keep typing", matches - shown))
+		list:Destroy()
+		popupNote(1, "Nothing matches that.")
+	else
+		-- Half a row more than fits when there is more below, so the cut-off row
+		-- says the list scrolls without a note saying so.
+		local visible = if matches > MAX_MODEL_ROWS then MAX_MODEL_ROWS + 0.5 else matches
+		list.Size = UDim2.new(1, 0, 0, visible * POPUP_ROW)
+		list.CanvasSize = UDim2.new(0, 0, 0, matches * POPUP_ROW)
+		if currentAt and currentAt > MAX_MODEL_ROWS then
+			list.CanvasPosition = Vector2.new(0, math.min(currentAt - 1, matches - visible) * POPUP_ROW)
+		end
 	end
 
-	popupDivider(n + 1)
-	popupRow(n + 2, "Provider", nil, Provider.label():lower(), true, function()
+	popupDivider(2)
+	popupRow(3, "Provider", nil, Provider.label():lower(), true, function()
 		providerPage = true
 		drawPopup()
 	end)
-	popupRow(n + 3, "Effort", nil, Settings.effortName():lower(), true, function()
+	popupRow(4, "Effort", nil, Settings.effortName():lower(), true, function()
 		effortPage = true
 		drawPopup()
 	end)
@@ -1157,13 +1278,16 @@ end)
 refreshModel()
 
 -- Autocomplete dropdown
+-- Drawn the way the model popup is: same border, fill, row hover. It used to be
+-- one monospace string per row, padded into columns with spaces, which ran
+-- straight past the frame's edge on any description longer than the width.
 local dropdown = make("Frame", {
 	Name = "AutocompleteDropdown",
 	Parent = widget,
 	BackgroundColor3 = Theme.BG_INPUT,
-	BorderColor3 = Theme.ACCENT,
+	BorderColor3 = Theme.BORDER,
 	BorderSizePixel = 1,
-	Size = UDim2.new(0, 320, 0, 0),
+	Size = UDim2.new(0, 360, 0, 0),
 	Position = UDim2.new(0, 12, 1, -32),
 	Visible = false,
 	ZIndex = 40,
@@ -1192,16 +1316,39 @@ local function updateDropdown(filter: string)
 	for i, entry in ipairs(matches) do
 		local button = make("TextButton", {
 			Parent = dropdown,
+			BackgroundColor3 = Theme.BG_DARK,
 			BackgroundTransparency = 1,
-			Size = UDim2.new(1, 0, 0, 24),
-			FontFace = Theme.MONO,
-			TextSize = Theme.TEXT_SIZE,
-			TextColor3 = Theme.TEXT_HI,
-			TextXAlignment = Enum.TextXAlignment.Left,
-			Text = "  " .. entry.cmd .. string.rep(" ", math.max(2, 14 - #entry.cmd)) .. entry.desc,
-			AutoButtonColor = true,
+			BorderSizePixel = 0,
+			Size = UDim2.new(1, 0, 0, POPUP_ROW),
+			Text = "",
+			AutoButtonColor = false,
 			LayoutOrder = i,
 			ZIndex = 41,
+		})
+		button.MouseEnter:Connect(function() button.BackgroundTransparency = 0 end)
+		button.MouseLeave:Connect(function() button.BackgroundTransparency = 1 end)
+		make("TextLabel", {
+			Parent = button,
+			BackgroundTransparency = 1,
+			Position = UDim2.new(0, 10, 0, 0),
+			Size = UDim2.new(0, 76, 1, 0),
+			FontFace = Theme.MONO,
+			TextSize = 13,
+			TextColor3 = Theme.TEXT_HI,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Text = entry.cmd,
+		})
+		make("TextLabel", {
+			Parent = button,
+			BackgroundTransparency = 1,
+			Position = UDim2.new(0, 92, 0, 0),
+			Size = UDim2.new(1, -102, 1, 0),
+			FontFace = Theme.SANS,
+			TextSize = 13,
+			TextColor3 = Theme.TEXT_MED,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Text = entry.desc,
 		})
 		button.MouseButton1Click:Connect(function()
 			inputBox.Text = entry.cmd .. " "
@@ -1211,8 +1358,10 @@ local function updateDropdown(filter: string)
 		table.insert(dropdownButtons, button)
 	end
 
-	local height = #matches * 24 + 4
-	dropdown.Size = UDim2.new(0, 320, 0, height)
+	local height = #matches * POPUP_ROW + 4
+	-- As wide as reads well, narrower when the widget is: the descriptions
+	-- truncate, so any width is a layout rather than an overflow.
+	dropdown.Size = UDim2.new(0, math.min(360, widget.AbsoluteSize.X - 24 - sidebarOffset), 0, height)
 	-- Sits above the input row, whatever height the row currently is, it grows
 	-- with the message, so the old hardcoded 32 would put the list on top of it.
 	-- The offset keeps it over the console instead of over an open drawer.
