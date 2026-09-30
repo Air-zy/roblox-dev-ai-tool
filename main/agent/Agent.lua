@@ -1939,7 +1939,7 @@ function Agent.send(text: string, isLoggedIn: () -> boolean)
 	-- Anchored to the message it is about to become, so Find can scroll back to
 	-- it later; the index is what the insert below lands on.
 	Console.setMessage(#conversation + 1)
-	Console.appendLine(Console.userText(message) or text, "user")
+	Console.appendLine(Console.contentText(content) or text, "user")
 	Console.setMessage(0)
 	table.insert(conversation, message)
 	-- Armed per message and reset here, not at session start: a budget is a

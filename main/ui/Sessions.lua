@@ -408,13 +408,12 @@ end
 -- normally a plain string, but sessions saved before Claude.withMessageCache
 -- stopped writing into the live conversation have theirs as a one-element text
 -- block array, those still have to restore and still have to be titled.
--- Returns nil for the other block shape, a tool_result batch, which is drawn
--- with the call that produced it rather than as a message of its own.
--- Moved to Console with the rest of the stored-message rendering: what a message
--- looks like on screen is the renderer's business. Aliased rather than called
--- through, because titleOf below and the self-test both read better without the
--- prefix, and this file already aliases Theme.make the same way.
-local userText = Console.userText
+-- A tool_result batch has no text or image blocks at its top level, so it reads
+-- as nil: it is drawn with the call that produced it, not as a message.
+-- Lives in Console with the rest of the stored-message rendering. Aliased
+-- rather than called through, because titleOf below and the self-test both read
+-- better without the prefix, and this file already aliases Theme.make the same way.
+local contentText = Console.contentText
 
 -- First user message, which is what the reader remembers the session by.
 -- Returns nil when there isn't one, a session resumed from a stop or an error
@@ -423,7 +422,7 @@ local userText = Console.userText
 local function titleOf(conversation: { any }): string?
 	for _, message in ipairs(conversation) do
 		if message.role == "user" then
-			local raw = userText(message)
+			local raw = contentText(message.content)
 			if raw then
 				local text = raw:gsub("%s+", " ")
 				if #text > 40 then return text:sub(1, 40) .. "…" end
@@ -487,23 +486,23 @@ local function stubOldResults(conversation: { any }, keep: number): { any }
 	return out
 end
 
--- Returns a COPY with every image replaced by the "[image]" Console shows for it.
--- Each image is megabytes of base64: in the archive it would sit in the place
--- file, and in the mirror it is exactly the settings-file bloat MIRROR_BYTES
--- exists to stop, out of stubOldResults' reach because it rides in a user
--- message. A restored session goes on without the picture; the model is told
--- one was there.
+-- Every image replaced by the "[image]" Console shows for it. Each image is
+-- megabytes of base64: in the archive it would sit in the place file, and in
+-- the mirror it is exactly the settings-file bloat MIRROR_BYTES exists to stop,
+-- out of stubOldResults' reach because it rides in a user message. A restored
+-- session goes on without the picture; the model is told one was there.
 --
--- A block list with its images swapped, including those inside a tool_result
--- (an image tool's answer), or nil when it holds none.
-local function stripImages(content: { any }): { any }?
+-- A list with its images swapped, or nil when it holds none. It recurses into
+-- anything with a content list, so a conversation (messages) and a tool_result
+-- (an image tool's answer) are walked the same way; copies only what changed.
+local function stripImages(list: { any }): { any }?
 	local out: { any }? = nil
-	for j, block in ipairs(content) do
+	for j, block in ipairs(list) do
 		if type(block) == "table" then
 			local swap: any = nil
 			if block.type == "image" then
 				swap = { type = "text", text = "[image]" }
-			elseif block.type == "tool_result" and type(block.content) == "table" then
+			elseif type(block.content) == "table" then
 				local inner = stripImages(block.content)
 				if inner then
 					swap = table.clone(block)
@@ -511,7 +510,7 @@ local function stripImages(content: { any }): { any }?
 				end
 			end
 			if swap then
-				out = out or table.clone(content)
+				out = out or table.clone(list)
 				;(out :: { any })[j] = swap
 			end
 		end
@@ -520,18 +519,7 @@ local function stripImages(content: { any }): { any }?
 end
 
 local function withoutImages(conversation: { any }): { any }
-	local out = table.clone(conversation)
-	for i, message in ipairs(conversation) do
-		if type(message.content) == "table" then
-			local content = stripImages(message.content)
-			if content then
-				local copy = table.clone(message)
-				copy.content = content
-				out[i] = copy
-			end
-		end
-	end
-	return out
+	return stripImages(conversation) or conversation
 end
 
 -- Called on every busy -> idle transition, so a crash costs at most the turn that
@@ -1487,16 +1475,14 @@ function Sessions.selfTest(): (boolean, string?)
 
 	-- The older on-disk shape, where the cache breakpoint had rewritten the user
 	-- message into blocks. Both the title and the replayed line come from
-	-- userText, so this one assertion covers a session that restores with the
+	-- contentText, so this one assertion covers a session that restores with the
 	-- reader's own messages missing.
 	local blockShaped = { role = "user", content = { { type = "text", text = "old  shape" } } }
 	if titleOf({ blockShaped }) ~= "old shape" then
-		return false, "userText did not read a block-shaped user message from an older session"
+		return false, "contentText did not read a block-shaped user message from an older session"
 	end
-	if userText({ role = "user", content = {
-		{ type = "tool_result", tool_use_id = "t1", content = "ls" },
-	} }) ~= nil then
-		return false, "userText mistook a tool_result batch for something the reader typed"
+	if contentText({ { type = "tool_result", tool_use_id = "t1", content = "ls" } }) ~= nil then
+		return false, "contentText mistook a tool_result batch for something the reader typed"
 	end
 
 	-- Slots, against a fake store: this is the half that used to be impossible.

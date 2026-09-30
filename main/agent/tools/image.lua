@@ -9,31 +9,55 @@
 
 local AssetService = game:GetService("AssetService")
 local EncodingService = game:GetService("EncodingService")
+local Props = require(script.Parent.Parent.Parent:WaitForChild("studio"):WaitForChild("Props"))
 
 local SIZE = 420
 
--- Where an object keeps its picture; the first one it has wins.
-local IMAGE_PROPS = { "Texture", "Image", "TextureID", "ColorMap" }
-
--- The id out of any form a property or the model writes one in, or nil for a
--- built-in rbxasset:// path, which has no id to thumbnail.
-local function assetId(value: string): string?
-	return value:match("^%s*(%d+)%s*$") or value:match("rbxassetid://(%d+)")
-		or value:match("[?&]id=(%d+)")
+-- The id in an asset URL, or nil: a built-in rbxasset:// path has none to
+-- thumbnail. URLs only, because this also reads every string property, and a
+-- TextLabel whose Text is "5" is not asset 5.
+local function urlId(value: string): string?
+	return value:match("rbxassetid://(%d+)") or value:match("[?&]id=(%d+)")
 end
 
-local function idFor(term: any, source: string): (string?, string?)
-	local id = assetId(source)
-	if id then return id end
-	local inst, err = term:resolve(source)
-	if not inst then return nil, err or ("no such object: " .. source) end
-	for _, prop in ipairs(IMAGE_PROPS) do
-		local ok, value = pcall(function() return (inst :: any)[prop] end)
-		if ok and type(value) == "string" and value ~= "" then
-			return assetId(value), string.format("%s.%s is %q, not an asset id", inst.Name, prop, value)
+-- Asset ids that are not pictures. Skipped by name rather than listing the
+-- picture ones, which Shirt (ShirtTemplate), ShirtGraphic (Graphic), Sky
+-- (SkyboxBk...) and the rest spell differently; MeshId sorts ahead of TextureId.
+local function notPicture(prop: string): boolean
+	return prop:find("Mesh") ~= nil or prop:find("Sound") ~= nil
+		or prop:find("Animation") ~= nil or prop:find("Video") ~= nil
+end
+
+-- The first property holding a picture's asset URL, walked in the API dump's
+-- order (the one `cat` prints), as (id, property) or (nil, why not).
+local function imageOf(inst: Instance): (string?, string?)
+	local names, err = Props.names(inst.ClassName)
+	if not names then return nil, err end
+	local builtin: string? = nil
+	for _, prop in ipairs(names) do
+		if not notPicture(prop) then
+			local ok, value = pcall(function() return (inst :: any)[prop] end)
+			if ok and type(value) == "string" and value ~= "" then
+				local id = urlId(value)
+				if id then return id, prop end
+				if value:match("^rbxasset://") then builtin = builtin or (prop .. " = " .. value) end
+			end
 		end
 	end
-	return nil, inst.ClassName .. " has no image property"
+	return nil, if builtin
+		then builtin .. ", a built-in file with no asset id"
+		else "no picture asset in any of its properties"
+end
+
+-- (id, what the text line should call it) or (nil, error).
+local function idFor(term: any, source: string): (string?, string?)
+	local id = source:match("^%s*(%d+)%s*$") or urlId(source)
+	if id then return id, "asset " .. id end
+	local inst, err = term:resolve(source)
+	if not inst then return nil, err or ("no such object: " .. source) end
+	local found, from = imageOf(inst)
+	if not found then return nil, inst.Name .. ": " .. tostring(from) end
+	return found, string.format("%s.%s, asset %s", inst.Name, tostring(from), found)
 end
 
 -- PNG
@@ -115,7 +139,7 @@ end
 return {
 	name = "image",
 	description = "view an image: an asset id, or the path of an object showing one "
-		.. "(Decal, Texture, ImageLabel, MeshPart). returns a 420x420 thumbnail",
+		.. "(Decal, Shirt, ImageLabel, MeshPart...). returns a 420x420 thumbnail",
 	input_schema = {
 		type = "object",
 		properties = {
@@ -125,8 +149,8 @@ return {
 	},
 	images = true,
 	run = function(term: any, input: { [string]: any }): any
-		local id, err = idFor(term, tostring(input.source or ""))
-		if not id then return "image: " .. tostring(err) end
+		local id, what = idFor(term, tostring(input.source or ""))
+		if not id then return "image: " .. tostring(what) end
 		local uri = string.format("rbxthumb://type=Asset&id=%s&w=%d&h=%d", id, SIZE, SIZE)
 		local ok, img = pcall(function()
 			return AssetService:CreateEditableImageAsync(Content.fromUri(uri))
@@ -141,11 +165,13 @@ return {
 		return {
 			{ type = "image", source = { type = "base64", media_type = "image/png",
 				data = buffer.tostring(EncodingService:Base64Encode(png(pixels, size.X, size.Y))) } },
-			{ type = "text", text = string.format("asset %s, %dx%d thumbnail", id, size.X, size.Y) },
+			{ type = "text", text = string.format("%s, %dx%d thumbnail", tostring(what), size.X, size.Y) },
 		}
 	end,
 	-- The encoder against a reference Python's zlib wrote (level 0 is this same
-	-- stored layout), and the id forms a property actually holds.
+	-- stored layout), the id forms a property actually holds, and which property
+	-- wins on the two classes that expose the rules. Needs the API dump, as
+	-- Props' own test does.
 	selfTest = function(): (boolean, string?)
 		local pixels = buffer.create(16)
 		for i, byte in ipairs({ 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 128 }) do
@@ -155,9 +181,24 @@ return {
 		if got ~= "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAHUlEQVR4AQESAO3/AP8AAP8A/wD/AAAA//////+ASUkJeEvZzgMAAAAASUVORK5CYII=" then
 			return false, "PNG encoder output differs from the reference"
 		end
-		if assetId("rbxassetid://123") ~= "123" or assetId("http://www.roblox.com/asset/?id=45") ~= "45"
-			or assetId(" 67 ") ~= "67" or assetId("rbxasset://textures/face.png") ~= nil then
+		if urlId("rbxassetid://123") ~= "123" or urlId("http://www.roblox.com/asset/?id=45") ~= "45"
+			or urlId("5") ~= nil or urlId("rbxasset://textures/face.png") ~= nil then
 			return false, "an asset id was misread"
+		end
+		local shirt = Instance.new("Shirt")
+		shirt.ShirtTemplate = "http://www.roblox.com/asset/?id=13916825311"
+		local mesh = Instance.new("SpecialMesh")
+		mesh.MeshId = "rbxassetid://1"
+		mesh.TextureId = "rbxassetid://2"
+		local shirtId, shirtProp = imageOf(shirt)
+		local meshId = imageOf(mesh)
+		shirt:Destroy()
+		mesh:Destroy()
+		if shirtId ~= "13916825311" or shirtProp ~= "ShirtTemplate" then
+			return false, "a Shirt's picture was not found: " .. tostring(shirtProp)
+		end
+		if meshId ~= "2" then
+			return false, "a SpecialMesh answered with its mesh, not its texture"
 		end
 		return true
 	end,

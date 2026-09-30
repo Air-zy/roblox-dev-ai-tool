@@ -1553,14 +1553,6 @@ function Console.contentText(content: any): string?
 	return #parts > 0 and table.concat(parts, "\n") or nil
 end
 
--- What the reader actually typed. A user message is a plain string unless it
--- carries an /attach image (or was saved by an old build that rewrote it into
--- text blocks); one that is only a tool_result batch has no text or image
--- blocks at its top level, so it comes back nil. Sessions uses it for titles.
-function Console.userText(message: any): string?
-	return Console.contentText(message.content)
-end
-
 -- One stored message, as the blocks it was on screen as.
 --
 -- `results` maps a tool_use id to the stored result text. A result is always
@@ -1573,7 +1565,7 @@ function Console.renderMessage(message: any, index: number, results: { [string]:
 	Console.setMessage(index)
 	local content = message.content
 	if message.role == "user" then
-		local typed = Console.userText(message)
+		local typed = Console.contentText(content)
 		if typed then
 			Console.appendLine(typed, "user")
 		end
