@@ -208,6 +208,38 @@ local function isServerResult(block: any): boolean
 	return type(block.type) == "string" and block.type:sub(-12) == "_tool_result"
 end
 
+-- An image block as a Responses input_image, or nil for anything else.
+local function inputImage(block: any): any?
+	if type(block) ~= "table" or block.type ~= "image" or type(block.source) ~= "table"
+		or block.source.type ~= "base64" then
+		return nil
+	end
+	return {
+		type = "input_image",
+		image_url = "data:" .. tostring(block.source.media_type)
+			.. ";base64," .. tostring(block.source.data),
+	}
+end
+
+-- A tool_result's content as function_call_output.output: the string it
+-- almost always is, or, when an image tool answered, the input_text and
+-- input_image list Codex itself sends (FunctionCallOutputContentItem).
+local function toolOutput(content: any): any
+	if type(content) ~= "table" then return ToolJson.resultText(content) end
+	local items: { any } = {}
+	local pictured = false
+	for _, part in ipairs(content) do
+		local image = inputImage(part)
+		if image then
+			items[#items + 1] = image
+			pictured = true
+		elseif type(part) == "table" and type(part.text) == "string" then
+			items[#items + 1] = { type = "input_text", text = part.text }
+		end
+	end
+	return if pictured then items else ToolJson.resultText(content)
+end
+
 -- Convert the complete local conversation to stateless Responses input items.
 -- Returns a fresh tree; request shaping must never mutate the live session.
 local function toResponseInput(messages: { any }, model: string?): { any }
@@ -246,17 +278,12 @@ local function toResponseInput(messages: { any }, model: string?): { any }
 					out[#out + 1] = {
 						type = "function_call_output",
 						call_id = block.tool_use_id,
-						output = ToolJson.resultText(block.content),
+						output = toolOutput(block.content),
 					}
 				elseif block.type == "text" and type(block.text) == "string" then
 					textParts[#textParts + 1] = block.text
-				elseif block.type == "image" and type(block.source) == "table"
-					and block.source.type == "base64" then
-					images[#images + 1] = {
-						type = "input_image",
-						image_url = "data:" .. tostring(block.source.media_type)
-							.. ";base64," .. tostring(block.source.data),
-					}
+				elseif block.type == "image" then
+					images[#images + 1] = inputImage(block)
 				end
 			end
 			flush()
@@ -1039,6 +1066,16 @@ local function selfTest(): (boolean, string?)
 		or parts[1].type ~= "input_image" or parts[1].image_url ~= "data:image/png;base64,AAAA"
 		or parts[2].type ~= "input_text" or parts[2].text ~= "look" then
 		return false, "an attached image did not reach Responses as input_image before the text"
+	end
+	local answered = toResponseInput({ { role = "user", content = {
+		{ type = "tool_result", tool_use_id = "c1", content = {
+			{ type = "image", source = { type = "base64", media_type = "image/png", data = "AAAA" } },
+			{ type = "text", text = "asset 1" },
+		} },
+	} } }, "gpt-6-astra")
+	local output = answered[1] and answered[1].output
+	if type(output) ~= "table" or output[1].type ~= "input_image" or output[2].text ~= "asset 1" then
+		return false, "an image tool's result did not reach Responses as an input_image output"
 	end
 	return true
 end

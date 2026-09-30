@@ -1533,15 +1533,11 @@ end
 -- the live one still has its own until the streaming turn writes through the
 -- conversation rather than into a bubble it holds for the length of a turn.
 
--- What the reader actually typed, out of either message shape. A user message is
--- a plain string unless it carries an /attach image (or was saved by an old build
--- that rewrote it into text blocks), and a user message that is only a
--- tool_result batch carries nothing they wrote. An image shows as "[image]", the
--- same text Sessions saves in its place, so live and restored views match.
--- Lives here rather than in Sessions because it is what a stored message LOOKS
--- like, which is the renderer's business; Sessions keeps using it for titles.
-function Console.userText(message: any): string?
-	local content = message.content
+-- Content as text: a string as it is, a block list as its text blocks with
+-- "[image]" for each image, the same text Sessions saves in an image's place so
+-- live and restored views match. nil when there is nothing to show. Lives here
+-- because it is what stored content LOOKS like, which is the renderer's business.
+function Console.contentText(content: any): string?
 	if type(content) == "string" then
 		return content ~= "" and content or nil
 	end
@@ -1555,6 +1551,14 @@ function Console.userText(message: any): string?
 		end
 	end
 	return #parts > 0 and table.concat(parts, "\n") or nil
+end
+
+-- What the reader actually typed. A user message is a plain string unless it
+-- carries an /attach image (or was saved by an old build that rewrote it into
+-- text blocks); one that is only a tool_result batch has no text or image
+-- blocks at its top level, so it comes back nil. Sessions uses it for titles.
+function Console.userText(message: any): string?
+	return Console.contentText(message.content)
 end
 
 -- One stored message, as the blocks it was on screen as.

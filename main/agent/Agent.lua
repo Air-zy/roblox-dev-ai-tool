@@ -176,8 +176,12 @@ local MODEL_TURN_CHARS = 2 * MODEL_RESULT_CHARS
 
 local function capTurn(results: { any })
 	-- Shallow: the entries are the same tables, so assigning content mutates
-	-- the blocks that are about to go on the wire.
-	local order = table.clone(results)
+	-- the blocks that are about to go on the wire. Text results only: a picture
+	-- is sized by the tool that made it, and cannot be cut in half.
+	local order: { any } = {}
+	for _, entry in ipairs(results) do
+		if type(entry.content) == "string" then order[#order + 1] = entry end
+	end
 	table.sort(order, function(a, b)
 		return #a.content < #b.content
 	end)
@@ -244,7 +248,8 @@ end
 local function buildTools(): { any }
 	local out: { any } = {}
 	for _, def in ipairs(Tools.definitions()) do
-		if Settings.toolEnabled(def.name) then
+		if Settings.toolEnabled(def.name)
+			and (Provider.wire.acceptsImages or not Tools.needsImages(def.name)) then
 			out[#out + 1] = def
 		end
 	end
@@ -601,6 +606,25 @@ local HISTORY_BUCKETS = {
 -- overstated; the per-image cost is ceil(w/28)*ceil(h/28) if this ever matters.
 local IMAGE_CHARS = 2700 * 4
 
+-- A tool_result's content in the same unit: a string's length, or a block
+-- list's text plus IMAGE_CHARS per picture.
+local function resultChars(content: any): number
+	if type(content) == "string" then return #content end
+	local total = 0
+	if type(content) == "table" then
+		for _, part in ipairs(content) do
+			if type(part) == "table" then
+				if part.type == "image" then
+					total += IMAGE_CHARS
+				elseif type(part.text) == "string" then
+					total += #part.text
+				end
+			end
+		end
+	end
+	return total
+end
+
 local function historyBuckets(messages: { any }): { [string]: number }
 	local out = { user = 0, assistant = 0, toolCalls = 0, toolResults = 0 }
 	for _, message in ipairs(messages) do
@@ -617,9 +641,7 @@ local function historyBuckets(messages: { any }): { [string]: number }
 					-- a user message, and counting it as something the user typed is
 					-- how the largest bucket in an agent session hides in the smallest.
 					if block.type == "tool_result" then
-						if type(block.content) == "string" then
-							out.toolResults += #block.content
-						end
+						out.toolResults += resultChars(block.content)
 					elseif block.type == "tool_use" then
 						if block.input ~= nil then
 							out.toolCalls += inputChars(block.input, 0)
@@ -812,14 +834,15 @@ local function clearOldToolResults(messages: { any }): number
 	-- hypothetical: the "" guard turns silent commands into "(no output)", which
 	-- is 11 characters, and `echo`, `diff` of identical scripts and anything
 	-- redirected to /dev/null all produce one.
+	-- A picture counts: old screenshots are the result most worth clearing.
 	local function worthClearing(block: any): boolean
-		return type(block.content) == "string" and #block.content > #CLEARED
+		return resultChars(block.content) > #CLEARED
 	end
 
 	local saving = 0
 	for i = 1, cutoff do
 		if worthClearing(results[i]) then
-			saving += #results[i].content - #CLEARED
+			saving += resultChars(results[i].content) - #CLEARED
 		end
 	end
 	-- A free pass only has to beat zero, which is Claude Code's guard in this
@@ -1023,7 +1046,8 @@ end
 -- unanswered tool_use is a protocol error, so failures go back as error text.
 -- `call` is the console row the result is written into.
 local function runToolUse(shell: any, block: any, call: any, stopReason: string?): any
-	local toolResult: string
+	-- A string, or a block list from a tool that returns a picture.
+	local toolResult: any
 	-- Set beside toolResult by dispatch; nil unless the call wrote source.
 	local sourceChanges: { any }? = nil
 	-- Whether the input never parsed, as opposed to a tool that ran and
@@ -1045,7 +1069,7 @@ local function runToolUse(shell: any, block: any, call: any, stopReason: string?
 		-- here rather than in each handler because "" is a correct result
 		-- for /sh; it is only invalid on the wire.
 		if toolResult == "" then toolResult = "(no output)" end
-		call.setResult(toolResult)
+		call.setResult(Console.contentText(toolResult) or "")
 		-- The scripts this call changed, if any. Console-only: it is
 		-- not in toolResult, so nothing here reaches the provider or
 		-- costs a token.

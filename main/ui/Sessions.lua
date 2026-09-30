@@ -493,17 +493,37 @@ end
 -- exists to stop, out of stubOldResults' reach because it rides in a user
 -- message. A restored session goes on without the picture; the model is told
 -- one was there.
+--
+-- A block list with its images swapped, including those inside a tool_result
+-- (an image tool's answer), or nil when it holds none.
+local function stripImages(content: { any }): { any }?
+	local out: { any }? = nil
+	for j, block in ipairs(content) do
+		if type(block) == "table" then
+			local swap: any = nil
+			if block.type == "image" then
+				swap = { type = "text", text = "[image]" }
+			elseif block.type == "tool_result" and type(block.content) == "table" then
+				local inner = stripImages(block.content)
+				if inner then
+					swap = table.clone(block)
+					swap.content = inner
+				end
+			end
+			if swap then
+				out = out or table.clone(content)
+				;(out :: { any })[j] = swap
+			end
+		end
+	end
+	return out
+end
+
 local function withoutImages(conversation: { any }): { any }
 	local out = table.clone(conversation)
 	for i, message in ipairs(conversation) do
 		if type(message.content) == "table" then
-			local content: { any }? = nil
-			for j, block in ipairs(message.content) do
-				if type(block) == "table" and block.type == "image" then
-					content = content or table.clone(message.content)
-					;(content :: { any })[j] = { type = "text", text = "[image]" }
-				end
-			end
+			local content = stripImages(message.content)
 			if content then
 				local copy = table.clone(message)
 				copy.content = content
@@ -738,7 +758,8 @@ local function replayInto(conversation: { any })
 		if type(message.content) == "table" then
 			for _, block in ipairs(message.content) do
 				if block.type == "tool_result" and block.tool_use_id then
-					results[block.tool_use_id] = tostring(block.content)
+					-- Not tostring: an image tool's result is a block list.
+					results[block.tool_use_id] = Console.contentText(block.content) or ""
 				end
 			end
 		end
@@ -1353,6 +1374,12 @@ function Sessions.selfTest(): (boolean, string?)
 	end
 	if live[1].content[1] ~= image then
 		return false, "withoutImages stripped the live conversation"
+	end
+	local answered = withoutImages({ { role = "user", content = {
+		{ type = "tool_result", tool_use_id = "t1", content = { image, { type = "text", text = "asset 1" } } },
+	} } })
+	if answered[1].content[1].content[1].text ~= "[image]" then
+		return false, "an image tool's picture would be saved into the session"
 	end
 
 	local big = string.rep("x", 5000)

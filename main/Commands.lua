@@ -292,6 +292,7 @@ local SELF_TESTS: { { name: string, run: () -> (boolean, string?) } } = {
 	{ name = "props",     run = Props.selfTest },
 	{ name = "agent",     run = Agent.selfTest },
 	{ name = "provider",  run = Provider.selfTest },
+	{ name = "image",     run = require(agent:WaitForChild("tools"):WaitForChild("image")).selfTest },
 	{ name = "sessions",  run = Sessions.selfTest },
 	{ name = "find",      run = Find.selfTest },
 	-- Last, and on its own line in the code as well as in the run: its check ends

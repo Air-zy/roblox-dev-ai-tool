@@ -2,7 +2,10 @@
 -- Tools.luau: the tool registry.
 --
 -- Every ModuleScript under `tools/` exports either one tool or an array of them:
---   { name, description, input_schema, run(term, input) -> string }
+--   { name, description, input_schema, run(term, input) -> string, images? }
+-- run may instead return a list of content blocks when the result is a picture:
+-- text and image blocks, in the same shape as an /attach message. Such a tool
+-- sets `images = true`, and is only offered when the provider accepts images.
 -- Adding a tool is adding a file. Nothing else in the codebase has to change
 -- which is the entire reason this module exists, since the old shape needed an
 -- entry in a literal array plus a branch in an if/else chain, in the same 2500
@@ -12,7 +15,8 @@ export type Tool = {
 	name: string,
 	description: string,
 	input_schema: any,
-	run: (any, { [string]: any }) -> string,
+	run: (any, { [string]: any }) -> any,
+	images: boolean?,
 }
 
 local Tools = {}
@@ -92,6 +96,11 @@ function Tools.has(name: string): boolean
 	return byName[name] ~= nil
 end
 
+function Tools.needsImages(name: string): boolean
+	local tool = byName[name]
+	return tool ~= nil and tool.images == true
+end
+
 function Tools.names(): { string }
 	local out: { string } = {}
 	for i, tool in ipairs(defs) do
@@ -115,7 +124,7 @@ end
 -- The second return is the source changes this call applied, or nil when it
 -- changed no script. It is for the console only: it never reaches the provider,
 -- costs no tokens, and the model's result is the first return, unchanged.
-function Tools.dispatch(term: any, name: string, input: { [string]: any }): (string, { any }?)
+function Tools.dispatch(term: any, name: string, input: { [string]: any }): (any, { any }?)
 	local tool = byName[name]
 	if not tool then
 		return "error: unknown tool '" .. tostring(name) .. "'"
