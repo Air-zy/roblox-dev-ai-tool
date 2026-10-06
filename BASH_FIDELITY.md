@@ -82,6 +82,7 @@ table is pinned by a test — see **Verification**.
 | `cd` | Silent. `PWD` and `OLDPWD` are ordinary exported variables it maintains; `cd -` reads `$OLDPWD` and prints where it landed. |
 | `find` | `-delete` and `-exec` bind to the `-o` branch they were written in, and the first matching branch claims the node. `-delete` unlinks and refuses a non-empty directory, as `rmdir` does. |
 | `seq` | GNU decimal inference, `first + i*step` (never an accumulator), `-w` pads after the sign. |
+| `shuf` | Lines of a file or stdin, `-e` operands, or an `-i LO-HI` range, uniformly permuted; `-n` draws only the slots it prints, so `shuf -i 1-1000000 -n 1` is one draw. `-r`, `-o` and `-z` are not taken. |
 | Catastrophic backtracking | 200k step budget per line, and the refusal *names the pattern shape*. Without it Studio freezes — Luau cannot preempt a running chunk. |
 
 ---
@@ -220,7 +221,7 @@ Correct calls, listed so they are not mistaken for the section above.
   refused and point at `-exec`.
 - **`seq` refuses past 1000** rather than truncating — half a sequence is the
   wrong sequence, and the loop built from one quietly does the wrong number of
-  things.
+  things. `shuf -i` without `-n` refuses past 1000 for the same reason.
 - **`ls /` collapses empty services** with a count and a way to see them
   (`ls -a /`). Studio instantiates 100+ services whether the place uses them or
   not.

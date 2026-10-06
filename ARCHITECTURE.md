@@ -182,12 +182,20 @@ limits to plugins. Every load reports how many scripts came with it, so look
 before you run.
 
 agent hands a task to a subagent. That is the same tool loop over a fresh
-history holding only the prompt, with the parent's model, system prompt and tool
-list, and it returns only its final message. Its searching and reading never
-enter the conversation that asked for it, which is the point.
+history holding only the prompt, with the parent's system prompt and tool list,
+and the parent's model unless `model` names another. It returns only its final
+message. Its searching and reading never enter the conversation that asked for
+it, which is the point.
 
 - **Parallel.** Several agent calls in one reply run side by side. Every other
-  tool still runs one at a time, in order.
+  tool still runs one at a time, in order. At most three children stream at
+  once, background ones included: HttpService allows four streams and the parent
+  keeps one.
+- **Fork.** `fork: true` starts the child from a copy of the conversation
+  instead, the turn that called it included, on the parent's model.
+- **Background.** `run_in_background: true` returns at once. The report arrives
+  later as a `<task-notification>`: on the next request if a turn is running, or
+  as a turn of its own if nothing is.
 - **Own shell.** Each child gets its own Terminal, so its `cd` never moves yours.
 - **Its own console.** Opening the agent row shows the child working inside it:
   its text as it streams, its thinking, and its tool calls with their diffs.
@@ -197,8 +205,9 @@ enter the conversation that asked for it, which is the point.
 - **No nesting.** A child cannot start agents of its own. The tool stays in its
   list and is refused when called, because the tool block is the front of the
   cached prefix and removing it would lose the cache.
-- **Stop** cancels every child. A tool a child is already running finishes first,
-  like any other tool.
+- **Stop** cancels every child, background ones included, and so does leaving
+  the conversation. A tool a child is already running finishes first, like any
+  other tool.
 - **Undo.** Writes from parallel children that overlap in time fold into one
   Ctrl+Z step, since a plugin gets one recording at a time.
 

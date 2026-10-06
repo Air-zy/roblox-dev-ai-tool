@@ -35,6 +35,8 @@ local warn = warn
 -- We require the caller to call OAuth:Initialize(plugin) before using any
 -- function that touches settings storage.
 local plugin: any = nil
+local usageRevision = 0
+local cachedPlan: string? = nil
 
 -- Constants, since cross-referenced against Claude Code's own oauth.ts rather
 -- than the gist these were first taken from. CLIENT_ID matches it exactly, as do
@@ -64,8 +66,8 @@ local REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
 -- needed for inference, and a narrower consent screen is the better default.
 local SCOPES = "org:create_api_key user:profile user:inference"
 -- Subscription usage, the same endpoint Claude Code's /usage reads for its plan
--- bars. Not in the public API reference (that documents the API-key rate limit
--- headers, which OAuth traffic doesn't get). Confirmed live: this host answers
+-- bars, including windows not carried by inference response headers. Not in the
+-- public API reference. Confirmed live: this host answers
 -- with authentication_error on a bad bearer, so the route is real;
 -- claude.ai/api/oauth/usage is fronted by a bot check and 403s.
 local USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -110,6 +112,11 @@ end
 -- They fail soft rather than crashing: a nil plugin means we treat state as empty
 -- and refuse to write.
 
+local function resetUsage()
+	cachedPlan = nil
+	usageRevision += 1
+end
+
 local function saveTokens(accessToken: string, refreshToken: string, expiresIn: number)
 	if not plugin then return end
 	plugin:SetSetting(KEY_ACCESS_TOKEN, accessToken)
@@ -118,6 +125,7 @@ local function saveTokens(accessToken: string, refreshToken: string, expiresIn: 
 end
 
 local function clearTokens()
+	resetUsage()
 	if not plugin then return end
 	plugin:SetSetting(KEY_ACCESS_TOKEN, "")
 	plugin:SetSetting(KEY_REFRESH_TOKEN, "")
@@ -141,6 +149,7 @@ end
 --   OAuth:Initialize(plugin)
 -- Idempotent: safe to call multiple times.
 local function Initialize(pluginRef: any)
+	if plugin ~= pluginRef then resetUsage() end
 	plugin = pluginRef
 end
 
@@ -258,6 +267,7 @@ local function completeLogin(pastedCode: string): (boolean, string?)
 		return false, "Token response missing refresh_token."
 	end
 
+	resetUsage()
 	saveTokens(accessToken, refreshToken, tonumber(expiresIn) :: number)
 	clearPkceState()
 	return true, nil
@@ -398,12 +408,10 @@ local function untilReset(resetsAt: any): string
 	return string.format("resets in %dd %dh", math.floor(seconds / 86400), math.floor(seconds % 86400 / 3600))
 end
 
--- ponytail: the endpoint's utilization scale isn't documented, and both 0..1 and
--- 0..100 appear in the wild. Anything above 1 is read as a percentage. Drop the
--- branch once the live response settles it.
+-- The usage endpoint reports percentages. Do not infer the scale from the value: 0.5% is a valid percentage too.
 local function fraction(utilization: any): number?
 	if type(utilization) ~= "number" then return nil end
-	return math.clamp(if utilization > 1 then utilization / 100 else utilization, 0, 1)
+	return math.clamp(utilization / 100, 0, 1)
 end
 
 -- Every rolling window the endpoint can carry, as rows. Anything the response
@@ -477,12 +485,11 @@ local PLAN_NAMES: { [string]: string } = {
 	claude_enterprise = "Enterprise",
 	claude_team = "Team",
 }
-local cachedPlan: string? = nil
-
 local function fetchPlan(): string?
 	if cachedPlan then return cachedPlan end
 	local token = getAccessToken()
 	if not token then return nil end
+	local revision = usageRevision
 	local ok, response = pcall(function()
 		return HttpService:RequestAsync({
 			Url = PROFILE_URL,
@@ -497,7 +504,7 @@ local function fetchPlan(): string?
 	-- Silent on failure, unlike fetchUsage. This is one decorative row; a profile
 	-- endpoint that 404s on some account shape must not put an error where the
 	-- plan goes, and must not cost a retry on every panel open either.
-	if not ok or (response :: any).StatusCode ~= 200 then return nil end
+	if revision ~= usageRevision or not ok or (response :: any).StatusCode ~= 200 then return nil end
 	local parsed
 	local parseOk = pcall(function()
 		parsed = HttpService:JSONDecode((response :: any).Body)
@@ -568,6 +575,7 @@ return {
 	isLoggedIn = isLoggedIn,
 	getAccessToken = getAccessToken,
 	fetchUsage = fetchUsage,
+	getUsageRevision = function(): number return usageRevision end,
 	fetchPlan = fetchPlan,
 	logout = logout,
 	refresh = refresh,

@@ -27,7 +27,10 @@ return {
 	description = "real bash shell over a live in-memory vfs, with network",
 	input_schema = {
 		type = "object",
-		properties = { command = { type = "string" } },
+		properties = {
+			command = { type = "string" },
+			description = { type = "string", description = "what this does, in a few words" },
+		},
 		required = { "command" },
 	},
 	run = function(term: any, input: { [string]: any }): string

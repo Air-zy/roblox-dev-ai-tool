@@ -346,11 +346,13 @@ of the original justifications for having no cap no longer holds.
 
 ## 8. The numbers are visible
 
-Every turn prints total in (`fresh + cache read + cache write`), then cache
-read, then cache write, then output. `input_tokens` alone is only the *uncached
-remainder*, so once the prefix is cached the fresh part really is a couple of
-tokens, and printing that number by itself made a working cache look like a
-broken counter. Session totals come from `Agent.usage()`.
+Each finished prompt prints one line for the whole of it, tool loop and
+subagents included: new input (`fresh + cache write`), then output. Cache reads
+stay out of that line and in the session breakdown, from `Agent.usage()`: with a
+working cache they are most of every turn at a tenth of the price. `input_tokens`
+alone is only the *uncached remainder*, so it is never printed by itself; once
+the prefix is cached it really is a couple of tokens, and that made a working
+cache look like a broken counter.
 
 ---
 

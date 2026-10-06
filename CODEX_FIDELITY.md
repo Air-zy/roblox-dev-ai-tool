@@ -29,7 +29,7 @@ committed 2026-09-06 21:07 UTC. The protocol-critical sources are:
 - [`core/client.rs`](https://github.com/openai/codex/blob/8d7cc24a87f4aa66aa434eb4f25f4f4bafc0e0a9/codex-rs/core/src/client.rs)
 - [`core/session/turn.rs`](https://github.com/openai/codex/blob/8d7cc24a87f4aa66aa434eb4f25f4f4bafc0e0a9/codex-rs/core/src/session/turn.rs)
 - [`core/stream_events_utils.rs`](https://github.com/openai/codex/blob/8d7cc24a87f4aa66aa434eb4f25f4f4bafc0e0a9/codex-rs/core/src/stream_events_utils.rs)
-- [`codex-api/rate_limits.rs`](https://github.com/openai/codex/blob/8d7cc24a87f4aa66aa434eb4f25f4f4bafc0e0a9/codex-rs/codex-api/src/rate_limits.rs)
+- [`backend-client/client/rate_limit_resets.rs`](https://github.com/openai/codex/blob/8d7cc24a87f4aa66aa434eb4f25f4f4bafc0e0a9/codex-rs/backend-client/src/client/rate_limit_resets.rs)
 
 OpenAI's public [Responses API reference](https://developers.openai.com/api/reference/resources/responses/methods/create)
 is useful for the item schema. The ChatGPT subscription route itself is an
@@ -54,8 +54,9 @@ Codex works at all:
    **[adapted]**
 3. A function call and `response.completed.response.end_turn == false` both cause
    another sampling request. **[exact]**
-4. Subscription windows and credits come from `codex.rate_limits` events and
-   `x-codex-*` headers, not from an invented token-price meter. **[exact]**
+4. Subscription windows and credits come from the account read Codex's backend
+   client makes (`GET /wham/usage`), not from an invented token-price meter.
+   **[exact]**
 
 It is not yet transport- or cache-identical. Upstream supplies a stable
 `prompt_cache_key`, can reuse a turn-scoped WebSocket with sticky routing, and
@@ -96,10 +97,10 @@ These are all OpenAI endpoints the provider currently uses:
 | `POST` | `https://auth.openai.com/api/accounts/deviceauth/token` | Poll until the authorization code and server-created PKCE verifier are ready. | **[exact]** |
 | `POST` | `https://auth.openai.com/oauth/token` | Exchange the authorization code; later rotate access/refresh tokens. | **[exact]** |
 | `POST` | `https://chatgpt.com/backend-api/codex/responses` | Stream model output against the user's Codex subscription. | **[exact]** |
+| `GET` | `https://chatgpt.com/backend-api/wham/usage` | Read the plan, rolling-window utilization and credits for the Usage page, with the `ChatGPT-Account-Id` and FedRAMP headers upstream's `get_rate_limits` sends. | **[exact]** |
 
-There is no usage endpoint. Quota snapshots arrive with response traffic. There
-is also no `/v1/models` call today; that omission is a real roster-freshness gap,
-covered in §9 and §11.
+There is no `/v1/models` call today; that omission is a real roster-freshness
+gap, covered in §9 and §11.
 
 ## 4. Authentication fidelity
 
@@ -324,20 +325,17 @@ accounting display, not a bill. **[adapted]**
 
 ### Subscription limits
 
-`OpenAIAuth` reads both forms upstream understands:
+`OpenAIAuth.fetchUsage` makes the same account read as upstream's
+`get_rate_limits`: `GET /wham/usage`, when the Usage page opens or Refresh is
+pressed. It displays the plan, rolling-window utilization/reset time, and credit
+state, and saves the plan it reports. Nothing is read from response traffic:
+`codex.rate_limits` events and `x-codex-*` headers are ignored. There is no
+dollars-per-token calculation and no Platform quota lookup. **[exact]**
 
-- `codex.rate_limits` SSE snapshots;
-- default `x-codex-primary-*`, `x-codex-secondary-*`, and
-  `x-codex-credits-*` headers.
-
-It displays the plan, rolling-window utilization/reset time, and credit state.
-There is no dollars-per-token calculation and no Platform quota lookup.
-**[exact]**
-
-Current upstream can parse multiple named rate-limit families announced by a
-limit-id header. Ours retains only the default primary/secondary family, so a
-future account with several independent Codex limits may see an incomplete
-usage panel. **[gap]**
+Upstream also turns the payload's additional rate-limit entries into snapshots of
+their own. Ours reads only `primary_window` and `secondary_window`, so an account
+with several independent Codex limits may see an incomplete usage panel.
+**[gap]**
 
 ## 10. Session persistence
 
@@ -435,7 +433,7 @@ Do not call these fidelity bugs:
 - MCP servers, cloud tasks, shell sandboxing, approval policies, and Git
   worktrees belonging to the full Codex runtime. The same goes for Codex's
   `spawn_agent`/`wait_agent`/`close_agent` family: subagents here are Claude
-  Code's blocking `agent` tool (see `CLAUDE_FIDELITY.md` §2), and they work on
+  Code's `agent` tool (see `CLAUDE_FIDELITY.md` §2), and they work on
   this provider like any other tool.
 - Bedrock/Azure/custom OpenAI-compatible providers.
 - Showing private chain-of-thought. The supported UI is a reasoning summary.

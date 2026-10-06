@@ -352,6 +352,8 @@ local stopCurrent: (() -> ())? = nil
 -- and would climb past the window on turn three while the window sat half empty.
 -- Zero before the first reply, where there is nothing measured to show.
 local totals = { input = 0, output = 0, cached = 0, cacheWrite = 0, prompt = 0, requests = 0 }
+-- Baseline for the current user prompt, including its tool loop and children.
+local turnUsageStart = { input = 0, output = 0, cached = 0, requests = 0 }
 
 -- Wall clock over the same span `totals` covers, which is the plugin's lifetime
 -- and not the conversation's: Agent.reset clears the window measurement and
@@ -377,6 +379,12 @@ local AGENT_TOOL = "agent"
 -- The cancel function of every subagent running now. Stop calls them all; each
 -- child removes its own when it returns.
 local children: { [() -> ()]: boolean } = {}
+
+-- Reports of background agents that have finished, waiting for a request to
+-- carry them. deliverNotices starts a turn for them when nothing else will;
+-- assigned below runTurn, which it needs.
+local notices: { string } = {}
+local deliverNotices: () -> ()
 
 -- The console row of each agent call being dispatched, keyed by the coroutine
 -- dispatching it, so the child it starts can draw into that row. Keyed the way
@@ -406,7 +414,17 @@ function Agent.conversation(): { any }
 	return conversation
 end
 
+-- Background agents belong to the conversation that started them: leaving it
+-- stops them and drops reports still waiting, or they would land in the next one.
+local function dropBackground()
+	for cancelChild in pairs(table.clone(children)) do
+		cancelChild()
+	end
+	table.clear(notices)
+end
+
 function Agent.reset()
+	dropBackground()
 	conversation = {}
 	pending = {}
 	pendingChanged()
@@ -419,6 +437,7 @@ end
 -- Adopts a saved conversation wholesale (Sessions). Takes the table rather than
 -- copying it, so later turns append to the same list the caller holds.
 function Agent.restore(messages: { any })
+	dropBackground()
 	conversation = messages
 	-- Picked for the chat being left, not this one.
 	pending = {}
@@ -1077,6 +1096,8 @@ local function runToolUse(shell: any, block: any, call: any, stopReason: string?
 		-- for /sh; it is only invalid on the wire.
 		if toolResult == "" then toolResult = "(no output)" end
 		call.setResult(Console.contentText(toolResult) or "")
+		-- bash rows only: their paths, resolved where this shell ran them.
+		call.linkPaths(function(path) return (shell:resolve(path)) end)
 		-- The scripts this call changed, if any. Console-only: it is
 		-- not in toolResult, so nothing here reaches the provider or
 		-- costs a token.
@@ -1115,32 +1136,50 @@ local function runToolUse(shell: any, block: any, call: any, stopReason: string?
 	}
 end
 
--- How many jobs runAll lets run at once. The jobs are subagents, each holding a
--- stream open, and HttpService allows four streams in total. The fourth is the
--- parent's: its socket is only closed once onComplete returns, and onComplete is
--- what is running these.
+-- How many subagents stream at once. HttpService allows four streams in total,
+-- and the fourth is the parent's: its socket is only closed once onComplete
+-- returns, and onComplete is what runs a batch of children.
 local MAX_AT_ONCE = 3
 
--- Runs jobs side by side and returns once every one has finished; past
--- MAX_AT_ONCE, the next starts as soon as one ends. A single job runs inline,
--- which keeps an ordinary tool call on exactly the path it always took. Jobs must
--- not throw: one that never gets to the counter leaves the caller asleep for
--- good, which is why runTurn's jobs answer their own failures.
+-- One budget across every child, a batch and the background ones alike: a
+-- background child streams while the parent goes on making its own requests and
+-- starting more. A child holds a slot only while it streams.
+local freeSlots = MAX_AT_ONCE
+local slotWaiters: { thread } = {}
+local function takeSlot()
+	if freeSlots > 0 then
+		freeSlots -= 1
+		return
+	end
+	table.insert(slotWaiters, coroutine.running())
+	coroutine.yield()
+end
+local function giveSlot()
+	-- Handed straight to the next in line, so it cannot be taken in between.
+	local thread = table.remove(slotWaiters, 1)
+	if thread then
+		task.defer(thread)
+	else
+		freeSlots += 1
+	end
+end
+
+-- Runs jobs side by side and returns once every one has finished; the slots
+-- above keep their streams under the cap. A single job runs inline, which keeps
+-- an ordinary tool call on exactly the path it always took. Jobs must not throw:
+-- one that never gets to the counter leaves the caller asleep for good, which is
+-- why runTurn's jobs answer their own failures.
 local function runAll(jobs: { () -> () })
 	if #jobs == 1 then
 		jobs[1]()
 		return
 	end
 	local left = #jobs
-	local taken = 0
 	local waiter: thread? = nil
-	for _ = 1, math.min(MAX_AT_ONCE, #jobs) do
+	for _, job in ipairs(jobs) do
 		task.spawn(function()
-			while taken < #jobs do
-				taken += 1
-				jobs[taken]()
-				left -= 1
-			end
+			job()
+			left -= 1
 			if left == 0 and waiter then
 				task.defer(waiter)
 			end
@@ -1174,20 +1213,47 @@ end
 local CHILD_NOTE = "\n\nYou are running as a subagent: do the task with your tools "
 	.. "(the agent tool is not available to you), then reply with a concise report; "
 	.. "that final message is all the caller receives."
+local FORK_LEAD = "You are a fork of the agent above, not that agent. Your task:\n\n"
+-- Every call in the forking turn is answered with this same text, so forks of
+-- one turn share their prefix and differ only in the task after it.
+local FORK_PLACEHOLDER = "fork started; working on it separately"
 local STOPPED = "stopped by the user"
 -- What an attempt's leftovers say once the stream died mid-answer and the
 -- request went out again. Only the screen ever held them: the history is written
 -- in onComplete, and our tools are dispatched from there too, so none of it ran.
 local DISCARDED = "cut off mid-answer; discarded and asked again"
 
-function Agent.runChild(parentTerm: any, input: { [string]: any }): string
+-- A fork's history, built the way Claude Code's buildForkedMessages builds it:
+-- the conversation so far, the turn that made this call included, then every
+-- call in that turn answered and the task after them. The parent's model goes
+-- with it, because that turn's thinking is only valid to the model that wrote it.
+local function forkedHistory(prompt: string): { any }
+	local history = table.clone(conversation)
+	local results: { any } = {}
+	local last = history[#history]
+	if last and last.role == "assistant" and type(last.content) == "table" then
+		for _, block in ipairs(last.content) do
+			if block.type == "tool_use" then
+				table.insert(results, { type = "tool_result", tool_use_id = block.id, content = FORK_PLACEHOLDER })
+			end
+		end
+	end
+	table.insert(results, { type = "text", text = FORK_LEAD .. prompt .. CHILD_NOTE })
+	table.insert(history, { role = "user", content = results })
+	return history
+end
+
+-- The child's loop. Returns its report, and whether a Stop ended it.
+local function runChild(parentTerm: any, input: { [string]: any }): (string, boolean)
 	-- Its own cwd and shell variables, starting where the caller is, so a child's
 	-- `cd` never moves the user's. `.new` is reached through the instance's
 	-- metatable, which spares Agent a require across folders.
 	local shell = parentTerm.new(parentTerm:current())
-	local messages: { any } = {
-		{ role = "user", content = tostring(input.prompt or "") .. CHILD_NOTE },
-	}
+	local prompt = tostring(input.prompt or "")
+	local messages: { any } = if input.fork == true
+		then forkedHistory(prompt)
+		else { { role = "user", content = prompt .. CHILD_NOTE } }
+	local model = if type(input.model) == "string" and input.model ~= "" then input.model else Settings.model()
 
 	-- Its own console, inside the agent row that started it. Everything the child
 	-- shows is drawn there, so it never adds a line to the main console, and it is
@@ -1263,9 +1329,15 @@ function Agent.runChild(parentTerm: any, input: { [string]: any }): string
 	local lastText = ""
 	local reply = STOPPED
 	while not cancelled do
+		takeSlot()
+		-- Stopped while queued for a slot: pass it on unused.
+		if cancelled then
+			giveSlot()
+			break
+		end
 		outcome = nil
-		stream = Provider.wire.streamMessage({
-			model = Settings.model(),
+		local opened, handle = pcall(Provider.wire.streamMessage, {
+			model = model,
 			system = systemPrompt(),
 			messages = messages,
 			effort = Settings.effort(),
@@ -1319,6 +1391,10 @@ function Agent.runChild(parentTerm: any, input: { [string]: any }): string
 				end
 			end,
 		})
+		-- A throw while building the request (a body that will not encode) is a
+		-- failed request, not a dead thread that still holds its slot.
+		stream = if opened then handle else nil
+		if not opened then settle({ ok = false, error = tostring(handle) }) end
 		-- Stopped while the request was still being set up (a token refresh
 		-- yields): the handle only exists now, so close it here, as runTurn does.
 		if cancelled and stream then
@@ -1329,6 +1405,8 @@ function Agent.runChild(parentTerm: any, input: { [string]: any }): string
 			coroutine.yield()
 		end
 		local result = outcome
+		-- Settled, so this stream is over; its tools run without holding a slot.
+		giveSlot()
 		-- The round's reply is done streaming; the next one starts a bubble of its own.
 		if bubble then bubble.finishThinking() end
 		bubble = nil
@@ -1399,7 +1477,62 @@ function Agent.runChild(parentTerm: any, input: { [string]: any }): string
 		call.finish()
 	end
 	children[cancel] = nil
-	return reply
+	return reply, cancelled
+end
+
+function Agent.runChild(parentTerm: any, input: { [string]: any }): string
+	if input.fork == true and type(input.model) == "string" and input.model ~= "" then
+		return "error: a fork keeps your model; drop either fork or model"
+	end
+	if input.run_in_background ~= true then
+		return (runChild(parentTerm, input))
+	end
+	-- Background: the child runs on a thread of its own and this call returns at
+	-- once. Its row keeps drawing the child's work and takes the report when it
+	-- lands; the report itself reaches the model through deliverNotices.
+	local row = agentRows[coroutine.running()]
+	local label = tostring(input.description or "agent")
+	task.spawn(function()
+		agentRows[coroutine.running()] = row
+		-- Nobody is waiting on this thread, so a throw would end it in silence and
+		-- the parent would never hear back. It reports as the agent's result instead.
+		local ok, report, stopped = pcall(runChild, parentTerm, input)
+		if not ok then report, stopped = "error: " .. tostring(report), false end
+		agentRows[coroutine.running()] = nil
+		if row then row.setResult(report, stopped) end
+		-- A Stop means the user wants quiet, not a new turn about what stopped.
+		if stopped then return end
+		-- Tagged the way Claude Code tags it, so the model reads a harness notice in
+		-- the user turn, not the user, and sees where the report starts and stops.
+		local status = if report:sub(1, 6) == "error:" then "failed" else "completed"
+		table.insert(notices, string.format(
+			'<task-notification>\n<summary>background agent "%s" %s</summary>\n<result>%s</result>\n</task-notification>',
+			label, status, report))
+		deliverNotices()
+	end)
+	return string.format('started "%s" in the background; its report arrives later as a <task-notification>', label)
+end
+
+-- What the console says about a notice: its summary, not the tags around it.
+local function noticeLine(text: string): string
+	return "  " .. (text:match("<summary>(.-)</summary>") or "background agent finished")
+end
+
+-- Finished background reports, onto the user message a request is about to send:
+-- the user's own or a batch of tool results, as text after them, which every
+-- wire already carries. A request that ends on the assistant (a pause_turn
+-- continuation) has no such message, so they wait for the next one.
+local function attachNotices()
+	local last = conversation[#conversation]
+	if #notices == 0 or not last or last.role ~= "user" then return end
+	if type(last.content) == "string" then
+		last.content = { { type = "text", text = last.content } }
+	end
+	for _, text in ipairs(notices) do
+		table.insert(last.content, { type = "text", text = text })
+		Console.appendLine(noticeLine(text), "system")
+	end
+	table.clear(notices)
 end
 
 -- One turn
@@ -1416,6 +1549,7 @@ local function runTurn(turn: number)
 			string.format("  Cleared %d characters of old tool output to save context.", dropped),
 			"system")
 	end
+	attachNotices()
 
 	-- Every block this turn draws — the bubble, the ones a server tool splits off,
 	-- and each tool call — belongs to the assistant message it is about to
@@ -1851,29 +1985,21 @@ local function runTurn(turn: number)
 				return
 			end
 
-			if result.usage then
-				-- input_tokens is only the UNCACHED remainder, not the prompt
-				-- size. Printing it alone made a working cache look like a broken
-				-- counter: once the system prompt, the tools and the whole
-				-- conversation are cached, the fresh part of a follow-up turn
-				-- really is a couple of tokens, and "2 in" was the truth told in
-				-- the most alarming possible way. The real prompt is fresh + read
-				-- + written, so show all three.
-				local usage = result.usage
-				local fresh = usage.input_tokens or 0
-				local cacheRead = usage.cache_read_input_tokens or 0
-				local cacheWrite = usage.cache_creation_input_tokens or 0
-				local parts = { string.format("%d in", fresh + cacheRead + cacheWrite) }
-				if cacheRead > 0 then
-					table.insert(parts, string.format("%d cached", cacheRead))
-				end
-				if cacheWrite > 0 then
-					table.insert(parts, string.format("%d new to cache", cacheWrite))
-				end
-				table.insert(parts, string.format("%d out", usage.output_tokens or 0))
+			if totals.requests > turnUsageStart.requests then
+				-- New input includes uncached tokens and cache writes. Cached reads
+				-- remain in the session breakdown, without repeating them here.
+				local newInput = totals.input - turnUsageStart.input
+					- (totals.cached - turnUsageStart.cached)
+				local parts = {
+					string.format("%d new", newInput),
+					string.format("%d out", totals.output - turnUsageStart.output),
+				}
 				Console.appendLine("  " .. table.concat(parts, " · "), "system")
 			end
 			setBusy(false)
+			-- A report that landed during this turn's last request. Deferred so
+			-- this stream closes before the next one opens.
+			task.defer(deliverNotices)
 		end,
 
 		-- A transient failure the provider is going to retry by itself. Printed
@@ -1940,6 +2066,45 @@ function Agent.watchAttachments(listener: () -> ())
 	onPendingChanged = listener
 end
 
+-- A turn that opens on a new user message: the user's, or the reports of
+-- background agents that finished while nothing was running. `shown` is the
+-- console line for it, drawn as `kind`.
+local function startTurn(content: any, shown: string, kind: string)
+	turnUsageStart = {
+		input = totals.input, output = totals.output,
+		cached = totals.cached, requests = totals.requests,
+	}
+	-- Anchored to the message it is about to become, so Find can scroll back to
+	-- it later; the index is what the insert below lands on.
+	Console.setMessage(#conversation + 1)
+	Console.appendLine(shown, kind)
+	Console.setMessage(0)
+	table.insert(conversation, { role = "user", content = content })
+	-- Before the first request, not after it. Otherwise the whole of turn one is
+	-- unsaved, and a crash inside it puts the session back to before the message
+	-- was ever typed — the one loss the user has to retype by hand rather than
+	-- just wait out.
+	if onCheckpoint then
+		local saved, err = pcall(onCheckpoint)
+		if not saved then warn("[agent] checkpoint failed: " .. tostring(err)) end
+	end
+	setBusy(true)
+	runTurn(1)
+end
+
+-- Nothing is running, so nothing will carry the reports: they open a turn of
+-- their own, the way Claude Code's task notifications wake an idle session.
+-- Logged out, they wait for the next message instead.
+deliverNotices = function()
+	if busy or #notices == 0 or not Provider.auth.isLoggedIn() then return end
+	local lines: { string } = {}
+	for index, text in ipairs(notices) do lines[index] = noticeLine(text) end
+	local text = table.concat(notices, "\n\n")
+	table.clear(notices)
+	budget, budgetSpent, continuations, lastDelta, lastChecked = nil, 0, 0, 0, 0
+	startTurn(text, table.concat(lines, "\n"), "system")
+end
+
 -- Entry point
 function Agent.send(text: string, isLoggedIn: () -> boolean)
 	if busy then return end
@@ -1958,29 +2123,12 @@ function Agent.send(text: string, isLoggedIn: () -> boolean)
 		pending = {}
 		pendingChanged()
 	end
-	local message = { role = "user", content = content }
-
-	-- Anchored to the message it is about to become, so Find can scroll back to
-	-- it later; the index is what the insert below lands on.
-	Console.setMessage(#conversation + 1)
-	Console.appendLine(Console.contentText(content) or text, "user")
-	Console.setMessage(0)
-	table.insert(conversation, message)
 	-- Armed per message and reset here, not at session start: a budget is a
 	-- property of the request that asked for one, and the next message without
 	-- `+500k` in it turns the whole mechanism back off.
 	budget = parseTokenBudget(text)
 	budgetSpent, continuations, lastDelta, lastChecked = 0, 0, 0, 0
-	-- Before the first request, not after it. Otherwise the whole of turn one is
-	-- unsaved, and a crash inside it puts the session back to before the message
-	-- was ever typed — the one loss the user has to retype by hand rather than
-	-- just wait out.
-	if onCheckpoint then
-		local saved, err = pcall(onCheckpoint)
-		if not saved then warn("[agent] checkpoint failed: " .. tostring(err)) end
-	end
-	setBusy(true)
-	runTurn(1)
+	startTurn(content, Console.contentText(content) or text, "user")
 end
 
 -- Self-test
@@ -2326,6 +2474,7 @@ function Agent.selfTest(): (boolean, string?)
 	-- refuses without ever reaching a shell. Restored OUTSIDE the pcall, because a
 	-- failed check must not leave every later request going to the fake.
 	local realWire = Provider.wire
+	local realConversation, realBusy = conversation, busy
 	local childOk, childErr = pcall(function(): string?
 		-- runAll: one job inline, and several all finished by the time it returns.
 		-- Same coroutine, not merely "it ran": task.spawn would run it at once too.
@@ -2344,21 +2493,24 @@ function Agent.selfTest(): (boolean, string?)
 		if done ~= 2 then
 			return string.format("runAll returned with %d of 2 jobs finished", done)
 		end
-		-- More jobs than streams: all of them finish, never more than the cap at once.
+		-- More children than slots: all of them finish, never more than the cap
+		-- streaming at once.
 		local live, peak, finished = 0, 0, 0
 		local capped: { () -> () } = {}
 		for i = 1, MAX_AT_ONCE + 2 do
 			capped[i] = function()
+				takeSlot()
 				live += 1
 				peak = math.max(peak, live)
 				task.wait()
 				live -= 1
+				giveSlot()
 				finished += 1
 			end
 		end
 		runAll(capped)
-		if finished ~= #capped or peak ~= MAX_AT_ONCE then
-			return string.format("runAll finished %d of %d jobs, %d at once (cap %d)",
+		if finished ~= #capped or peak > MAX_AT_ONCE then
+			return string.format("%d of %d children finished, %d streaming at once (cap %d)",
 				finished, #capped, peak, MAX_AT_ONCE)
 		end
 
@@ -2420,6 +2572,69 @@ function Agent.selfTest(): (boolean, string?)
 			return "a child's reply did not draw into its row's console"
 		end
 
+		-- What a child's request carries: the model asked for, and for a fork the
+		-- conversation with every call of the forking turn answered.
+		local seen: any = nil
+		Provider.wire = {
+			streamMessage = function(request: any, callbacks: any)
+				-- A copy: the child appends its reply to the same list afterwards.
+				seen = { model = request.model, messages = table.clone(request.messages) }
+				callbacks.onComplete({ ok = true, text = "done", stopReason = "end_turn",
+					contentBlocks = { { type = "text", text = "done" } } })
+				return { cancel = function() end }
+			end,
+		}
+		Agent.runChild(fakeShell, { description = "t", prompt = "p", model = "other-model" })
+		if not seen or seen.model ~= "other-model" then
+			return "a child ignored its model override"
+		end
+		conversation = {
+			{ role = "user", content = "hi" },
+			{ role = "assistant", content = {
+				{ type = "tool_use", id = "f1", name = AGENT_TOOL, input = {} },
+				{ type = "tool_use", id = "f2", name = AGENT_TOOL, input = {} },
+			} },
+		}
+		Agent.runChild(fakeShell, { description = "t", prompt = "forked task", fork = true })
+		local tail = seen.messages[#seen.messages]
+		if #seen.messages ~= 3 or tail.role ~= "user" or tail.content[1].tool_use_id ~= "f1"
+			or tail.content[2].tool_use_id ~= "f2"
+			or not tostring(tail.content[3].text):find("forked task", 1, true) then
+			return "a fork did not get the conversation with its turn's calls answered"
+		end
+		if seen.model ~= Settings.model() then
+			return "a fork did not keep the parent's model"
+		end
+		if not Agent.runChild(fakeShell, { description = "t", prompt = "p", fork = true, model = "x" }):find("^error") then
+			return "a fork with a model override was accepted"
+		end
+
+		-- A request that throws while it is built fails the child and frees its
+		-- slot; a leaked slot is every later agent call waiting forever.
+		local slotsBefore = freeSlots
+		Provider.wire = { streamMessage = function() error("body would not encode") end }
+		local failed = Agent.runChild(fakeShell, { description = "t", prompt = "p" })
+		if not failed:find("would not encode", 1, true) or freeSlots ~= slotsBefore then
+			return "a throwing request leaked its slot or its error (" .. failed .. ")"
+		end
+		Provider.wire = {
+			streamMessage = function(request: any, callbacks: any)
+				callbacks.onComplete({ ok = true, text = "done", stopReason = "end_turn",
+					contentBlocks = { { type = "text", text = "done" } } })
+				return { cancel = function() end }
+			end,
+		}
+
+		-- Background: the call returns at once and the report waits in notices.
+		-- Busy, so it is held for the next request rather than opening a turn.
+		busy = true
+		local started = Agent.runChild(fakeShell, { description = "bg", prompt = "p", run_in_background = true })
+		task.wait()
+		local notice = table.remove(notices)
+		if not started:find("background", 1, true) or not notice or not notice:find("done", 1, true) then
+			return "a background agent's report did not arrive as a notice"
+		end
+
 		-- Stop: a request that never answers still ends. Only this test's child is
 		-- cancelled, so a /selftest during a real run leaves that run's alone.
 		Provider.wire = {
@@ -2442,6 +2657,7 @@ function Agent.selfTest(): (boolean, string?)
 		return nil
 	end)
 	Provider.wire = realWire
+	conversation, busy = realConversation, realBusy
 	-- A check that threw between setting a fake row and clearing it.
 	agentRows[coroutine.running()] = nil
 	if not childOk then return false, "subagent check threw: " .. tostring(childErr) end

@@ -7,8 +7,8 @@
 -- hand below with stored (uncompressed) deflate blocks. Valid, not small: about
 -- 700 KB at 420x420, which the model reads as ~225 tokens.
 
-local AssetService = game:GetService("AssetService")
-local EncodingService = game:GetService("EncodingService")
+-- AssetService and EncodingService are fetched where they are used, not here:
+-- a Studio or test shim without one would otherwise fail every tool's load.
 local Props = require(script.Parent.Parent.Parent:WaitForChild("studio"):WaitForChild("Props"))
 
 local SIZE = 420
@@ -153,7 +153,7 @@ return {
 		if not id then return "image: " .. tostring(what) end
 		local uri = string.format("rbxthumb://type=Asset&id=%s&w=%d&h=%d", id, SIZE, SIZE)
 		local ok, img = pcall(function()
-			return AssetService:CreateEditableImageAsync(Content.fromUri(uri))
+			return game:GetService("AssetService"):CreateEditableImageAsync(Content.fromUri(uri))
 		end)
 		if not ok then return string.format("image: asset %s did not load: %s", id, tostring(img)) end
 		-- nil rather than an error is how the editable-image memory budget says no.
@@ -164,7 +164,7 @@ return {
 		if not read then return "image: " .. tostring(pixels) end
 		return {
 			{ type = "image", source = { type = "base64", media_type = "image/png",
-				data = buffer.tostring(EncodingService:Base64Encode(png(pixels, size.X, size.Y))) } },
+				data = buffer.tostring(game:GetService("EncodingService"):Base64Encode(png(pixels, size.X, size.Y))) } },
 			{ type = "text", text = string.format("%s, %dx%d thumbnail", tostring(what), size.X, size.Y) },
 		}
 	end,
@@ -177,7 +177,7 @@ return {
 		for i, byte in ipairs({ 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 128 }) do
 			buffer.writeu8(pixels, i - 1, byte)
 		end
-		local got = buffer.tostring(EncodingService:Base64Encode(png(pixels, 2, 2)))
+		local got = buffer.tostring(game:GetService("EncodingService"):Base64Encode(png(pixels, 2, 2)))
 		if got ~= "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAHUlEQVR4AQESAO3/AP8AAP8A/wD/AAAA//////+ASUkJeEvZzgMAAAAASUVORK5CYII=" then
 			return false, "PNG encoder output differs from the reference"
 		end

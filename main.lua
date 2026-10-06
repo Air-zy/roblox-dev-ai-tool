@@ -56,6 +56,7 @@ Sessions.Initialize(plugin)
 Git.Initialize(plugin)
 
 local term = Terminal.new(game)
+Console.setResolver(function(path) return (term:resolve(path)) end)
 -- Terminal asks this before executing anything, rather than importing Settings
 -- itself; keeps the dependency pointing one way.
 Terminal.setRunGuard(Settings.allowRun)
@@ -499,13 +500,35 @@ local usageWindows: { any }? = nil
 local usageError: string? = nil
 local usageFetchedAt = 0
 local usageInFlight = false
+local usageRetryAt = 0
+local planName: string? = nil
+local planTried = false
+local usageOwner: any = nil
+local usageOwnerRevision = 0
+local usageGeneration = 0
+
+local function syncUsageOwner()
+	local auth = Provider.auth
+	local revision = if type(auth.getUsageRevision) == "function" then auth.getUsageRevision() else 0
+	if usageOwner == auth and usageOwnerRevision == revision then return end
+	usageOwner, usageOwnerRevision = auth, revision
+	usageGeneration += 1
+	usageWindows, usageError, planName = nil, nil, nil
+	usageFetchedAt, usageInFlight, planTried, usageRetryAt = 0, false, false, 0
+end
+
+-- True once a provider switch or login has replaced the owner a request began under.
+local function ownerChanged(generation: number): boolean
+	syncUsageOwner()
+	return generation ~= usageGeneration
+end
 
 -- Forward-declared because the status provider below is written before it and
 -- calls it when the Usage page is drawn. Declared with `local` up here and
 -- ASSIGNED later, not declared later: a name used before its `local` exists is
 -- a nil global, not that local, which is the trap Agent.lua's cancelRequested
 -- and Sessions' `replay` are both arranged around.
-local refreshUsage: () -> ()
+local refreshUsage: (boolean?) -> ()
 
 -- One colour per breakdown category, keyed by the label Agent.contextBreakdown
 -- returns. Semantic where the palette already means something — tool calls take
@@ -550,9 +573,6 @@ end
 -- from the status provider, which meant a blocking HTTP request inside a redraw
 -- — and, because a failed lookup cached nothing, one request per redraw for the
 -- rest of the session.
-local planName: string? = nil
-local planTried = false
-
 local function planRow(rows: { Settings.StatusRow })
 	if planName then
 		table.insert(rows, { label = "Plan", value = planName :: string })
@@ -568,6 +588,7 @@ local refreshPlan: () -> ()
 -- reason the Context breakdown can afford to be as detailed as it is.
 local toggleSettings, refreshSettings = Settings.mountPanel(widget,
 	function(page: Settings.Page): { Settings.StatusRow }
+	syncUsageOwner()
 	local rows: { Settings.StatusRow } = {}
 
 	-- Model, effort, web search and run-code are NOT repeated here: each has a
@@ -624,18 +645,17 @@ local toggleSettings, refreshSettings = Settings.mountPanel(widget,
 		planRow(rows)
 		usageRows(rows)
 
-		-- Refresh sits with the bars it refreshes rather than in the panel chrome,
-		-- where it would have to say what it acts on. Clears the freshness stamp
-		-- first: refreshUsage's own 60s guard exists to stop a panel open costing a
-		-- request, and an explicit click is the one case that should always spend
-		-- one — a reader pressing Refresh has already decided the numbers are old.
+		-- An explicit refresh bypasses the successful-read cache, but never the
+		-- failure cooldown. Show the wait beside the last-known bars.
+		local retrySeconds = usageRetryAt - os.clock()
 		table.insert(rows, {
 			label = "",
-			value = if usageInFlight then "refreshing…" else "↻ Refresh",
+			value = if usageInFlight then "refreshing…"
+				elseif retrySeconds > 0 then "retry in " .. elapsed(math.ceil(retrySeconds))
+				else "↻ Refresh",
 			onClick = function()
 				if usageInFlight then return end
-				usageFetchedAt = 0
-				refreshUsage()
+				refreshUsage(true)
 			end,
 		})
 
@@ -800,11 +820,14 @@ end,
 -- well as the success: a profile endpoint that 404s on some account shape must
 -- cost one request, not one per panel open.
 refreshPlan = function()
+	syncUsageOwner()
+	local generation = usageGeneration
 	local fetch = (Provider.auth :: any).fetchPlan
 	if planTried or not fetch or not Provider.auth.isLoggedIn() then return end
 	planTried = true
 	task.spawn(function()
 		local ok, name = pcall(fetch)
+		if ownerChanged(generation) then return end
 		if ok and type(name) == "string" and name ~= "" then
 			planName = name
 			refreshSettings()
@@ -818,9 +841,11 @@ end
 -- these are driven by onPageShown instead, which fires only when a page becomes
 -- visible.
 local USAGE_MAX_AGE = 60
-refreshUsage = function()
-	if usageInFlight or not Provider.auth.isLoggedIn() then return end
-	if usageWindows and os.clock() - usageFetchedAt < USAGE_MAX_AGE then return end
+refreshUsage = function(force: boolean?)
+	syncUsageOwner()
+	local generation = usageGeneration
+	if usageInFlight or not Provider.auth.isLoggedIn() or os.clock() < usageRetryAt then return end
+	if not force and usageWindows and os.clock() - usageFetchedAt < USAGE_MAX_AGE then return end
 	usageInFlight = true
 	task.spawn(function()
 		-- pcall'd because the reset below is the only thing that lets this run
@@ -829,7 +854,13 @@ refreshUsage = function()
 		-- request and its token refresh are guarded, the row formatting after them
 		-- is not. On the failure branch `windows` is the error message.
 		local ok, windows, err = pcall(Provider.auth.fetchUsage)
+		-- A provider switch or login can happen while the HTTP request yields.
+		-- Its result must not replace the new owner's bars or in-flight flag.
+		if ownerChanged(generation) then return end
 		usageInFlight = false
+		-- The usage endpoint has its own rate limit; a failure must not cost a
+		-- request per click.
+		if not (ok and windows) then usageRetryAt = os.clock() + USAGE_MAX_AGE end
 		if not ok then
 			usageError = tostring(windows)
 			refreshSettings()

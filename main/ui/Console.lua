@@ -1053,6 +1053,7 @@ function Console.setWorking(on: boolean)
 end
 
 -- Collapsible thinking block
+local MAX_THINKING_PREVIEW_CHARS = 240
 function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinking
 	local host = parent or sink
 	local container = make("Frame", {
@@ -1081,7 +1082,8 @@ function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinki
 		TextSize = Theme.SMALL_SIZE,
 		TextColor3 = Theme.THINK_CLR,
 		TextXAlignment = Enum.TextXAlignment.Left,
-		Text = "▶ thinking",
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Text = "thinking",
 		AutoButtonColor = false,
 		LayoutOrder = 1,
 	})
@@ -1106,10 +1108,12 @@ function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinki
 
 	local expanded = false
 	local finished = false
+	local preview = "thinking"
+	local previewComplete = false
 	local frame = SPINNER[1]
 	local function render()
-		header.Text = (expanded and "▼ " or "▶ ") .. "thinking"
-			.. (finished and "" or (" " .. frame))
+		-- Open, the body already starts with the line the preview would repeat.
+		header.Text = (finished and "" or (frame .. " ")) .. (expanded and "thinking" or preview)
 	end
 	local stopSpin = Console.spin(function(f)
 		frame = f
@@ -1137,6 +1141,22 @@ function Console.createThinking(parent: Instance?, layoutOrder: number?): Thinki
 	return {
 		append = function(delta: string)
 			text ..= delta
+			-- Grow the first nonempty line as it streams, then leave it stable.
+			-- Later deltas and spinner frames never scan the full thought again.
+			if not previewComplete then
+				local start = text:find("%S")
+				if start then
+					local lineEnd = text:find("[\r\n]", start)
+					local last = lineEnd and lineEnd - 1 or #text
+					local clipped = last - start + 1 > MAX_THINKING_PREVIEW_CHARS
+					if clipped then
+						last = (utf8.offset(text, 0, start + MAX_THINKING_PREVIEW_CHARS) or last + 1) - 1
+					end
+					preview = text:sub(start, last):gsub("%s+$", "") .. (clipped and "…" or "")
+					previewComplete = lineEnd ~= nil or clipped
+					render()
+				end
+			end
 			if not capped then
 				if #text > ENGINE_TEXT_LIMIT then
 					capped = true
@@ -1168,6 +1188,87 @@ local MAX_ARG_CHARS = 60
 -- A read of a large file comes back as one string. Past this the body is a wall
 -- nobody reads, and every character is a TextBox the DataModel has to lay out.
 local MAX_DETAIL_CHARS = 4000
+local MAX_COMMAND_CHARS = 600
+local MAX_COMMAND_LINES = 6
+
+-- Tool headers are RichText in the call's colour, and only the verb keeps it:
+-- the program starting each command line, or the tool's name. Arguments are
+-- wrapped neutral and the scaffolding dim. The colour stays on the header, so a
+-- failed call turning it red still reaches the verb.
+local DIM_HEX, ARG_HEX = Theme.hex(Theme.TEXT_LO), Theme.hex(Theme.TEXT_MED)
+local escape = Markdown.escape
+local function tint(text: string, hex: string): string
+	return '<font color="' .. hex .. '">' .. escape(text) .. "</font>"
+end
+local function dim(text: string): string
+	return tint(text, DIM_HEX)
+end
+
+-- A word of a command, quotes dropped. Only one with a slash is tried as a path,
+-- so an argument like `Touched` never links to a sibling that shares its name.
+local PATH_WORD = "[^%s;|&<>()]+"
+local function unquote(word: string): string
+	return (word:gsub("^['\"]", ""):gsub("['\"]$", ""))
+end
+local function shortPath(path: string): string?
+	local parts = path:split("/")
+	return if #parts > 2 then "…/" .. parts[#parts - 1] .. "/" .. parts[#parts] else nil
+end
+
+-- A piece of a header line, as RichText, with the object it names if it is a link.
+type Piece = { text: string, inst: Instance? }
+local LINK_HEX = Theme.hex(Theme.TEXT_HI)
+
+-- One line per `;` command, capped, the verb in the call's colour and the rest
+-- neutral. Display only: a "; " inside quotes splits too, and the expanded body
+-- keeps the command verbatim. A path in `links` is shortened and underlined as a
+-- piece of its own; the rows come back only when there is one, so a command
+-- with no links stays a single string.
+local function commandPreview(command: string, links: { [string]: Instance }): (string, { { Piece } }?)
+	command = command:gsub("\r\n", "\n"):gsub("([^\\]);%s+", "%1\n")
+	local truncated = #command > MAX_COMMAND_CHARS
+	if truncated then
+		local keep = (utf8.offset(command, 0, MAX_COMMAND_CHARS + 1) or MAX_COMMAND_CHARS + 1) - 1
+		command = command:sub(1, keep)
+	end
+	local lines = command:split("\n")
+	truncated = truncated or #lines > MAX_COMMAND_LINES
+	local rows: { { Piece } } = {}
+	local linked = false
+	for index = 1, math.min(#lines, MAX_COMMAND_LINES) do
+		local line = lines[index]
+		local row: { Piece } = { { text = if index == 1 then dim("$") .. " " else "  " } }
+		local at, gap = 1, ""
+		-- Text between links. Its trailing blanks move onto the next piece, since
+		-- a label's leading spaces always take room and its trailing ones may not.
+		local function plain(text: string)
+			local body, blanks = text:match("^(.-)(%s*)$")
+			local verb, rest = "", body
+			if #row == 1 then verb, rest = body:match("^(%S*)(.*)$") end
+			table.insert(row, { text = gap .. escape(verb) .. tint(rest, ARG_HEX) })
+			gap = blanks
+		end
+		for from, word, to in line:gmatch("()(" .. PATH_WORD .. ")()") do
+			local path = unquote(word)
+			local inst = links[path]
+			if inst then
+				plain(line:sub(at, from - 1))
+				table.insert(row, { inst = inst, text = gap .. "<u>" .. tint(shortPath(path) or path, LINK_HEX) .. "</u>" })
+				gap, at, linked = "", to, true
+			end
+		end
+		plain(line:sub(at))
+		rows[index] = row
+	end
+	if truncated then table.insert(rows, { { text = dim("  …") } }) end
+	local texts: { string } = {}
+	for index, row in ipairs(rows) do
+		local parts: { string } = {}
+		for _, piece in ipairs(row) do table.insert(parts, piece.text) end
+		texts[index] = table.concat(parts)
+	end
+	return table.concat(texts, "\n"), if linked then rows else nil
+end
 
 -- Lines of patch drawn before `Review all` appears. A one-line edit is five
 -- lines with its hunk header and context, so twelve shows a small edit whole
@@ -1180,6 +1281,8 @@ local PREVIEW_LINES = 12
 local MAX_REVIEW_ROWS = 400
 
 local function summarise(value: any): string
+	-- A list (multiedit's `edits`) by its length: tostring gives an address.
+	if type(value) == "table" then return string.format("[%d]", #value) end
 	local text = tostring(value)
 	local firstLine = text:match("^[^\n]*") or text
 	local truncated = #firstLine < #text or #firstLine > MAX_ARG_CHARS
@@ -1198,8 +1301,8 @@ local function verbatim(value: any): string
 end
 
 -- Collapsed by default, same shape as the thinking block: the header carries the
--- tool name and shortened arguments, and clicking it reveals the untruncated
--- input and result.
+-- tool name and shortened arguments, or a shell command preview. Clicking it
+-- reveals the untruncated input and result.
 --
 -- `result` may be omitted and supplied later through the returned setResult:
 -- server tools (web search) are run by Anthropic, so their call and their result
@@ -1213,12 +1316,27 @@ end
 -- the call, but its arguments stream in afterwards, a whole file, for a `write`
 --, so the header goes up argument-less rather than leaving the console silent
 -- for the seconds that takes.
+-- How a restored bash row finds the objects its paths name; set once by the
+-- entry point. ponytail: the main shell's cwd, so a relative path a subagent
+-- reached through its own `cd` may not link after a restore.
+local resolvePath: ((string) -> Instance?)? = nil
+function Console.setResolver(resolve: (string) -> Instance?)
+	resolvePath = resolve
+end
+
 function Console.appendToolCall(toolName: string, input: { [string]: any }, result: string?, isError: boolean?)
+	local isShell = toolName == "bash"
 	local label = ""
 	local detail: { string } = {}
+	local currentInput = input
+	-- Command paths that named a real object once the command ran (linkPaths),
+	-- and the header's pieces while any of them is on screen.
+	local links: { [string]: Instance } = {}
+	local rows: { { Piece } }? = nil
 	-- Rebuilt rather than appended to: setInput replaces the arguments outright,
 	-- it never adds to them.
 	local function readInput(from: { [string]: any })
+		currentInput = from
 		local keys: { string } = {}
 		for k in pairs(from) do
 			table.insert(keys, tostring(k))
@@ -1228,12 +1346,18 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 		local summary: { string } = {}
 		detail = {}
 		for _, k in ipairs(keys) do
-			table.insert(summary, k .. "=" .. summarise(from[k]))
+			table.insert(summary, dim(k .. "=") .. tint(summarise(from[k]), ARG_HEX))
 			table.insert(detail, k .. ": " .. verbatim(from[k]))
 		end
-		label = if #summary > 0
-			then string.format("[%s: %s]", toolName, table.concat(summary, " "))
-			else string.format("[%s]", toolName)
+		rows = nil
+		if isShell and type(from.command) == "string" then
+			label, rows = commandPreview(from.command, links)
+		else
+			label = if isShell then dim("$ …")
+				elseif #summary > 0
+				then escape(toolName) .. " " .. table.concat(summary, " ")
+				else escape(toolName)
+		end
 	end
 	readInput(input)
 
@@ -1253,12 +1377,18 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 		Parent = container,
 		BackgroundTransparency = 1,
 		Size = UDim2.new(1, 0, 0, 20),
+		AutomaticSize = isShell and Enum.AutomaticSize.Y or Enum.AutomaticSize.None,
 		FontFace = Theme.MONO,
 		TextSize = Theme.SMALL_SIZE,
 		TextColor3 = isError and Theme.ERR_CLR or Theme.TOOL_CLR,
 		TextXAlignment = Enum.TextXAlignment.Left,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-		Text = "▶ " .. label,
+		TextYAlignment = isShell and Enum.TextYAlignment.Top or Enum.TextYAlignment.Center,
+		TextWrapped = isShell,
+		TextTruncate = isShell and Enum.TextTruncate.None or Enum.TextTruncate.AtEnd,
+		-- A linked command's labels do not wrap; a line too long is cut here.
+		ClipsDescendants = true,
+		RichText = true,
+		Text = label,
 		AutoButtonColor = false,
 		LayoutOrder = 1,
 	})
@@ -1312,8 +1442,34 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 	-- it is written: a `local` introduced later is a different binding, and the
 	-- click handler would have captured a global nil instead.
 	local lastResult = result
+	local imagePreview: ImageLabel? = nil
+	-- The image tool's caption preserves the resolved asset id even when its
+	-- PNG is stripped from a saved session. Reuse the same thumbnail URI; resolving
+	-- the input path again could show a different image after the object changes.
+	-- Create the label only on expansion, so closed calls do not load thumbnails.
+	local function renderImage()
+		if toolName ~= "image" then return end
+		local id = lastResult and lastResult:match("asset (%d+), %d+x%d+ thumbnail$")
+		if not expanded or not id then
+			if imagePreview then imagePreview.Visible = false end
+			return
+		end
+		local preview = imagePreview or make("ImageLabel", {
+			Name = "ImagePreview",
+			Parent = container,
+			BackgroundColor3 = Theme.BG_CODE,
+			BorderSizePixel = 0,
+			Size = UDim2.new(1, 0, 0, 240),
+			ScaleType = Enum.ScaleType.Fit,
+			LayoutOrder = 3,
+		})
+		imagePreview = preview
+		preview.Image = string.format("rbxthumb://type=Asset&id=%s&w=420&h=420", id)
+		preview.Visible = true
+	end
 	local pending = result == nil
 	local frame = SPINNER[1]
+	local linkLabels: { [TextLabel]: Instance } = {}
 	local function renderHeader()
 		-- While the arguments are still streaming there is nothing to summarise,
 		-- so the size stands in for them. It is the only thing on screen that
@@ -1326,12 +1482,61 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 		-- had to be looking at the right moment — and afterwards there was no way
 		-- to tell whether it had ever appeared. A finished `write` saying how big
 		-- it was is worth more than a tidier header.
-		local size = if streamedLen > 0
+		local size = if not isShell and streamedLen > 0
 			then string.format(" %.1fk", streamedLen / 1000)
 			else ""
-		header.Text = (expanded and "▼ " or "▶ ") .. label .. changeLabel .. size
-			.. (pending and (" " .. frame) or "")
+		local suffix = dim(changeLabel .. size .. (pending and (" " .. frame) or ""))
+		if next(linkLabels) then
+			header:ClearAllChildren()
+			table.clear(linkLabels)
+		end
+		-- bash's optional description stands in for the command while the row is
+		-- closed; opening it shows the command itself, links and all.
+		local description = currentInput.description
+		if isShell and not expanded and type(description) == "string" and description ~= "" then
+			header.Text = dim("$") .. " " .. escape(summarise(description)) .. suffix
+			return
+		end
+		if not rows then
+			header.Text = label .. suffix
+			return
+		end
+		-- A linked command is drawn as one label per piece, so the header's own
+		-- click can tell which path it landed on. Rebuilt per render, which for a
+		-- finished row is only setChanges and a failure's recolour.
+		header.Text = ""
+		make("UIListLayout", { Parent = header, SortOrder = Enum.SortOrder.LayoutOrder })
+		for index, row in ipairs(rows) do
+			local line = make("Frame", {
+				Parent = header,
+				BackgroundTransparency = 1,
+				AutomaticSize = Enum.AutomaticSize.XY,
+				LayoutOrder = index,
+			})
+			make("UIListLayout", {
+				Parent = line,
+				FillDirection = Enum.FillDirection.Horizontal,
+				SortOrder = Enum.SortOrder.LayoutOrder,
+			})
+			local pieces = if index == #rows then table.clone(row) else row
+			if index == #rows then table.insert(pieces, { text = suffix }) end
+			for order, piece in ipairs(pieces) do
+				local text = make("TextLabel", {
+					Parent = line,
+					BackgroundTransparency = 1,
+					AutomaticSize = Enum.AutomaticSize.XY,
+					FontFace = Theme.MONO,
+					TextSize = Theme.SMALL_SIZE,
+					TextColor3 = header.TextColor3,
+					RichText = true,
+					Text = piece.text,
+					LayoutOrder = order,
+				})
+				if piece.inst then linkLabels[text] = piece.inst end
+			end
+		end
 	end
+	renderHeader()
 	local stopSpin: (() -> ())? = nil
 	if pending then
 		stopSpin = Console.spin(function(f)
@@ -1341,16 +1546,50 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 	end
 
 	header.MouseButton1Click:Connect(function()
+		-- On a linked path, select it; anywhere else, open or close the row. The
+		-- one connection covers every link, by testing the labels' bounds.
+		local widget = next(linkLabels) and header:FindFirstAncestorWhichIsA("PluginGui")
+		if widget then
+			local mouse = widget:GetRelativeMousePosition()
+			for text, inst in pairs(linkLabels) do
+				local offset = mouse - text.AbsolutePosition
+				if offset.X >= 0 and offset.Y >= 0
+					and offset.X < text.AbsoluteSize.X and offset.Y < text.AbsoluteSize.Y then
+					-- Gone since the command ran: selecting nothing beats an error.
+					if inst.Parent then game:GetService("Selection"):Set({ inst }) end
+					return
+				end
+			end
+		end
 		expanded = not expanded
 		detailBox.Visible = expanded
+		renderImage()
 		if nested then nested.Visible = expanded end
 		-- Re-rendered on open because appendInput skips the render while the block
 		-- is closed. Without this, expanding a call mid-stream showed whatever was
 		-- there when it was last open, which for a `write` is nothing at all.
 		if expanded then renderDetail(lastResult) end
-		renderHeader()
+		-- A described bash row swaps the description for its command when open.
+		if isShell and currentInput.description then renderHeader() end
 		Console.scrollToBottom()
 	end)
+
+	-- After a bash call has run, with the resolver of the shell that ran it, so
+	-- a path made or removed by the command is judged by what is there now.
+	-- Paths that do not resolve stay as typed.
+	local function linkPaths(resolve: (string) -> Instance?)
+		local command = currentInput.command
+		if not isShell or type(command) ~= "string" then return end
+		for word in command:gmatch(PATH_WORD) do
+			local path = unquote(word)
+			if path:find("/", 1, true) then links[path] = resolve(path) end
+		end
+		readInput(currentInput)
+		renderHeader()
+	end
+	-- A row drawn with its result already known is a restored one: no shell ran
+	-- it here, so it links against the main one.
+	if result ~= nil and resolvePath then linkPaths(resolvePath) end
 
 	Console.scrollToBottom()
 	return {
@@ -1390,6 +1629,7 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 		-- result exists.
 		setResult = function(res: string, failed: boolean?)
 			lastResult = res
+			renderImage()
 			pending = false
 			if stopSpin then stopSpin() end
 			if failed then header.TextColor3 = Theme.ERR_CLR end
@@ -1397,6 +1637,7 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 			renderDetail(res)
 			if expanded then Console.scrollToBottom() end
 		end,
+		linkPaths = linkPaths,
 		-- Stops the spinner without a result, for a call whose result is never
 		-- coming: the request errored or was cancelled while it was in flight.
 		finish = function()
@@ -1442,7 +1683,7 @@ function Console.appendToolCall(toolName: string, input: { [string]: any }, resu
 		--
 		-- Drawn without a click. A source change is the one tool result worth
 		-- seeing before being asked for, and the raw arguments stay behind the
-		-- chevron where they already were.
+		-- header's click where they already were.
 		setChanges = function(changes: { any }?)
 			if type(changes) ~= "table" or #changes == 0 or diffHolder then return end
 			local files = SourceDiff.files(changes)

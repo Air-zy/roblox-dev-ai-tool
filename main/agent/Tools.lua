@@ -85,7 +85,8 @@ function Tools.definitions(): { any }
 		out[i] = {
 			name = tool.name,
 			description = tool.description,
-			input_schema = tool.input_schema,
+			-- A function where the schema depends on the session (agent's models).
+			input_schema = if type(tool.input_schema) == "function" then tool.input_schema() else tool.input_schema,
 			eager_input_streaming = true,
 		}
 	end

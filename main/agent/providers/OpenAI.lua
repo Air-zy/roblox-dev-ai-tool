@@ -804,8 +804,6 @@ local function streamMessage(args: {
 			complete(ctrl, response, reason == "max_output_tokens" and "max_tokens" or tostring(reason))
 		elseif kind == "response.failed" or kind == "error" or kind == "response.error" then
 			failEvent(ctrl, event.response or event, raw)
-		elseif kind == "codex.rate_limits" then
-			Auth.updateUsage(event)
 		end
 	end
 
@@ -859,9 +857,6 @@ local function streamMessage(args: {
 			completed = false
 		end,
 		frame = onFrame,
-		opened = function(_status: number, headers: string)
-			Auth.updateUsageHeaders(headers)
-		end,
 		closed = function(ctrl: Stream.Ctrl)
 			if textAcc ~= "" or #slots > 0 then complete(ctrl, nil, nil) end
 		end,

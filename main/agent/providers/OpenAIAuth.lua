@@ -16,6 +16,7 @@ local HttpService = game:GetService("HttpService")
 local EncodingService = game:GetService("EncodingService")
 
 local plugin: any = nil
+local usageRevision = 0
 
 local ISSUER = "https://auth.openai.com"
 local CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -24,6 +25,8 @@ local DEVICE_TOKEN_URL = ISSUER .. "/api/accounts/deviceauth/token"
 local DEVICE_VERIFY_URL = ISSUER .. "/codex/device"
 local DEVICE_REDIRECT_URI = ISSUER .. "/deviceauth/callback"
 local TOKEN_URL = ISSUER .. "/oauth/token"
+-- Same account-status read as Codex's backend-client rate_limit_resets.rs.
+local USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
 local KEY_ACCESS_TOKEN = "openai_chatgpt_access_token"
 local KEY_REFRESH_TOKEN = "openai_chatgpt_refresh_token"
@@ -35,7 +38,6 @@ local KEY_DEVICE_AUTH_ID = "openai_device_auth_id"
 local KEY_DEVICE_USER_CODE = "openai_device_user_code"
 local KEY_DEVICE_INTERVAL = "openai_device_interval"
 local KEY_DEVICE_STARTED_AT = "openai_device_started_at"
-local KEY_RATE_LIMITS = "openai_codex_rate_limits"
 -- Removed provider builds used this key. Clear it on load and logout so an API
 -- credential cannot be selected accidentally by stale local state.
 local KEY_LEGACY_API_KEY = "openai_api_key"
@@ -67,13 +69,13 @@ local function clearDevice()
 end
 
 local function clearTokens()
+	usageRevision += 1
 	setSetting(KEY_ACCESS_TOKEN, "")
 	setSetting(KEY_REFRESH_TOKEN, "")
 	setSetting(KEY_ACCOUNT_ID, "")
 	setSetting(KEY_PLAN_TYPE, "")
 	setSetting(KEY_FEDRAMP, false)
 	setSetting(KEY_EXPIRES_AT, 0)
-	setSetting(KEY_RATE_LIMITS, "")
 	setSetting(KEY_LEGACY_API_KEY, "")
 	clearDevice()
 end
@@ -185,6 +187,7 @@ local function saveTokens(accessToken: string, refreshToken: string, idToken: st
 	if type(accountId) ~= "string" or accountId == "" then
 		return false, "The ChatGPT login did not identify an account."
 	end
+	if not requireSameAccount then usageRevision += 1 end
 	setSetting(KEY_ACCESS_TOKEN, accessToken)
 	setSetting(KEY_REFRESH_TOKEN, refreshToken)
 	setSetting(KEY_ACCOUNT_ID, accountId)
@@ -196,6 +199,7 @@ local function saveTokens(accessToken: string, refreshToken: string, idToken: st
 end
 
 local function Initialize(pluginRef: any)
+	if plugin ~= pluginRef then usageRevision += 1 end
 	plugin = pluginRef
 	-- This migration is intentional and irreversible inside the plugin settings:
 	-- the old value could authorize separately billed Platform API requests.
@@ -378,55 +382,6 @@ local function isFedramp(): boolean
 	return getSetting(KEY_FEDRAMP) == true
 end
 
-local function saveRateLimits(snapshot: any)
-	if not plugin or type(snapshot) ~= "table" then return end
-	local ok, encoded = pcall(function() return HttpService:JSONEncode(snapshot) end)
-	if ok then setSetting(KEY_RATE_LIMITS, encoded) end
-	if type(snapshot.plan_type) == "string" and snapshot.plan_type ~= "" then
-		setSetting(KEY_PLAN_TYPE, snapshot.plan_type)
-	end
-end
-
-local function updateUsage(event: any)
-	if type(event) == "table" and event.type == "codex.rate_limits" then saveRateLimits(event) end
-end
-
-local function headerValue(headers: string, name: string): string?
-	local pattern = name:lower():gsub("%-", "%%-") .. ":%s*([^\r\n]+)"
-	local value = headers:lower():match(pattern)
-	return value and value:match("^%s*(.-)%s*$") or nil
-end
-
-local function headerWindow(headers: string, prefix: string): any?
-	local used = tonumber(headerValue(headers, prefix .. "-used-percent") or "")
-	if not used then return nil end
-	return {
-		used_percent = used,
-		window_minutes = tonumber(headerValue(headers, prefix .. "-window-minutes") or ""),
-		reset_at = tonumber(headerValue(headers, prefix .. "-reset-at") or ""),
-	}
-end
-
-local function updateUsageHeaders(headers: string?)
-	if type(headers) ~= "string" or headers == "" then return end
-	local primary = headerWindow(headers, "x-codex-primary")
-	local secondary = headerWindow(headers, "x-codex-secondary")
-	local hasCredits = headerValue(headers, "x-codex-credits-has-credits")
-	if not primary and not secondary and not hasCredits then return end
-	local unlimited = headerValue(headers, "x-codex-credits-unlimited")
-	local credits = if hasCredits then {
-		has_credits = hasCredits == "true" or hasCredits == "1",
-		unlimited = unlimited == "true" or unlimited == "1",
-		balance = headerValue(headers, "x-codex-credits-balance"),
-	} else nil
-	saveRateLimits({
-		type = "codex.rate_limits",
-		plan_type = getSetting(KEY_PLAN_TYPE),
-		rate_limits = { primary = primary, secondary = secondary },
-		credits = credits,
-	})
-end
-
 local PLAN_NAMES: { [string]: string } = {
 	free = "Free", plus = "Plus", pro = "Pro", business = "Business",
 	enterprise = "Enterprise", edu = "Edu", team = "Team",
@@ -470,22 +425,40 @@ end
 local function fetchUsage(): ({ UsageRow }?, string?)
 	local token, tokenErr = getAccessToken()
 	if not token then return nil, tokenErr end
+	local accountId = getAccountId()
+	if not accountId then return nil, "usage: ChatGPT account ID is missing" end
+	local revision = usageRevision
+	local headers = {
+		["Authorization"] = "Bearer " .. token,
+		["ChatGPT-Account-ID"] = accountId,
+		["accept"] = "application/json",
+		["cache-control"] = "no-cache",
+	}
+	if isFedramp() then headers["X-OpenAI-Fedramp"] = "true" end
+	local response, requestErr = request({ Url = USAGE_URL, Method = "GET", Headers = headers })
+	if revision ~= usageRevision then return nil, "usage: account changed during refresh" end
+	if not response then return nil, "usage: " .. tostring(requestErr) end
+	if response.StatusCode ~= 200 then return nil, responseError("usage", response) end
+	local payload = jsonBody(response)
+	if type(payload) ~= "table" then return nil, "usage: response was not JSON" end
+	if type(payload.plan_type) == "string" and payload.plan_type ~= "" then
+		setSetting(KEY_PLAN_TYPE, payload.plan_type)
+	end
+	local details = payload.rate_limit
+	local function window(key: string): any
+		local data = type(details) == "table" and details[key] or nil
+		if type(data) ~= "table" then return nil end
+		return { used_percent = data.used_percent, reset_at = data.reset_at,
+			window_minutes = type(data.limit_window_seconds) == "number" and data.limit_window_seconds / 60 or nil }
+	end
 	local rows: { UsageRow } = {}
 	local plan = getSetting(KEY_PLAN_TYPE)
 	if type(plan) == "string" and plan ~= "" then
 		rows[#rows + 1] = { label = "Plan", value = PLAN_NAMES[plan:lower()] or plan }
 	end
-	local encoded = getSetting(KEY_RATE_LIMITS)
-	local snapshot
-	if type(encoded) == "string" and encoded ~= "" then
-		pcall(function() snapshot = HttpService:JSONDecode(encoded) end)
-	end
-	local limits = type(snapshot) == "table" and snapshot.rate_limits or nil
-	if type(limits) == "table" then
-		addWindow(rows, "primary", limits.primary)
-		addWindow(rows, "secondary", limits.secondary)
-	end
-	local credits = type(snapshot) == "table" and snapshot.credits or nil
+	addWindow(rows, "primary", window("primary_window"))
+	addWindow(rows, "secondary", window("secondary_window"))
+	local credits = payload.credits
 	if type(credits) == "table" and credits.has_credits == true then
 		local value = if credits.unlimited == true then "unlimited"
 			elseif type(credits.balance) == "string" and credits.balance ~= ""
@@ -493,7 +466,7 @@ local function fetchUsage(): ({ UsageRow }?, string?)
 		rows[#rows + 1] = { label = "Codex credits", value = value }
 	end
 	if #rows == 0 or (#rows == 1 and rows[1].label == "Plan") then
-		rows[#rows + 1] = { label = "Limits", value = "update after the first response" }
+		rows[#rows + 1] = { label = "Limits", value = "not reported for this account" }
 	end
 	return rows, nil
 end
@@ -510,8 +483,7 @@ return {
 	getAccessToken = getAccessToken,
 	getAccountId = getAccountId,
 	isFedramp = isFedramp,
-	updateUsage = updateUsage,
-	updateUsageHeaders = updateUsageHeaders,
+	getUsageRevision = function(): number return usageRevision end,
 	fetchUsage = fetchUsage,
 	logout = logout,
 	refresh = refresh,

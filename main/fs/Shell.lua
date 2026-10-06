@@ -684,6 +684,10 @@ local SPECS: { [string]: FlagSpec } = {
 		why = { ["-h"] = "sorts by human-readable size suffixes, and -n already sorts " ..
 			"the numbers this shell emits" },
 	},
+	shuf = {
+		bool = "e", value = "in",
+		long = { ["--echo"] = "bool:-e", ["--input-range"] = "value:-i", ["--head-count"] = "value:-n" },
+	},
 	stat = { value = "c", long = { ["--format"] = "value:-c" }, why = { ["-L"] = NO_LINKS } },
 	tail = {
 		bool = "qv", value = "cn",
@@ -3241,6 +3245,49 @@ HANDLERS.sort = function(self, argv, stdin)
 	return result
 end
 
+-- Lines, -e's operands, or -i's LO-HI range, in random order. Fisher-Yates that
+-- only draws the -n slots it prints, over a virtual list, so `shuf -i 1-1000000
+-- -n 1` is one draw rather than a million lines.
+HANDLERS.shuf = function(self, argv, stdin)
+	local flags, values, operands = parse(argv)
+	local total: number, item: (number) -> string
+	local range = valueOf(values, "-i")
+	if range then
+		local lo, hi = range:match("^(%d+)%-(%d+)$")
+		if not lo or tonumber(hi) < tonumber(lo) then
+			return fail("shuf", string.format("-i takes LO-HI, e.g. 1-100 — got %q", range))
+		end
+		total = tonumber(hi) - tonumber(lo) + 1
+		item = function(k) return tostring(tonumber(lo) + k - 1) end
+	else
+		local lines = operands
+		if not flags["-e"] then
+			local input, inputErr = textInput(self, operands, stdin)
+			if not input then return fail("shuf", inputErr) end
+			lines = splitLines(input)
+		end
+		total = #lines
+		item = function(k) return lines[k] end
+	end
+	local limit = valueOf(values, "-n")
+	if limit and not tonumber(limit) then
+		return fail("shuf", string.format("-n takes a count — got %q", limit))
+	end
+	local count = math.min(tonumber(limit) or total, total)
+	-- A range is a generated stream, capped and refused for seq's reason.
+	if range and count > MAX_SEQ then
+		return fail("shuf", string.format("%d values, and the cap is %d — add -n", count, MAX_SEQ))
+	end
+	local slot: { [number]: number } = {}
+	local out: { string } = {}
+	for i = 1, count do
+		local j = math.random(i, total)
+		slot[i], slot[j] = slot[j] or j, slot[i] or i
+		out[i] = item(slot[i])
+	end
+	return table.concat(out, "\n")
+end
+
 -- Adjacent-only, as in bash: `sort | uniq` is the idiom, and silently doing a
 -- global dedupe would make `uniq -c` counts wrong for anyone who relies on it.
 HANDLERS.uniq = function(self, argv, stdin)
@@ -5791,7 +5838,7 @@ Shell.COMMANDS = COMMANDS
 -- looks exactly like a right one.
 local STDIN_COMMANDS: { [string]: boolean } = {
 	cat = true, grep = true, egrep = true, fgrep = true,
-	head = true, tail = true, wc = true, sort = true, uniq = true,
+	head = true, tail = true, wc = true, sort = true, uniq = true, shuf = true,
 	sed = true, tr = true, cut = true, awk = true,
 }
 
@@ -6430,6 +6477,9 @@ function Shell.selfTest(probe: any): (boolean, string?)
 		{ line = "uniq -c Dupes.luau", want = "   2 a\n   1 b", why = "uniq -c counts a run" },
 		{ line = "uniq -d Dupes.luau", want = "a", why = "uniq -d keeps only repeats" },
 		{ line = "uniq -u Dupes.luau", want = "b", why = "uniq -u keeps only singles" },
+		{ line = "shuf Nums.luau | sort -n", want = "2\n10\n30", why = "shuf permutes every line" },
+		{ line = "shuf -e a b c -n 2 | wc -l", want = "2", why = "shuf -n caps the draw" },
+		{ line = "shuf -i 7-7", want = "7", why = "shuf -i shuffles a range" },
 
 		-- tr: escapes, classes, and the one-set flags. `tr -d '\n'` failed three
 		-- ways over, the escape was not understood, two sets were required, and
