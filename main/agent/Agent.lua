@@ -403,6 +403,13 @@ local agentRows: { [thread]: any } = {}
 -- did nothing and a restored session was treated as cache-warm.
 local lastRequestAt: number? = nil
 
+-- The open session's id, set by Sessions. Providers that route their cache by
+-- a key send it as one; the rest ignore it.
+local sessionId: string? = nil
+function Agent.setSessionId(id: string)
+	sessionId = id
+end
+
 function Agent.Initialize(terminal: any, busyCallback: ((boolean) -> ())?,
 	checkpointCallback: (() -> ())?)
 	term = terminal
@@ -1343,6 +1350,7 @@ local function runChild(parentTerm: any, input: { [string]: any }): (string, boo
 			effort = Settings.effort(),
 			tools = buildTools(),
 			webSearch = Settings.webSearchMaxUses(),
+			sessionId = sessionId,
 		}, {
 			onThinking = function(delta: string)
 				-- As in runTurn: a short thought summarises to empty deltas, so a
@@ -1756,6 +1764,7 @@ local function runTurn(turn: number)
 		-- put server tools in their tool arrays; OpenRouter uses a body-level plugin.
 		-- Those wire details are the provider's business, not Agent's.
 		webSearch = Settings.webSearchMaxUses(),
+		sessionId = sessionId,
 	}, {
 		onThinking = function(delta: string)
 			if not thinkingSeen then

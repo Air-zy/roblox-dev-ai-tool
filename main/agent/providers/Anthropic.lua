@@ -100,7 +100,8 @@ local MODEL_CAPS: { [string]: { thinking: string, effort: boolean, maxOutput: nu
 	["claude-sonnet-5-5"]         = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
 	["claude-opus-5"]             = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
 	["claude-sonnet-5"]           = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
-	["claude-haiku-4-5"]          = { thinking = "budget",   effort = false, maxOutput = 64000,  context = 200000 },
+	["claude-haiku-5-5"]          = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
+	["claude-haiku-4-5"]         = { thinking = "budget",   effort = false, maxOutput = 64000,  context = 200000 },
 }
 local DEFAULT_CAPS = { thinking = "adaptive", effort = true, maxOutput = 64000, context = 200000 }
 
@@ -157,7 +158,7 @@ local MODELS = {
 	{ id = "claude-opus-5-5",  label = "Claude Opus 5.5 (recommended)", name = "Opus 5.5",  hint = "recommended" },
 	{ id = "claude-fable-5-1", label = "Claude Fable 5.1 (most capable)", name = "Fable 5.1", hint = "most capable" },
 	{ id = "claude-sonnet-5-5", label = "Claude Sonnet 5.5 (balanced)", name = "Sonnet 5.5", hint = "balanced" },
-	{ id = "claude-haiku-4-5", label = "Claude Haiku 4.5 (fastest)",    name = "Haiku 4.5", hint = "fastest" },
+	{ id = "claude-haiku-5-5", label = "Claude Haiku 5.5 (fastest)",    name = "Haiku 5.5", hint = "fastest" },
 }
 local DEFAULT_MODEL = "claude-opus-5-5"
 

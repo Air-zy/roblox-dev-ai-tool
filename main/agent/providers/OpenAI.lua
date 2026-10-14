@@ -566,6 +566,7 @@ local function streamMessage(args: {
 	effort: string?,
 	tools: { any }?,
 	webSearch: number?,
+	sessionId: string?,
 	}, callbacks: {
 		onText: ((string) -> ())?,
 		onThinking: ((string) -> ())?,
@@ -610,6 +611,10 @@ local function streamMessage(args: {
 		parallel_tool_calls = true,
 	}
 	if args.system and args.system ~= "" then bodyTable.instructions = args.system end
+	-- Codex sends the session id as both (prompt_cache_key in core/src/client.rs,
+	-- the session-id header in codex-api). Without a key, the cache is routed on
+	-- the prompt's first tokens alone, which every session of this plugin shares.
+	if args.sessionId then bodyTable.prompt_cache_key = args.sessionId end
 	if args.effort and args.effort ~= "" and supportsReasoning(model) then
 		bodyTable.reasoning = { effort = args.effort, summary = "auto" }
 	end
@@ -843,6 +848,7 @@ local function streamMessage(args: {
 				["accept"] = "text/event-stream",
 			}
 			if Auth.isFedramp() then headers["X-OpenAI-Fedramp"] = "true" end
+			if args.sessionId then headers["session-id"] = args.sessionId end
 			return {
 				url = RESPONSES_URL,
 				headers = headers,

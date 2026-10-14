@@ -58,11 +58,10 @@ Codex works at all:
    client makes (`GET /wham/usage`), not from an invented token-price meter.
    **[exact]**
 
-It is not yet transport- or cache-identical. Upstream supplies a stable
-`prompt_cache_key`, can reuse a turn-scoped WebSocket with sticky routing, and
-refreshes model metadata dynamically. We do none of those. Local calls are also
-executed sequentially even though the request permits parallel calls. Those are
-the meaningful remaining gaps; they are ranked in §11.
+It is not yet transport-identical. Upstream can reuse a turn-scoped WebSocket
+with sticky routing and refreshes model metadata dynamically. We do neither.
+Local calls are also executed sequentially even though the request permits
+parallel calls. Those are the meaningful remaining gaps; they are ranked in §11.
 
 ## 2. Hard billing boundary
 
@@ -158,7 +157,7 @@ retry. The stable body is:
 | `store` | `false` | `false` | **[exact]** |
 | `stream` | `true` | `true` | **[exact]** |
 | `include` | `reasoning.encrypted_content`; web sources when enabled | `reasoning.encrypted_content` | **[exact]** plus UI data |
-| `prompt_cache_key` | absent | session id, or an internal parent-thread namespace | **[gap]** |
+| `prompt_cache_key` | session id, also sent as the `session-id` header | session id, or an internal parent-thread namespace | **[adapted]** |
 | `stream_options` | absent | optional sequential-cutoff reasoning-summary delivery | **[gap, optional]** |
 | `service_tier` | absent | model/config-derived when applicable | **[out of scope]** |
 | `text` | absent | optional verbosity/output-schema controls | **[out of scope]** |
@@ -313,11 +312,12 @@ stable prefixes, and reports `cached_tokens` from actual response usage. Agent
 avoids clearing old tool results while a prefix is warm unless the context is
 near its urgent line. Cache hits are therefore real, not estimated. **[adapted]**
 
-But upstream always computes `prompt_cache_key`—normally the session id—and puts
-it in `ResponsesApiRequest`. We omit it and also omit the upstream session/turn
-routing metadata. Automatic prefix matching may still hit, but cache identity
-and routing are weaker than Codex's. This is the highest-value protocol gap.
-**[gap]**
+Like upstream, `prompt_cache_key` is the session id (the Sessions GUID, which
+survives save and restore), and the same id goes out as the `session-id` header.
+Subagents share their parent's key. Without a key, routing used only the
+prompt's first tokens, which every session of this plugin shares. **[adapted]**
+The per-turn `x-codex-turn-state` sticky-routing token is still absent; see
+§11.1. **[gap]**
 
 Usage is rebased into fresh input, cache read, cache creation when present, and
 output counts so the common session panel remains provider-neutral. This is
@@ -369,15 +369,15 @@ scope]**
 
 Ranked by likely cost:
 
-### 11.1 Send a stable `prompt_cache_key` and session identity
+### 11.1 Replay the `x-codex-turn-state` sticky-routing token
 
-Upstream uses the session id unless an internal parent-thread namespace applies.
-Ours sends neither the key nor equivalent session metadata. Add a provider-
-neutral stable id to Agent/Sessions, pass it into `streamMessage`, and set
-`prompt_cache_key` for OpenAI without perturbing existing message prefixes.
+`prompt_cache_key` and the `session-id` header are in. What's left is the token
+the server returns on a turn's first request. Upstream sends it back on every
+later request in that turn (`core/src/client.rs`), so the turn stays on one
+backend. Ours does not read it.
 
-**Cost today:** lower cache affinity, weaker sticky routing, and potentially more
-subscription capacity consumed reprocessing the same prefix.
+**Cost today:** requests inside one tool loop may land on different backends.
+The cache key should cover most of that, but this is not verified.
 
 ### 11.2 Use Codex model metadata and ETag refresh
 

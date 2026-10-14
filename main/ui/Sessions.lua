@@ -395,6 +395,7 @@ local function setCurrent(id: string)
 		end
 	end
 	currentId = id
+	Agent.setSessionId(id)
 	if refreshList then refreshList() end
 end
 
