@@ -96,6 +96,7 @@ local CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for 
 local MODEL_CAPS: { [string]: { thinking: string, effort: boolean, maxOutput: number,
 	context: number } } = {
 	["claude-opus-5-5"]           = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
+	["claude-fable-5-2"]          = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
 	["claude-fable-5-1"]          = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
 	["claude-sonnet-5-5"]         = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
 	["claude-opus-5"]             = { thinking = "adaptive", effort = true,  maxOutput = 128000, context = 1000000 },
@@ -154,12 +155,15 @@ end
 -- regexes in main.luau — one of which had to strip the vendor word, which meant
 -- naming a vendor in a file that is not allowed to. Composing here is free;
 -- parsing it back cost a heuristic that guessed wrong on a two-word vendor.
-local MODELS = {
+-- Kept apart from MODELS, which adopt() clears in place, because adopt() puts
+-- back any of these the fetched roster leaves out.
+local BUILTIN_MODELS = {
 	{ id = "claude-opus-5-5",  label = "Claude Opus 5.5 (recommended)", name = "Opus 5.5",  hint = "recommended" },
-	{ id = "claude-fable-5-1", label = "Claude Fable 5.1 (most capable)", name = "Fable 5.1", hint = "most capable" },
+	{ id = "claude-fable-5-2", label = "Claude Fable 5.2 (most capable)", name = "Fable 5.2", hint = "most capable" },
 	{ id = "claude-sonnet-5-5", label = "Claude Sonnet 5.5 (balanced)", name = "Sonnet 5.5", hint = "balanced" },
 	{ id = "claude-haiku-5-5", label = "Claude Haiku 5.5 (fastest)",    name = "Haiku 5.5", hint = "fastest" },
 }
+local MODELS = table.clone(BUILTIN_MODELS)
 local DEFAULT_MODEL = "claude-opus-5-5"
 
 -- Whether `/model <arg>` should accept an id the list above has never heard of,
@@ -248,16 +252,31 @@ end
 -- place, because MODELS is exported by reference. Never empties a working list.
 local function adopt(entries: { any }): boolean
 	local rows: { any } = {}
+	local listed: { [string]: boolean } = {}
 	for _, entry in ipairs(entries) do
 		local row = rosterEntry(entry)
-		if row then rows[#rows + 1] = row end
+		if row then
+			rows[#rows + 1] = row
+			listed[row.id] = true
+		end
 	end
 	if #rows == 0 then return false end
+	-- The roster can leave out a model the same login can use: on 2026-11-09 it
+	-- had no claude-fable-5-2, which answered when picked by name. A built-in row
+	-- it misses goes on top, where the newest sit, shaped by MODEL_CAPS.
+	local missing: { any } = {}
+	for _, entry in ipairs(BUILTIN_MODELS) do
+		if not listed[entry.id] then
+			missing[#missing + 1] = rosterEntry({ id = entry.id, display_name = "Claude " .. entry.name })
+		end
+	end
 	table.clear(MODELS)
 	table.clear(fetched)
-	for _, row in ipairs(rows) do
-		MODELS[#MODELS + 1] = row
-		fetched[row.id] = row
+	for _, list in ipairs({ missing, rows }) do
+		for _, row in ipairs(list) do
+			MODELS[#MODELS + 1] = row
+			fetched[row.id] = row
+		end
 	end
 	return true
 end

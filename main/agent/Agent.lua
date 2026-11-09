@@ -139,6 +139,27 @@ local function safeCut(s: string, limit: number): string
 	return string.sub(s, 1, n)
 end
 
+-- The same rejection, for bytes a tool hands back rather than a cut made here:
+-- a `run` that returned binary mesh data, or a value its own 500-byte preview
+-- cut mid-codepoint. One such result in the history fails every later request
+-- with "Can't convert to JSON", and the session save with it. Each invalid byte
+-- becomes U+FFFD, so the valid text around it survives.
+local function validUtf8(s: string): string
+	if utf8.len(s) then return s end
+	local parts: { string } = {}
+	local i = 1
+	while i <= #s do
+		local ok, bad = utf8.len(s, i)
+		if ok then
+			parts[#parts + 1] = string.sub(s, i)
+			break
+		end
+		parts[#parts + 1] = string.sub(s, i, (bad :: number) - 1) .. "\u{FFFD}"
+		i = (bad :: number) + 1
+	end
+	return table.concat(parts)
+end
+
 -- Naming the narrower commands is the load-bearing half. Without it the model's
 -- next move is to re-run the same unbounded command and pay for it twice.
 local function forModel(result: string, limit: number?): string
@@ -1102,6 +1123,7 @@ local function runToolUse(shell: any, block: any, call: any, stopReason: string?
 		-- here rather than in each handler because "" is a correct result
 		-- for /sh; it is only invalid on the wire.
 		if toolResult == "" then toolResult = "(no output)" end
+		if type(toolResult) == "string" then toolResult = validUtf8(toolResult) end
 		call.setResult(Console.contentText(toolResult) or "")
 		-- bash rows only: their paths, resolved where this shell ran them.
 		call.linkPaths(function(path) return (shell:resolve(path)) end)
@@ -2233,6 +2255,12 @@ function Agent.selfTest(): (boolean, string?)
 	end
 	if #cut > MODEL_RESULT_CHARS + 200 then
 		return false, "forModel overshot the cap"
+	end
+
+	-- A stray 0xFF and an e-acute cut to its first byte, around valid text.
+	local repaired = validUtf8("a" .. string.char(0xFF) .. "b" .. string.char(0xC3))
+	if repaired ~= "a\u{FFFD}b\u{FFFD}" then
+		return false, "validUtf8 did not replace invalid bytes with U+FFFD"
 	end
 
 	-- With newlines it should stop on one, leaving whole lines behind. The kept
